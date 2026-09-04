@@ -341,12 +341,13 @@ impl Yard {
     ///
     /// The supplied roots are strong for this pass. Direct roots retain only
     /// themselves; recursive roots retain their resident descendants. Every
-    /// retained native collection record, capability proof, and WANT adds all
-    /// of its resident direct references as recursive roots. This structural
-    /// ownership is independent of signatures, admission, or algebraic
-    /// usefulness. Missing references remain missing and never trigger a fetch
-    /// or prevent resident siblings from surviving. Pass an empty
-    /// [`RetentionRoots`] explicitly when native records supply the only roots.
+    /// retained native collection record and WANT adds all of its resident
+    /// direct references as recursive roots; self-contained capability proofs
+    /// add none. This structural ownership is independent of signatures,
+    /// admission, or algebraic usefulness. Missing references remain missing
+    /// and never trigger a fetch or prevent resident siblings from surviving.
+    /// Pass an empty [`RetentionRoots`] explicitly when native records supply
+    /// the only roots.
     pub fn collect(&mut self, retention: &RetentionRoots) -> Result<(), YardCollectError> {
         let (_snapshot, keep) = self.retention_observation(retention)?;
         for generation in &mut self.generations {
@@ -575,8 +576,9 @@ impl Yard {
         Ok(combined)
     }
 
-    /// Add every resident claim reference and physical kind description of
-    /// every native proof record.
+    /// Retain the physical kind description whenever native proofs exist.
+    ///
+    /// A self-contained proof has no blob closure of its own.
     fn retention_with_capability_proofs(
         &self,
         snapshot: &YardSnapshot,
@@ -589,13 +591,6 @@ impl Yard {
             .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
         if !proofs.is_empty() {
             retain_kind_if_present(&mut combined, present, capability_proof_record_kind());
-        }
-        for proof in proofs {
-            for handle in proof.blob_references() {
-                if present.get(&handle.raw).is_some() {
-                    combined.retain_recursive(handle);
-                }
-            }
         }
         Ok(combined)
     }
@@ -1542,8 +1537,7 @@ mod tests {
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
     };
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
@@ -1833,28 +1827,22 @@ mod tests {
     }
 
     #[test]
-    fn capability_proofs_union_generations_root_claims_and_survive_reclaim() {
+    fn capability_proofs_union_generations_without_blob_closure_and_survive_reclaim() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
         publish_record_kind_descriptions(&mut yard);
-        let attachment = yard
-            .put::<RawBytes, _>(raw_blob(b"proof-owned attachment"))
+        let coincident_resource_blob = yard
+            .put::<RawBytes, _>(raw_blob(b"resource bytes are not proof closure"))
             .unwrap();
         let root = SigningKey::from_bytes(&[71; 32]);
         let leaf = SigningKey::from_bytes(&[72; 32]);
-        let claim = CapabilityClaim::root(
-            CapabilityAtom::new(
-                CapabilityAction::new(pin_id(73)),
-                CapabilityResource::new(attachment.raw),
-            ),
-            CapabilityMode::Invoke,
+        let proof = CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::new(coincident_resource_blob.raw),
+            Capability::new(CapabilityAction::new(pin_id(73)), CapabilityMode::Invoke),
             None,
+            leaf.verifying_key(),
         );
-        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
-        let proof = bundle.proof().clone();
-        let claim_handle = yard
-            .put::<SimpleArchive, _>(bundle.claims()[0].clone())
-            .unwrap();
 
         yard.generations[1]
             .active_mut()
@@ -1876,8 +1864,9 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.snapshot().unwrap();
-        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_ok());
-        assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
+        assert!(reader
+            .get::<Blob<RawBytes>, _>(coincident_resource_blob)
+            .is_err());
         assert_record_kind_description_resident(&reader, capability_proof_record_kind());
         assert_record_kind_description_resident(&reader, blob_record_kind());
         drop(reader);
@@ -1907,8 +1896,9 @@ mod tests {
             vec![proof]
         );
         let reader = reopened.snapshot().unwrap();
-        assert!(reader.get::<Blob<RawBytes>, _>(attachment).is_ok());
-        assert!(reader.get::<Blob<SimpleArchive>, _>(claim_handle).is_ok());
+        assert!(reader
+            .get::<Blob<RawBytes>, _>(coincident_resource_blob)
+            .is_err());
         drop(reader);
         reopened.close().unwrap();
     }

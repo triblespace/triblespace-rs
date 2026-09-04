@@ -33,32 +33,22 @@ An abstraction that persists immutable content-addressed blobs. Implementations
 back local piles, in-memory collections, or remote object stores while exposing
 small capability traits for insertion, retrieval, metadata, and enumeration.
 
-### Capability Claim
-A closed canonical, keyless `SimpleArchive` naming one exact action/resource
-atom, invoke/delegate mode, optional parent **claim** handle, and optional
-inclusive validity interval. A root claim has no parent; each later claim names
-its exact semantic predecessor. Principal keys and signatures live in the
-native proof, not in the claim.
-
 ### Capability Proof
-A canonical native `K0 (S C K)+` byte string. Each strict Ed25519 signature
-binds its issuer key, exact claim handle, and delegate key. Its BLAKE3 digest is
-the proof ID used for exact physical lookup. Verification also receives the
-ordered claim blobs, external trust root, expected leaf, explicit instant, and
-exact request; authority is the meet of the claims, never a consequence of
-proof presence.
-
-### Capability Proof Bundle
-A complete portable capability proof plus the exact claim blobs it names in
-root-to-leaf order. It is useful as an application-level invitation artifact,
-but collection networking carries only native proofs; their claim handles use
-ordinary exact blob acquisition.
+A canonical self-contained, prefix-signed byte string. Its header contains a
+grammar magic, opaque resource, and one Ed25519 root. Each edge then contains
+an exact action, mode, optional inclusive validity interval, delegate, and a
+strict Ed25519 signature over the complete prefix through that delegate. Every
+signed prefix is therefore a proof for its intermediate subject. Its BLAKE3
+digest is the proof ID used for exact physical lookup. Verification also
+receives the external trust root, expected subject, explicit instant, and exact
+request; authority is the meet of the path's restrictions, never a consequence
+of proof presence.
 
 ### Capability Proof Store
 A grow-only native set of canonical capability proofs. It supports
 deterministic enumeration and exact lookup by proof ID, but no discovery by key
-or claim. Storing a proof preserves evidence and can root resident claim blobs;
-it does not make the proof authorized.
+or semantic request. Storing a proof preserves evidence but does not make the
+proof authorized or root any blob closure.
 
 ### Commit
 A signed native collection membership assertion. A `CollectionCommit` names
@@ -68,9 +58,10 @@ synthetic entity ID. Commits are independent leaves rather than snapshots in a
 parent chain.
 
 ### Capability Presentation
-One owned `CapabilityProofBundle` paired with the exact leaf key the caller
+One owned `CapabilityProof` paired with the exact subject key the caller
 expects it to establish. The expectation prevents a valid prefix or proof for
-another principal from silently becoming an admission decision.
+another principal from silently becoming an admission decision; no companion
+bundle or claim blobs are needed.
 
 ### Collection
 A self-describing grow-only join semilattice. Signed commits introduce members;
@@ -85,7 +76,7 @@ the `CollectionEncoding` type `E`.
 One exact point in a collection lattice, represented by a typed collection
 descriptor and a PATCH set of distinct `Handle<E>` payload handles.
 Signatures, authors, and metadata are optional provenance fibers queryable from
-the store, not part of cover identity or required for replay, so several claims
+the store, not part of cover identity or required for replay, so several commits
 over identical data collapse to one member. Distinct covers may have the same
 support: a stored merge records that `{a, b}` and `{a⊔b}` denote the same join.
 Cover construction is opaque; admission and stored collection algebra produce
@@ -97,16 +88,16 @@ The read-time signer decision performed by
 resident proof paths rooted in the policy's canonical root set are considered
 at one clock instant for the exact `ACTION_WRITE`/collection atom. A writer is
 admitted only when it has the policy's required distinct root support. Invalid,
-expired, irrelevant, or incomplete candidates grant nothing without poisoning
-other evidence.
+expired, or irrelevant candidates grant nothing without poisoning other
+evidence.
 
 ### Collection Descriptor
 A canonical `SimpleArchive` describing a collection's UTF-8 root name or exact
 derived source, member encoding, and independent READ and WRITE admission
 policies. Each policy is open or a canonical quorum over capability roots with
-separate invoke and delegation thresholds. A derived descriptor also links one
-concrete mapping entity carrying its algorithm and parameters. Its content
-handle is the `CollectionHandle`, so every native record which names a
+one semantic threshold. A derived descriptor also links one concrete mapping
+entity carrying its algorithm and parameters. Its content handle is the
+`CollectionHandle`, so every native record which names a
 collection can resolve its meaning through the ordinary blob store. A derived
 descriptor states its own policies and never inherits them through its source.
 
@@ -160,13 +151,13 @@ either an eager value or a lazy sharded view through the same snapshot.
 
 ### Collection READ
 The exact `ACTION_READ` capability over one collection descriptor handle.
-Network repair presents a bounded proof forest for the authenticated endpoint
-and the descriptor's READ policy. Knowing the collection handle permits joining
-its opaque wake topic, but does not reveal records, proofs, counts, or blobs;
-collection evidence crosses only after READ(C) admission. `Open` READ needs no
-proof. Exact immutable content is a separate bearer system: every served
-resident H may be advertised under opaque KDF(H), and exact GET neither names a
-collection nor consults READ(C).
+Network repair presents bounded independent proof paths for the authenticated
+endpoint and the descriptor's READ policy. Knowing the collection handle
+permits joining its opaque wake topic, but does not reveal records, proofs,
+counts, or blobs; collection evidence crosses only after READ(C) admission.
+`Open` READ needs no proof. Exact immutable content is a separate bearer
+system: every served resident H may be advertised under opaque KDF(H), and
+exact GET neither names a collection nor consults READ(C).
 
 ### Constraint
 The trait that every query operator implements. Its methods—`variables`,
@@ -249,16 +240,17 @@ referencing those blobs stay portable. The corresponding traits are
 
 ### Policy Root
 One Ed25519 key named by an admission policy. Roots have inherent support for
-their policy's action and may issue capability paths according to its
-delegation threshold. A collection may name several roots and require a quorum;
-READ and WRITE have independent root sets and thresholds. A root is not a
+their policy's action and may issue capability paths. A collection may name
+several roots and require one threshold; READ and WRITE have independent root
+sets and thresholds. Whether one root share remains delegable is carried by
+the signed mode on that path, not derived from sibling proofs. A root is not a
 network namespace, routing scope, roster, or mutable owner.
 
 ### Collection WRITE
 The exact `ACTION_WRITE` capability over one collection descriptor handle.
 Signed COMMITs are active only when their author satisfies the descriptor's
-WRITE policy in the observed proof forest. Local stores may retain inactive
-claims; synchronization and concatenation remain monotone because later proof
+WRITE policy in the observed proof set. Local stores may retain inactive
+commits; synchronization and concatenation remain monotone because later proof
 evidence can activate them without retracting bytes.
 
 ### Collection Wake

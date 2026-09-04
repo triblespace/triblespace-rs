@@ -67,14 +67,9 @@ operations:
 ```rust,ignore
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
-use triblespace::core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode,
-    CapabilityProofBundle, CapabilityResource,
-};
 use triblespace::core::{
     blob::encodings::simplearchive::SimpleArchive,
-    collection::{AdmissionPolicy, CollectionPolicy, ACTION_WRITE},
-    repo::CapabilityProofStore,
+    collection::{grant_collection_write, AdmissionPolicy, CollectionPolicy},
 };
 use triblespace::prelude::*;
 
@@ -90,20 +85,12 @@ let models = storage.collection(
         AdmissionPolicy::direct(team),
     ),
 )?;
-let atom = CapabilityAtom::new(
-    CapabilityAction::new(ACTION_WRITE),
-    CapabilityResource::from(models.handle()),
-);
-let bundle = CapabilityProofBundle::issue_root(
+let _proof = grant_collection_write(
+    &mut storage,
+    models.handle(),
     &team_key,
-    CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
     writer_subject,
 )?;
-let (proof, claims) = bundle.into_parts();
-for claim in claims {
-    storage.put::<SimpleArchive, _>(claim)?;
-}
-storage.insert_proof(proof)?;
 
 let commit = storage.commit(
     models,
@@ -118,19 +105,20 @@ storage.flush()?;
 ```
 
 Local publication deliberately performs no authorization check: the local
-store is a grow-only claim ledger, not an access-control boundary. Observation
+store is a grow-only record ledger, not an access-control boundary. Observation
 loads the independent policies from the descriptor. A policy root is admitted
 directly; every other author needs enough resident proof paths for exact
 `ACTION_WRITE` on this descriptor. Each operation observes the clock once and
-verifies every matching proof. Invalid, expired, irrelevant, or incomplete
+verifies every matching proof. Invalid, expired, or irrelevant
 candidate evidence grants nothing; inability to enumerate the proof store
 remains an error.
 
 READ and WRITE are explicit because both participate in collection identity.
 Either may be `Open` or a canonical quorum over capability roots, with
-independent invoke and delegation thresholds. Derived collections state their
-own policies rather than inheriting ambient authority from a source or a
-network-wide team scope.
+one semantic threshold. Derived collections state their own policies rather
+than inheriting ambient authority from a source or a network-wide team scope.
+Whether a subject may delegate a share onward is carried by the signed mode of
+that independently rooted proof path, not by a second policy threshold.
 
 ### What publication writes
 
@@ -246,22 +234,25 @@ root-collection read when the intermediate support and physical cover are
 irrelevant.
 
 Consumers which need the exact strictly verified COMMIT roots selected during
-admission use `collection.admitted_with_commits_at(&snapshot, instant)`; later claims over
-the same payload remain broader provenance rather than retroactive roots.
+admission use `collection.admitted_with_commits_at(&snapshot, instant)`; later
+attestations over the same payload remain broader provenance rather than
+retroactive roots.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear in this call or a later
 one. A mutating `ensure` or `maintain` operation returns a new store snapshot;
 the caller may then ask that snapshot for the collection it actually contains.
 
-Raw record readers still expose dangling native records and proofs for repair.
-Semantic snapshot operations do not: a `COMMIT`, `MERGE`, `DERIVE`, or
-authorization proof is invisible until all of its direct blob references are
-resident in that exact frozen snapshot. Snapshot operations never acquire,
-wait, write, or emit `WANT`. Record retention is a separate lifetime rule: a
-retained non-blob record strongly retains every directly referenced blob which
-is resident, but does not fetch an absent one. A `WANT` is itself only an
-explicit durable demand record, never automatic cache-miss bookkeeping.
+Raw record readers still expose dangling native collection records and stored
+proof records for repair. A `COMMIT`, `MERGE`, or `DERIVE` is semantically
+invisible until all of its direct blob references are resident in that exact
+frozen snapshot. A capability proof is already self-contained and has no blob
+residency gate. Snapshot operations never acquire, wait, write, or emit
+`WANT`. Record retention is a separate lifetime rule: a retained non-blob
+record strongly retains every directly referenced blob which is resident, but
+does not fetch an absent one; proofs simply have no such references. A `WANT`
+is itself only an explicit durable demand record, never automatic cache-miss
+bookkeeping.
 
 The four live store operations are asynchronous even for local stores. They may
 fetch only exact missing handles in the operation's frozen raw frontier,
@@ -364,7 +355,7 @@ let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 
 - `acquire_admitted_support_at` freezes collection records and capability
   proofs at the caller's control snapshot, then acquires only the missing
-  immutable descriptor, claim, data, and metadata bytes needed to decide that
+  immutable descriptor, data, and metadata bytes needed to decide that
   frontier. Concurrent records and proofs remain deferred. Reusing the same
   control snapshot across several calls therefore gives a batch one semantic
   watermark without pretending that byte residency was already complete.

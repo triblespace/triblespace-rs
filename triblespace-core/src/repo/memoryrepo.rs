@@ -378,17 +378,6 @@ impl crate::repo::BlobStoreKeep for MemoryRepo {
                 }
             }
         }
-        for key in self.capability_proofs.iter() {
-            let proof = self
-                .capability_proofs
-                .get(key)
-                .expect("proof key from PATCH must retain its value");
-            for root in proof.blob_references() {
-                if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
-                    roots.retain_recursive(root);
-                }
-            }
-        }
         for request in &self.wants {
             for root in request.blob_references() {
                 if crate::repo::BlobStoreList::contains_blob(&reader, root).unwrap_or(false) {
@@ -450,8 +439,7 @@ mod tests {
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
     use crate::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
     };
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{CollectionDerive, CollectionMerge, CollectionPolicy};
@@ -461,25 +449,18 @@ mod tests {
     }
 
     #[test]
-    fn capability_proofs_are_an_idempotent_set_and_retain_claims() {
-        use crate::repo::{BlobStoreGet, BlobStoreKeep};
-
+    fn capability_proofs_are_an_idempotent_set_without_blob_closure() {
         let mut repo = MemoryRepo::default();
         let root = SigningKey::from_bytes(&[61; 32]);
         let leaf = SigningKey::from_bytes(&[62; 32]);
         let action = CapabilityAction::new(Id::new([63; 16]).unwrap());
-        let claim = CapabilityClaim::root(
-            CapabilityAtom::new(action, CapabilityResource::new([64; 32])),
-            CapabilityMode::Invoke,
+        let proof = CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::new([64; 32]),
+            Capability::new(action, CapabilityMode::Invoke),
             None,
+            leaf.verifying_key(),
         );
-        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
-        let proof = bundle.proof().clone();
-        let claim_handle = repo
-            .put::<crate::blob::encodings::simplearchive::SimpleArchive, _>(
-                bundle.claims()[0].clone(),
-            )
-            .unwrap();
 
         repo.insert_proof(proof.clone()).unwrap();
         repo.insert_proof(proof.clone()).unwrap();
@@ -494,48 +475,6 @@ mod tests {
                 .unwrap(),
             vec![proof]
         );
-
-        repo.keep(std::iter::empty());
-        let snapshot = repo.snapshot().unwrap();
-        assert!(snapshot
-            .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
-            .is_ok());
-    }
-
-    #[test]
-    fn capability_proof_claim_roots_retain_their_resident_closure() {
-        use crate::repo::{BlobStoreGet, BlobStoreKeep};
-
-        let mut repo = MemoryRepo::default();
-        let coincident_resource = repo
-            .put::<UnknownBlob, _>(Bytes::from_source(b"opaque resource".to_vec()))
-            .unwrap();
-        let root = SigningKey::from_bytes(&[65; 32]);
-        let leaf = SigningKey::from_bytes(&[66; 32]);
-        let claim = CapabilityClaim::root(
-            CapabilityAtom::new(
-                CapabilityAction::new(Id::new([67; 16]).unwrap()),
-                CapabilityResource::new(coincident_resource.raw),
-            ),
-            CapabilityMode::Invoke,
-            None,
-        );
-        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
-        let claim_handle = repo
-            .put::<crate::blob::encodings::simplearchive::SimpleArchive, _>(
-                bundle.claims()[0].clone(),
-            )
-            .unwrap();
-        repo.insert_proof(bundle.proof().clone()).unwrap();
-
-        repo.keep(std::iter::empty());
-        let snapshot = repo.snapshot().unwrap();
-        assert!(snapshot
-            .get::<Blob<crate::blob::encodings::simplearchive::SimpleArchive>, _>(claim_handle)
-            .is_ok());
-        assert!(snapshot
-            .get::<Blob<UnknownBlob>, _>(coincident_resource)
-            .is_ok());
     }
 
     /// Wants form an idempotent grow-only set. Enumeration is sorted (stable
@@ -811,18 +750,16 @@ mod tests {
 
         let root = SigningKey::from_bytes(&[75; 32]);
         let leaf = SigningKey::from_bytes(&[76; 32]);
-        let claim = CapabilityClaim::root(
-            CapabilityAtom::new(
+        let proof = CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::new([78; 32]),
+            Capability::new(
                 CapabilityAction::new(Id::new([77; 16]).unwrap()),
-                CapabilityResource::new([78; 32]),
+                CapabilityMode::Invoke,
             ),
-            CapabilityMode::Invoke,
             None,
+            leaf.verifying_key(),
         );
-        let proof = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key())
-            .unwrap()
-            .proof()
-            .clone();
         repo.insert_proof(proof).unwrap();
         let after_proof = repo.snapshot().unwrap();
         assert!(after_record != after_proof);

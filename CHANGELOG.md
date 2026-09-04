@@ -11,14 +11,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add `CollectionStoreExt::acquire_read_audience_at` as the live counterpart
   to inert snapshot audience discovery. It freezes the proof/control frontier,
-  acquires the exact collection descriptor and claim handles from
-  signature-valid proofs rooted in READ(C), emits no WANT, and excludes
-  concurrently arriving proofs until the next call. Reuse the same
-  candidate-proof hydration for WRITE admission.
+  acquires only the exact collection descriptor, evaluates self-contained
+  proofs rooted in READ(C), emits no WANT, and excludes concurrently arriving
+  proofs until the next call.
 - Cover the cold collection-bootstrap path where a recipient knows only a
   collection handle and one issuer endpoint: issuer-held complete READ(C)
-  evidence admits repair, while the transferred native proof's claims and the
-  repaired payload remain ordinary exact-H acquisitions and create no WANT.
+  evidence admits repair, while a transferred native proof is already complete
+  and the repaired payload remains an ordinary exact-H acquisition which
+  creates no WANT.
 - Make each derived target encoding own its canonical `Source`, runtime
   `Argument`, descriptor binding, and member map through
   `CollectionDerivation`. `derive::<Target>(source, argument, policy)` still
@@ -54,23 +54,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when its frozen collection-record observation fails instead of treating the
   partial observation as an empty receipt set.
 - Make physical blob lifetime a structural law shared by MemoryRepo, Pile, and
-  Yard. Every retained COMMIT, MERGE, DERIVE, authorization proof, and WANT now
-  owns each independently resident direct blob reference recursively, without
-  fetching, signature/admission filtering, or failure for missing sibling
-  references. Remove the collection-specific retention planner and Yard's
-  weak/budgeted WANT eviction path.
+  Yard. Every retained COMMIT, MERGE, DERIVE, and WANT now owns each
+  independently resident direct blob reference recursively, without fetching,
+  signature/admission filtering, or failure for missing sibling references.
+  Authorization proofs remain retained native records but are self-contained
+  and own no blob closure. Remove the collection-specific retention planner and
+  Yard's weak/budgeted WANT eviction path.
 - Keep native authorization-proof repair independent of blob demand: receiving
-  a proof no longer creates `Blob(H)` WANTs for its claim references.
+  a self-contained proof creates no blob acquisition or `Blob(H)` WANT.
 - Replace separate collection WRITE evidence with one collection-scoped
   authorization-evidence projection containing structurally relevant native
-  READ(C) and WRITE(C) proofs. Repair transports proof records only; every
-  referenced claim stays an ordinary H-addressed blob acquired through the
-  durable bearer WANT path. `ReconcileDirection` now gates only collection
+  READ(C) and WRITE(C) proofs. Repair transports the complete proof records and
+  no authorization blob closure. `ReconcileDirection` now gates only collection
   repair, so H discovery, publication, serving, and fetching remain available
   in every direction. The record component contains every signature-valid
   exact-C COMMIT independent of WRITE admission, so records and grants commute;
-  each receiver derives activation locally, while Full disclosure remains
-  rooted only in locally admitted commits.
+  each receiver derives activation locally.
 - Restore bounded target-carry batching under invariant foundational support.
   Maintenance resolves collection semantics once per actionable dyadic tier
   round instead of once per individual `MERGE`, while each disjoint result is
@@ -196,7 +195,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   requester proves it second, with both proofs bound to the two TLS endpoint
   identities. H never crosses the wire, and returned bytes are accepted only
   after hashing to H. Collection READ(C) remains solely the admission boundary
-  for collection anti-entropy and Full repair.
+  for collection anti-entropy and never gates exact GET.
 
 - Add `pile collection init <PILE> <NAME> [--key PATH]` to register one
   canonical `SimpleArchive` root descriptor under an existing durable signing
@@ -206,9 +205,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Add symmetric `grant_collection_read` / `grant_collection_write` APIs and
   `pile collection grant-read` / `grant-write` commands for an exact existing
   collection and recipient key. Each root-only operation validates the
-  descriptor's matching action policy before mutation, issues an unbounded
-  Invoke claim, persists claim closure before proof, and is deterministic and
-  replay-idempotent.
+  descriptor's matching action policy before mutation, issues and inserts one
+  unbounded self-contained Invoke proof, and is deterministic and
+  replay-idempotent. There are no companion claim blobs to persist.
 
 - Add a read-only `Collection::<E>::open` boundary for validating an existing
   descriptor handle against a coherent snapshot, plus descriptor-free
@@ -225,15 +224,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remains separate and bearer-addressed.
 
 - Add an immutable per-collection repair overlay: exact signed COMMIT records and
-  every complete, structurally relevant native READ(C) or WRITE(C) proof form
-  two canonical grow-only PATCHes and one opaque, domain-separated wake digest.
+  every structurally relevant self-contained native READ(C) or WRITE(C) proof
+  form two canonical grow-only PATCHes and one opaque, domain-separated wake digest.
   Authorization evidence inventory is independent of wall-clock expiry,
   quorum completeness, and current mode admission. Repair sends native proof
-  bodies only; missing claim handles remain inert until an actual consumer
-  follows them through the ordinary exact-H path. A bounded native READ proof
-  forest may cold-bootstrap a server for a later retry, but never admits the
-  same immutable session or transports claim bytes. Core also exposes deterministic finite
-  READ-audience enumeration while representing open READ as non-enumerable.
+  bodies only; each body already contains the complete path and restrictions.
+  A bounded set of native READ proofs may cold-bootstrap a server for a later
+  retry, but never admits the same immutable session. Core also exposes
+  deterministic finite READ-audience enumeration while representing open READ
+  as non-enumerable.
 
 - Add the policy-independent collection-delta element for a future
   READ-authorized push overlay. It strictly frames sparse records, verifies
@@ -252,10 +251,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add self-contained independent READ and WRITE admission policies to every
   collection descriptor. Each action is either `Open` or a validated quorum
-  over a canonical root set with separate invocation and optional downstream
-  delegation thresholds. Exact proof-forest evaluation counts distinct roots,
-  admits configured roots directly, supports direct root grants even when
-  redelegation is disabled, and adds the distinct `ACTION_READ` boundary.
+  over a canonical root set with one threshold. Evaluation counts distinct
+  independently valid root paths, admits configured roots directly, and adds
+  the distinct `ACTION_READ` boundary. Downstream delegation is controlled by
+  the mode signed into each path, never by a sibling-proof fixed point or a
+  second semantic threshold.
 
 - Add the lean store-owned construction API:
   `store.collection(name, policy)` creates a root `SimpleArchive` collection,
@@ -452,15 +452,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and historical branch-name encodings, and reports every source-to-target
   mapping, including deterministic many-to-one collapse and idempotent replays.
 
-- Add paired direct team proofs to `trible team`. `create` stores keyless
-  founder CONNECT and SYNC_TEAM claims with native `K0 (S C K)+` proofs;
-  `invite` loads both exact parent proof IDs and exports one versioned portable
-  artifact; `join` verifies both roots, expected leaves, exact atoms, mode
-  meets, and current time against the separately supplied team root before one
-  idempotent store write; and `show` selects one proof by ID. Optional paired
-  RFC 3339 bounds map to inclusive validity intervals. `pile net` selects exact
-  `--connect-proof` and `--sync-proof` IDs under the explicit team root.
-
 - Add `trible pile net inventory`, a read-only exact manifest probe for the
   bound pile. It prints the canonical `/14` generation plus every component's
   leaf count and PATCH root, and fails closed if sync-visible state changes
@@ -621,20 +612,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   removed, while immutable legacy pin snapshots remain documented only for
   diagnosis, retention, and explicit migration.
 
-- Add the clean direct capability kernel. Keyless canonical claim blobs carry
-  exact action/resource, mode, validity, and parent-claim restrictions; a
-  bounded native `K0 (S C K)+` proof binds issuer, claim handle, and delegate at
-  every edge and is addressed by BLAKE3 over its exact bytes. Verification
-  takes an external trust root, expected leaf, explicit epoch, and request, and
-  computes the claims' meet without storage discovery. Pile-sync moves to ALPN
-  v10. The first `OP_AUTH` stream carries one self-contained CONNECT bundle;
-  one later connection-local `INVENTORY_AUTH` installs the independent
-  SYNC_TEAM session required by manifest, node, blob-range, and exact blob
-  reads. Mixed older endpoints fail protocol negotiation. Proof records are a
-  native grow-only set with exact lookup and direct claim rooting; their
-  presence grants no authority and creates no implicit replication or WANT.
-  `PeerConfig` now takes one team root, both proof bundles, bootstrap routes,
-  and local reconciliation QoS.
+- Replace the claim-blob capability grammar with one self-contained,
+  prefix-signed proof value:
+  `magic16 | resource32 | root32 |`
+  `N*(action16 | flags1 | validity32 | delegate32 | signature64)`. Each
+  signature is last and covers the exact prefix through its delegate, so every
+  signed prefix is itself a proof and paths cannot be grafted or reordered.
+  Root and delegate keys are canonical non-weak principal identities, and
+  signed `i128` validity bounds remain exact at authorization-clock boundaries.
+  Verification takes an external trust root, expected subject, explicit epoch,
+  and exact request, and computes the path-local meet without storage
+  discovery. Quorum counts independent paths from distinct configured roots
+  under one threshold; sibling paths cannot supply delegation support. Proof
+  records use a fresh V2 pile kind, are addressed by BLAKE3 over their exact
+  bytes, and have no blob closure, portable bundle wrapper, implicit WANT, or
+  claim-retention edge. The retired `K(S,C,K)+` pile kind remains recognizable
+  as inert so old append-only files can still be traversed; authority must be
+  reissued because old signatures covered different bytes.
 
 - Pin inventory history per component rather than retaining whole store
   snapshots for every changed root. Unchanged roots reuse their immutable
@@ -1220,13 +1214,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Ordinary collections expose authority-resolved exact covers.**
   `collection.admitted(&store_snapshot)` admits the descriptor authority
   directly and
-  verifies every resident delegation proof for exact WRITE access to that
+  verifies every resident self-contained proof for exact WRITE access to that
   descriptor, then returns the distinct payload handles named by admitted
-  strict claims. Invalid, expired, irrelevant, and incomplete proof candidates
-  grant nothing. It reads proof-claim blobs, but no collection-member data or
-  commit-metadata blobs. Cover resolution and materialization therefore share
-  one multi-author known-prefix payload frontier rather than treating a
-  publishing key as ambient authority.
+  signed COMMITs. Invalid, expired, or irrelevant proof candidates grant
+  nothing. Admission reads no collection-member or commit-metadata blobs.
+  Cover resolution and materialization therefore share one multi-author
+  known-prefix payload frontier rather than treating a publishing key as
+  ambient authority.
 
 - **Path summaries now form a native typed collection algebra.** A source
   `SimpleArchive` collection can be lowered through an automaton-specific
@@ -2300,8 +2294,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   derived-key DHT PUT/GET leases. Directory requests never carry bearer blob
   handles, while unrelated artifacts no longer collapse onto 256 fixed
   hotspots. Exact-content publication covers every served resident blob and
-  remains independent of collection READ policy. The incompatible wire uses a
-  new pile-sync ALPN generation, currently `/triblespace/pile-sync/22`.
+  remains independent of collection READ policy. This locator change and the
+  later self-contained proof-body cutover use the current pile-sync ALPN
+  generation, `/triblespace/pile-sync/23`.
 
 - Make nonempty exact-derived network attachment fail closed when refreshing
   discovers a conflicting store scope, rather than clearing the serving view

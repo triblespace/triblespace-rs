@@ -20,6 +20,7 @@
 //! Format](../../book/src/pile-format.md) chapter of the Tribles Book.
 
 use anybytes::Bytes;
+use ed25519_dalek::VerifyingKey;
 use hex_literal::hex;
 use memmap2::MmapOptions;
 use memmap2::MmapRaw;
@@ -871,9 +872,9 @@ struct CollectionDeriveHeaderEnvelopeV1V4 {
 }
 
 // ---------------------------------------------------------------------------
-// Current V2 envelope: 28-byte magic, 4-byte span, 32-byte record kind. Every
-// field of every body is 32-byte aligned, and because records start on a
-// 256-byte boundary that alignment holds at absolute file offsets too.
+// Current V2 envelope: 28-byte magic, 4-byte span, 32-byte record kind.
+// Fixed record bodies use 32-byte-aligned fields; variable payloads define
+// their own canonical grammar after a fixed prefix.
 // ---------------------------------------------------------------------------
 
 /// Common prefix of every newly written pile record.
@@ -890,8 +891,8 @@ struct RecordFrame {
     record_kind: RawInline,
 }
 
-/// Complete capability proof: `64..72` length, `96..` canonical K(S,C,K)+
-/// bytes, then zero padding to the declared block span.
+/// Complete capability proof: `64..72` length, `96..` canonical self-contained
+/// prefix-signed bytes, then zero padding to the declared block span.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
 struct CapabilityProofRecordPrefix {
@@ -899,8 +900,7 @@ struct CapabilityProofRecordPrefix {
     span_blocks: [u8; 4],
     record_kind: RawInline,
     length: [u8; 8],
-    /// Rounds the scalar length up so proof keys, signatures, and handles all
-    /// begin and remain on 32-byte boundaries.
+    /// Canonical reserved bytes keeping the variable proof body at byte 96.
     scalar_pad: [u8; 24],
 }
 
@@ -1431,8 +1431,8 @@ pub enum PileRecordContent {
         /// Canonically reconstructed semantic record.
         record: CollectionRecord,
     },
-    /// One canonical complete capability proof stored inline in K(S,C,K)+
-    /// order. Its content id is an exact-body index, not an authority token.
+    /// One canonical complete self-contained prefix-signed capability proof.
+    /// Its content id is an exact-body index, not an authority token.
     CapabilityProof {
         /// BLAKE3 identity of the exact canonical proof bytes.
         id: CapabilityProofId,
@@ -1441,6 +1441,12 @@ pub enum PileRecordContent {
         /// Exact proof-body length, excluding zero padding.
         data_len: usize,
     },
+    /// One structurally valid retired K(S,C,K)+ capability proof.
+    ///
+    /// Current replay treats it as inert and semantic rewrites drop it. The
+    /// dedicated variant lets an old pile remain readable without mistaking
+    /// its claim-dependent proof grammar for the self-contained V2 grammar.
+    RetiredCapabilityProofV1,
     /// One structurally valid retired PEER routing record.
     ///
     /// Current replay treats it as inert and semantic rewrites drop it. The
@@ -1623,7 +1629,7 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content,
             })
         }
-        record_kind::KIND_AUTH_PROOF => {
+        record_kind::KIND_AUTH_PROOF_V1 | record_kind::KIND_AUTH_PROOF => {
             let (header, _) =
                 CapabilityProofRecordPrefix::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
             if nonzero(&[&header.scalar_pad[..]]) {
@@ -1631,9 +1637,6 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             }
             let data_len =
                 usize::try_from(u64::from_le_bytes(header.length)).map_err(|_| corrupt())?;
-            if data_len < 160 || (data_len - 32) % 128 != 0 {
-                return Err(corrupt());
-            }
             let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
             let expected_blocks =
                 envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(corrupt)?;
@@ -1646,6 +1649,16 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 .ok_or_else(corrupt)?;
             if nonzero(&[&bytes[data_end..len]]) {
                 return Err(corrupt());
+            }
+            if prefix.record_kind == record_kind::KIND_AUTH_PROOF_V1 {
+                if !retired_capability_proof_v1_is_structural(&bytes[prefix_len..data_end]) {
+                    return Err(corrupt());
+                }
+                return Ok(PileRecord {
+                    offset,
+                    len,
+                    content: PileRecordContent::RetiredCapabilityProofV1,
+                });
             }
             let proof =
                 CapabilityProof::from_bytes(&bytes[prefix_len..data_end]).map_err(|_| corrupt())?;
@@ -1752,6 +1765,31 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             },
         }),
     }
+}
+
+fn retired_capability_proof_v1_is_structural(bytes: &[u8]) -> bool {
+    const ROOT_LEN: usize = 32;
+    const EDGE_LEN: usize = 128;
+    const DELEGATE_OFFSET: usize = 96;
+    const MAX_STEPS: usize = u8::MAX as usize;
+
+    if bytes.len() < ROOT_LEN + EDGE_LEN || (bytes.len() - ROOT_LEN) % EDGE_LEN != 0 {
+        return false;
+    }
+    let steps = (bytes.len() - ROOT_LEN) / EDGE_LEN;
+    if steps > MAX_STEPS {
+        return false;
+    }
+    let Ok(root) = <[u8; 32]>::try_from(&bytes[..ROOT_LEN]) else {
+        return false;
+    };
+    if VerifyingKey::from_bytes(&root).is_err() {
+        return false;
+    }
+    bytes[ROOT_LEN..].chunks_exact(EDGE_LEN).all(|edge| {
+        let delegate: [u8; 32] = edge[DELEGATE_OFFSET..].try_into().expect("fixed V1 edge");
+        VerifyingKey::from_bytes(&delegate).is_ok()
+    })
 }
 
 /// True when any of the given reserved regions carries a nonzero byte.
@@ -2464,6 +2502,7 @@ enum Applied {
     CapabilityProof {
         id: CapabilityProofId,
     },
+    RetiredCapabilityProofV1,
     RetiredTeamState,
     LegacyCollectionV3,
     RetiredCollectionDeriveV4,
@@ -3292,6 +3331,7 @@ impl Pile {
                 }
                 Applied::CapabilityProof { id }
             }
+            PileRecordContent::RetiredCapabilityProofV1 => Applied::RetiredCapabilityProofV1,
             PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
                 Applied::RetiredTeamState
             }
@@ -3881,7 +3921,7 @@ impl CapabilityProofStore for Pile {
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let bytes = proof.as_bytes();
         let data_len = bytes.len();
-        debug_assert!(data_len >= 160 && (data_len - 32) % 128 == 0);
+        debug_assert!(CapabilityProof::from_bytes(bytes).is_ok());
         let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
         let span_blocks =
             envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(|| {
@@ -4095,6 +4135,7 @@ impl Pile {
                     Some(Applied::RetiredWantState) => {}
                     Some(Applied::Collection { .. }) => {}
                     Some(Applied::CapabilityProof { .. }) => {}
+                    Some(Applied::RetiredCapabilityProofV1) => {}
                     Some(Applied::RetiredTeamState) => {}
                     Some(Applied::LegacyCollectionV3) => {}
                     Some(Applied::RetiredCollectionDeriveV4) => {}
@@ -4446,9 +4487,10 @@ pub struct PileReframeStats {
     pub collection_records: usize,
     /// Complete capability proofs re-encoded.
     pub capability_proofs: usize,
-    /// Records dropped because they never carried live state: inert legacy V3
-    /// collection headers, retired team state, retired local cells, and records
-    /// of a kind this reader does not interpret.
+    /// Records dropped because they no longer carry live state: inert legacy
+    /// V3 collection headers, retired capability proofs and team state,
+    /// retired local cells, and records of a kind this reader does not
+    /// interpret.
     pub dropped_inert: usize,
 }
 
@@ -4550,13 +4592,15 @@ impl Error for PileReframeError {
 ///   domain-separated transcript over its fields, not the bytes of its frame,
 ///   so re-encoding cannot invalidate one — but verify rather than assume, and
 ///   the tests and the CLI both do.
-/// * Complete capability proofs are another grow-only content-addressed set.
-///   Their exact canonical bodies survive reframing; proof ids are physical
-///   selectors and do not stand in for verification.
+/// * Current self-contained capability proofs are another grow-only
+///   content-addressed set. Their exact canonical bodies survive reframing;
+///   proof ids are physical selectors and do not stand in for verification.
+///   Retired claim-dependent proof records are inert and dropped.
 /// * Records that never carried live state are dropped and counted: inert
-///   legacy V3 collection headers, retired PEER and STORE_SCOPE state, retired
-///   local cells, and kinds this reader does not interpret. Only retired
-///   derivation record generations are in this category: current native
+///   legacy V3 collection headers, claim-dependent V1 capability proofs,
+///   retired PEER and STORE_SCOPE state, retired local cells, and kinds this
+///   reader does not interpret. Only retired derivation record generations are
+///   in this category: current native
 ///   `MERGE` and `DERIVE` records enter through the `Collection` arm above and
 ///   are preserved.
 ///
@@ -4771,13 +4815,13 @@ impl Pile {
     /// during migration.
     ///
     /// The source is refreshed once; blobs, strong pins, collection records,
-    /// complete proofs, inert legacy collection headers, and wants are then
-    /// taken from that coherent applied-prefix
-    /// snapshot. Every native collection record owns each resident descriptor,
+    /// current self-contained proofs, inert legacy collection headers, and
+    /// wants are then taken from that coherent applied-prefix snapshot. Every
+    /// native collection record owns each resident descriptor,
     /// member, input, or output handle it names recursively, independently of
     /// signature validity, admission, or algebraic usefulness. Every canonical
-    /// complete proof similarly owns each resident claim it names, and every
-    /// preserved WANT owns each resident handle in its request. Each emitted
+    /// preserved WANT owns each resident handle in its request. Capability
+    /// proofs are self-contained and therefore name no owned blobs. Each emitted
     /// non-BLOB frame also owns the resident description of its own record
     /// kind. A BLOB frame does not root itself merely by existing, but once an
     /// independent root selects any BLOB frame for output, that frame owns the
@@ -4865,16 +4909,6 @@ impl Pile {
                     .expect("PileSnapshot residency lookup is infallible")
                 {
                     roots.retain_recursive(handle);
-                }
-            }
-        }
-        for proof in &capability_proofs {
-            for claim in proof.blob_references() {
-                if reader
-                    .contains_blob(claim)
-                    .expect("PileSnapshot residency lookup is infallible")
-                {
-                    roots.retain_recursive(claim);
                 }
             }
         }
@@ -4977,8 +5011,8 @@ mod tests {
     use tempfile;
 
     use crate::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        Capability, CapabilityAction, CapabilityMode, CapabilityResource,
+        CAPABILITY_PROOF_HEADER_LEN, MAX_CAPABILITY_PROOF_STEPS,
     };
     use crate::collection::descriptor::named_for_tests;
     use crate::collection::{
@@ -5061,20 +5095,33 @@ mod tests {
         assert!(records.next().is_none());
     }
 
-    fn capability_fixture(seed: u8, resource: [u8; 32]) -> (CapabilityProof, Blob<SimpleArchive>) {
+    fn capability_fixture(seed: u8, resource: [u8; 32]) -> CapabilityProof {
         let root = SigningKey::from_bytes(&[seed; 32]);
         let leaf = SigningKey::from_bytes(&[seed.wrapping_add(1); 32]);
         let action = Id::new([seed.wrapping_add(2); 16]).expect("nonzero fixture action");
-        let claim = CapabilityClaim::root(
-            CapabilityAtom::new(
+        CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::new(resource),
+            Capability::new(
                 CapabilityAction::new(action),
-                CapabilityResource::new(resource),
+                CapabilityMode::InvokeAndDelegate,
             ),
-            CapabilityMode::Invoke,
             None,
-        );
-        let bundle = CapabilityProofBundle::issue_root(&root, claim, leaf.verifying_key()).unwrap();
-        (bundle.proof().clone(), bundle.claims()[0].clone())
+            leaf.verifying_key(),
+        )
+    }
+
+    fn retired_capability_v1_record(body: &[u8]) -> Vec<u8> {
+        let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
+        let blocks = envelope_blocks_for_prefixed_payload(prefix_len, body.len()).unwrap();
+        let mut bytes = CapabilityProofRecordPrefix::new(blocks, body.len() as u64)
+            .as_bytes()
+            .to_vec();
+        bytes[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET]
+            .copy_from_slice(&record_kind::KIND_AUTH_PROOF_V1);
+        bytes.extend_from_slice(body);
+        bytes.resize(blocks as usize * ENVELOPE_BLOCK_LEN, 0);
+        bytes
     }
 
     const TEST_UNKNOWN_KIND_A: RawInline = [0xA5; 32];
@@ -5222,14 +5269,14 @@ mod tests {
     fn native_capability_proof_record_round_trips_and_deduplicates_exact_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "proof.pile");
-        let (proof, _) = capability_fixture(11, [12; 32]);
-        assert_eq!(proof.as_bytes().len(), 160);
+        let proof = capability_fixture(11, [12; 32]);
+        assert_eq!(proof.as_bytes().len(), 225);
 
         let mut pile = Pile::open(&path).unwrap();
         pile.insert_proof(proof.clone()).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
         pile.insert_proof(proof.clone()).unwrap();
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 512);
         let snapshot = pile.snapshot().unwrap();
         assert_eq!(snapshot.proof(proof.id()).unwrap(), Some(proof.clone()));
         assert_eq!(snapshot.proof(Inline::new([0; 32])).unwrap(), None);
@@ -5282,9 +5329,9 @@ mod tests {
         let path_b = fresh_empty_pile_path(&dir, "proof-b.pile");
         let path_ab = dir.path().join("proof-ab.pile");
         let path_ba = dir.path().join("proof-ba.pile");
-        let (first, _) = capability_fixture(71, [72; 32]);
-        let (second, _) = capability_fixture(73, [74; 32]);
-        let (third, _) = capability_fixture(75, [76; 32]);
+        let first = capability_fixture(71, [72; 32]);
+        let second = capability_fixture(73, [74; 32]);
+        let third = capability_fixture(75, [76; 32]);
 
         let mut a = Pile::open(&path_a).unwrap();
         a.insert_proof(first.clone()).unwrap();
@@ -5320,14 +5367,67 @@ mod tests {
     }
 
     #[test]
+    fn retired_capability_proof_v1_is_known_inert() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "retired-proof-v1.pile");
+        let bytes = retired_capability_v1_record(&[0; 160]);
+        append_test_bytes(&path, &bytes);
+
+        let mut records = PileRecords::open(&path).unwrap();
+        assert!(matches!(
+            records.next().unwrap().unwrap().content,
+            PileRecordContent::RetiredCapabilityProofV1
+        ));
+        assert!(records.next().is_none());
+
+        let mut pile = Pile::open(&path).unwrap();
+        assert!(pile.snapshot().unwrap().proofs().unwrap().next().is_none());
+        pile.close().unwrap();
+    }
+
+    #[test]
+    fn retired_capability_proof_v1_retains_its_structural_bounds() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let invalid_key_path = fresh_empty_pile_path(&dir, "retired-invalid-key.pile");
+        let mut invalid_key = [0; 160];
+        let mut invalid_signer = [0; 32];
+        invalid_signer[0] = 2;
+        invalid_key[..32].copy_from_slice(&invalid_signer);
+        assert!(VerifyingKey::from_bytes(&invalid_signer).is_err());
+        append_test_bytes(
+            &invalid_key_path,
+            &retired_capability_v1_record(&invalid_key),
+        );
+        let mut pile = Pile::open(&invalid_key_path).unwrap();
+        assert!(matches!(
+            pile.refresh(),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+        pile.close().unwrap();
+
+        let overlong_path = fresh_empty_pile_path(&dir, "retired-overlong.pile");
+        let overlong = vec![0; 32 + 128 * (MAX_CAPABILITY_PROOF_STEPS + 1)];
+        append_test_bytes(&overlong_path, &retired_capability_v1_record(&overlong));
+        let mut pile = Pile::open(&overlong_path).unwrap();
+        assert!(matches!(
+            pile.refresh(),
+            Err(ReadError::CorruptPile { valid_length: 0 })
+        ));
+        pile.close().unwrap();
+    }
+
+    #[test]
     fn known_capability_proof_record_rejects_root_only_and_nonzero_padding() {
         let dir = tempfile::tempdir().unwrap();
-        let (one_edge, _) = capability_fixture(21, [22; 32]);
+        let one_edge = capability_fixture(21, [22; 32]);
 
         let root_only_path = fresh_empty_pile_path(&dir, "root-only.pile");
         let mut root_only = Vec::with_capacity(256);
-        root_only.extend_from_slice(CapabilityProofRecordPrefix::new(1, 32).as_bytes());
-        root_only.extend_from_slice(&one_edge.as_bytes()[..32]);
+        root_only.extend_from_slice(
+            CapabilityProofRecordPrefix::new(1, CAPABILITY_PROOF_HEADER_LEN as u64).as_bytes(),
+        );
+        root_only.extend_from_slice(&one_edge.as_bytes()[..CAPABILITY_PROOF_HEADER_LEN]);
         root_only.resize(256, 0);
         append_test_bytes(&root_only_path, &root_only);
         let mut pile = Pile::open(&root_only_path).unwrap();
@@ -5338,18 +5438,24 @@ mod tests {
         pile.close().unwrap();
 
         let padded_path = fresh_empty_pile_path(&dir, "bad-padding.pile");
-        let mut two_edge_bytes = one_edge.as_bytes().to_vec();
-        two_edge_bytes.extend_from_slice(&[0; 64]);
-        two_edge_bytes.extend_from_slice(&[23; 32]);
-        two_edge_bytes
-            .extend_from_slice(&SigningKey::from_bytes(&[24; 32]).verifying_key().to_bytes());
-        let two_edge = CapabilityProof::from_bytes(&two_edge_bytes).unwrap();
+        let two_edge = one_edge
+            .extend(
+                &SigningKey::from_bytes(&[22; 32]),
+                Capability::new(
+                    CapabilityAction::new(Id::new([23; 16]).expect("nonzero fixture action")),
+                    CapabilityMode::Invoke,
+                ),
+                None,
+                SigningKey::from_bytes(&[24; 32]).verifying_key(),
+            )
+            .unwrap();
+        let padding_offset = 96 + two_edge.as_bytes().len();
         let mut pile = Pile::open(&padded_path).unwrap();
         pile.insert_proof(two_edge).unwrap();
         pile.close().unwrap();
         let mut bytes = std::fs::read(&padded_path).unwrap();
         assert_eq!(bytes.len(), 512);
-        bytes[384] = 1;
+        bytes[padding_offset] = 1;
         std::fs::write(&padded_path, bytes).unwrap();
         let mut pile = Pile::open(&padded_path).unwrap();
         assert!(matches!(
@@ -5364,7 +5470,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "proof-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "proof-destination.pile");
-        let (proof, _) = capability_fixture(31, [32; 32]);
+        let proof = capability_fixture(31, [32; 32]);
         let mut source = Pile::open(&source_path).unwrap();
         source.insert_proof(proof.clone()).unwrap();
         source.close().unwrap();
@@ -5386,7 +5492,7 @@ mod tests {
     }
 
     #[test]
-    fn retained_rewrite_preserves_all_proofs_and_their_resident_claim_closures() {
+    fn retained_rewrite_preserves_proofs_without_treating_resources_as_blob_roots() {
         let dir = tempfile::tempdir().unwrap();
         let source_path = fresh_empty_pile_path(&dir, "proof-retention-source.pile");
         let destination_path = fresh_empty_pile_path(&dir, "proof-retention-destination.pile");
@@ -5397,14 +5503,13 @@ mod tests {
         let invalid_attachment = source
             .put::<UnknownBlob, _>(Bytes::from_source(b"invalid attachment".to_vec()))
             .unwrap();
-        let (valid_proof, valid_claim) = capability_fixture(41, valid_attachment.raw);
-        let (invalid_source, invalid_claim) = capability_fixture(51, invalid_attachment.raw);
+        let valid_proof = capability_fixture(41, valid_attachment.raw);
+        let invalid_source = capability_fixture(51, invalid_attachment.raw);
         let mut invalid_bytes = invalid_source.as_bytes().to_vec();
-        invalid_bytes[32] ^= 1;
+        let last = invalid_bytes.len() - 1;
+        invalid_bytes[last] ^= 1;
         let invalid_proof = CapabilityProof::from_bytes(&invalid_bytes).unwrap();
         assert!(invalid_proof.verify_signatures().is_err());
-        let valid_claim_handle = source.put::<SimpleArchive, _>(valid_claim).unwrap();
-        let invalid_claim_handle = source.put::<SimpleArchive, _>(invalid_claim).unwrap();
         source.insert_proof(valid_proof.clone()).unwrap();
         source.insert_proof(invalid_proof.clone()).unwrap();
 
@@ -5416,20 +5521,16 @@ mod tests {
                 WantRewritePolicy::Drop,
             )
             .unwrap();
-        assert_eq!(stats.retained_blobs, 4);
+        assert_eq!(stats.retained_blobs, 0);
         assert_eq!(stats.capability_proofs, 2);
 
         let reader = destination.snapshot().unwrap();
         assert!(reader
-            .get::<Blob<SimpleArchive>, _>(valid_claim_handle)
-            .is_ok());
-        assert!(reader.get::<Blob<UnknownBlob>, _>(valid_attachment).is_ok());
-        assert!(reader
-            .get::<Blob<SimpleArchive>, _>(invalid_claim_handle)
-            .is_ok());
+            .get::<Blob<UnknownBlob>, _>(valid_attachment)
+            .is_err());
         assert!(reader
             .get::<Blob<UnknownBlob>, _>(invalid_attachment)
-            .is_ok());
+            .is_err());
         drop(reader);
 
         let stored = destination
@@ -6001,7 +6102,7 @@ mod tests {
         for record in collection_records.iter().copied() {
             source.insert(record).unwrap();
         }
-        let (proof, _) = capability_fixture(74, [75; 32]);
+        let proof = capability_fixture(74, [75; 32]);
         source.insert_proof(proof).unwrap();
 
         source
@@ -8925,7 +9026,7 @@ mod tests {
             StoreChanges::COLLECTION_RECORDS,
         );
 
-        let (proof, _) = capability_fixture(81, [82; 32]);
+        let proof = capability_fixture(81, [82; 32]);
         writer.insert_proof(proof).unwrap();
         writer.flush().unwrap();
         let after_external_proof = observer.snapshot().unwrap();

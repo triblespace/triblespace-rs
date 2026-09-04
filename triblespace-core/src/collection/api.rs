@@ -24,9 +24,9 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
-    capability_quorum_authorized_subjects, capability_quorum_authorizes, CapabilityAction,
-    CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof, CapabilityProofBundle,
-    CapabilityRequest, CapabilityResource,
+    capability_quorum_authorized_subjects, capability_quorum_authorizes, Capability,
+    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityRequest,
+    CapabilityResource,
 };
 use crate::clock;
 use crate::id::Id;
@@ -65,17 +65,15 @@ use super::{
 /// Failure to discover the resident capability evidence used for collection
 /// admission.
 ///
-/// Individual candidate proofs are untrusted evidence: a missing claim,
-/// malformed claim, invalid signature, wrong request, or expired validity
-/// interval merely grants nothing. This error is reserved for failure of the
-/// proof-store observation itself, where silently returning a smaller cover
-/// would confuse unavailable evidence with negative authorization.
+/// Individual candidate proofs are untrusted evidence: an invalid signature,
+/// wrong request, or inactive validity interval merely grants nothing. This
+/// error is reserved for failure of the proof-store observation itself, where
+/// silently returning a smaller cover would confuse unavailable evidence with
+/// negative authorization.
 #[derive(Debug)]
 pub enum CollectionEvidenceDiscoveryError<ProofsError> {
     /// The store could not enumerate its resident proof snapshot.
     Proofs(ProofsError),
-    /// A resident proof dependency could not be observed or read coherently.
-    Resident(ResidentProofLoadError),
 }
 
 impl<ProofsError> fmt::Display for CollectionEvidenceDiscoveryError<ProofsError>
@@ -90,7 +88,6 @@ where
                     "failed to enumerate resident capability proofs: {source}"
                 )
             }
-            Self::Resident(source) => source.fmt(formatter),
         }
     }
 }
@@ -102,34 +99,7 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Proofs(source) => Some(source),
-            Self::Resident(source) => Some(source),
         }
-    }
-}
-
-/// Failure while turning raw proof records into resident semantic evidence.
-#[derive(Debug)]
-pub struct ResidentProofLoadError {
-    claim: Inline<Handle<SimpleArchive>>,
-    operation: &'static str,
-    source: Box<dyn Error + Send + Sync + 'static>,
-}
-
-impl fmt::Display for ResidentProofLoadError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "failed to {} resident capability claim {}: {}",
-            self.operation,
-            hex::encode_upper(self.claim.raw),
-            self.source,
-        )
-    }
-}
-
-impl Error for ResidentProofLoadError {
-    fn source(&self) -> Option<&(dyn Error + 'static)> {
-        Some(self.source.as_ref())
     }
 }
 
@@ -224,11 +194,9 @@ where
 /// Failure to persist one root-issued, unbounded collection grant.
 ///
 /// The operation validates the descriptor and the exact action roots before
-/// writing anything. Claim blobs are then stored before the native proof
-/// record, so a failed or interrupted publication can only leave inert content
-/// behind.
+/// writing one self-contained native proof record.
 #[derive(Debug)]
-pub enum CollectionGrantError<SnapshotError, GetError, PutError, InsertError> {
+pub enum CollectionGrantError<SnapshotError, GetError, InsertError> {
     /// The store could not freeze the read boundary used to validate policy.
     Snapshot(SnapshotError),
     /// The collection descriptor was unavailable or malformed.
@@ -249,18 +217,15 @@ pub enum CollectionGrantError<SnapshotError, GetError, PutError, InsertError> {
         /// Public half of the supplied root signing key.
         root: VerifyingKey,
     },
-    /// A canonical claim blob could not be stored.
-    ClaimPut(PutError),
-    /// The native proof record could not be inserted after its claim closure.
+    /// The native proof record could not be inserted.
     ProofInsert(InsertError),
 }
 
-impl<SnapshotError, GetError, PutError, InsertError> fmt::Display
-    for CollectionGrantError<SnapshotError, GetError, PutError, InsertError>
+impl<SnapshotError, GetError, InsertError> fmt::Display
+    for CollectionGrantError<SnapshotError, GetError, InsertError>
 where
     SnapshotError: fmt::Display,
     GetError: fmt::Display,
-    PutError: fmt::Display,
     InsertError: fmt::Display,
 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -286,26 +251,18 @@ where
                 collection_action_label(*action),
                 hex::encode_upper(collection.raw),
             ),
-            Self::ClaimPut(source) => {
-                write!(
-                    formatter,
-                    "failed to store capability claim before proof: {source}"
-                )
+            Self::ProofInsert(source) => {
+                write!(formatter, "failed to insert capability proof: {source}")
             }
-            Self::ProofInsert(source) => write!(
-                formatter,
-                "failed to insert capability proof after its claims: {source}",
-            ),
         }
     }
 }
 
-impl<SnapshotError, GetError, PutError, InsertError> Error
-    for CollectionGrantError<SnapshotError, GetError, PutError, InsertError>
+impl<SnapshotError, GetError, InsertError> Error
+    for CollectionGrantError<SnapshotError, GetError, InsertError>
 where
     SnapshotError: Error + 'static,
     GetError: Error + 'static,
-    PutError: Error + 'static,
     InsertError: Error + 'static,
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
@@ -313,19 +270,18 @@ where
             Self::Snapshot(source) => Some(source),
             Self::Descriptor(source) => Some(source),
             Self::OpenPolicy { .. } | Self::RootNotAuthorized { .. } => None,
-            Self::ClaimPut(source) => Some(source),
             Self::ProofInsert(source) => Some(source),
         }
     }
 }
 
 /// Error returned by [`grant_collection_read`].
-pub type CollectionReadGrantError<SnapshotError, GetError, PutError, InsertError> =
-    CollectionGrantError<SnapshotError, GetError, PutError, InsertError>;
+pub type CollectionReadGrantError<SnapshotError, GetError, InsertError> =
+    CollectionGrantError<SnapshotError, GetError, InsertError>;
 
 /// Error returned by [`grant_collection_write`].
-pub type CollectionWriteGrantError<SnapshotError, GetError, PutError, InsertError> =
-    CollectionGrantError<SnapshotError, GetError, PutError, InsertError>;
+pub type CollectionWriteGrantError<SnapshotError, GetError, InsertError> =
+    CollectionGrantError<SnapshotError, GetError, InsertError>;
 
 fn collection_action_label(action: Id) -> &'static str {
     match action {
@@ -1056,9 +1012,8 @@ pub(crate) enum AdmissionEvidence {
     Quorum {
         roots: Vec<VerifyingKey>,
         invoke_threshold: NonZeroUsize,
-        delegate_threshold: Option<NonZeroUsize>,
         request: CapabilityRequest,
-        bundles: Arc<[CapabilityProofBundle]>,
+        proofs: Arc<[CapabilityProof]>,
     },
 }
 
@@ -1069,17 +1024,15 @@ impl AdmissionEvidence {
             Self::Quorum {
                 roots,
                 invoke_threshold,
-                delegate_threshold,
                 request,
-                bundles,
+                proofs,
             } => capability_quorum_authorizes(
-                bundles.iter(),
+                proofs.iter(),
                 roots.iter().copied(),
                 instant,
                 subject,
                 *request,
                 *invoke_threshold,
-                *delegate_threshold,
             ),
         }
     }
@@ -1090,63 +1043,25 @@ impl AdmissionEvidence {
             Self::Quorum {
                 roots,
                 invoke_threshold,
-                delegate_threshold,
                 request,
-                bundles,
+                proofs,
             } => CollectionReadAudience::Restricted(capability_quorum_authorized_subjects(
-                bundles.iter(),
+                proofs.iter(),
                 roots.iter().copied(),
                 instant,
                 *request,
                 *invoke_threshold,
-                *delegate_threshold,
             )),
         }
     }
 }
 
-pub(crate) fn load_resident_proof_bundles<R>(
-    reader: &R,
-    proofs: impl IntoIterator<Item = CapabilityProof>,
-) -> Result<Arc<[CapabilityProofBundle]>, ResidentProofLoadError>
-where
-    R: BlobStoreGet + BlobStoreList,
-{
-    let mut bundles = Vec::new();
-    'proofs: for proof in proofs {
-        let mut claims = Vec::new();
-        for claim in proof.claim_handles() {
-            let resident =
-                reader
-                    .contains_blob(claim)
-                    .map_err(|source| ResidentProofLoadError {
-                        claim,
-                        operation: "inspect",
-                        source: Box::new(source),
-                    })?;
-            if !resident {
-                continue 'proofs;
-            }
-            let blob = reader
-                .get::<Blob<SimpleArchive>, SimpleArchive>(claim)
-                .map_err(|source| ResidentProofLoadError {
-                    claim,
-                    operation: "read",
-                    source: Box::new(source),
-                })?;
-            claims.push(blob);
-        }
-        bundles.push(CapabilityProofBundle::new(proof, claims));
-    }
-    Ok(bundles.into())
-}
-
-pub(crate) fn admission_evidence_from_bundles(
+pub(crate) fn admission_evidence_from_proofs(
     policy: &AdmissionPolicy,
     action: crate::id::Id,
     required: CapabilityMode,
     collection: CollectionHandle,
-    bundles: Arc<[CapabilityProofBundle]>,
+    proofs: Arc<[CapabilityProof]>,
 ) -> AdmissionEvidence {
     let AdmissionPolicy::Quorum(quorum) = policy else {
         return AdmissionEvidence::Open;
@@ -1160,33 +1075,25 @@ pub(crate) fn admission_evidence_from_bundles(
         roots: quorum.roots().to_vec(),
         invoke_threshold: NonZeroUsize::new(quorum.invoke_threshold() as usize)
             .expect("validated collection policy has a nonzero invoke threshold"),
-        delegate_threshold: quorum.delegate_threshold().map(|threshold| {
-            NonZeroUsize::new(threshold as usize)
-                .expect("validated collection policy has a nonzero delegate threshold")
-        }),
         request,
-        bundles,
+        proofs,
     }
 }
 
-fn admission_evidence_at<R>(
-    reader: &R,
+fn admission_evidence_at(
     policy: &AdmissionPolicy,
     action: crate::id::Id,
     required: CapabilityMode,
     collection: CollectionHandle,
     proofs: impl IntoIterator<Item = CapabilityProof>,
-) -> Result<AdmissionEvidence, ResidentProofLoadError>
-where
-    R: BlobStoreGet + BlobStoreList,
-{
-    Ok(admission_evidence_from_bundles(
+) -> AdmissionEvidence {
+    admission_evidence_from_proofs(
         policy,
         action,
         required,
         collection,
-        load_resident_proof_bundles(reader, proofs)?,
-    ))
+        proofs.into_iter().collect::<Vec<_>>().into(),
+    )
 }
 
 fn discover_admission_evidence_at<S>(
@@ -1197,20 +1104,26 @@ fn discover_admission_evidence_at<S>(
     collection: CollectionHandle,
 ) -> Result<AdmissionEvidence, CollectionEvidenceDiscoveryError<S::ProofsError>>
 where
-    S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    S: CapabilityProofRead,
 {
     let needs_proofs = matches!(policy, AdmissionPolicy::Quorum(_));
     if !needs_proofs {
-        return admission_evidence_at(snapshot, policy, action, required, collection, [])
-            .map_err(CollectionEvidenceDiscoveryError::Resident);
+        return Ok(admission_evidence_at(
+            policy,
+            action,
+            required,
+            collection,
+            [],
+        ));
     }
     let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
-    admission_evidence_at(snapshot, policy, action, required, collection, proofs)
-        .map_err(CollectionEvidenceDiscoveryError::Resident)
+    Ok(admission_evidence_at(
+        policy, action, required, collection, proofs,
+    ))
 }
 
 fn discover_admitted_cover_at<S, L>(
@@ -1260,25 +1173,24 @@ where
 /// store snapshot. `root` must be named by its READ quorum; an open READ policy
 /// needs no grant and is rejected as a redundant operation.
 ///
-/// The claim closure is written before the proof record. Repeating the same
-/// call with the same collection, root, and recipient therefore reproduces the
-/// same content identities and is idempotent on a conforming store.
+/// Repeating the same call with the same collection, root, and recipient
+/// reproduces the same self-contained proof bytes and is idempotent on a
+/// conforming store.
 pub fn grant_collection_read<S>(
     store: &mut S,
     collection: CollectionHandle,
     root: &SigningKey,
     recipient: VerifyingKey,
 ) -> Result<
-    CapabilityProofBundle,
+    CapabilityProof,
     CollectionReadGrantError<
         <S as SnapshotSource>::SnapshotError,
         <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
-        <S as BlobStorePut>::PutError,
         <S as CapabilityProofStore>::InsertError,
     >,
 >
 where
-    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    S: SnapshotSource + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
     grant_collection_action(store, collection, root, recipient, ACTION_READ)
@@ -1288,26 +1200,24 @@ where
 ///
 /// This is the WRITE counterpart of [`grant_collection_read`]. The descriptor
 /// is validated from one coherent snapshot, `root` must be named by its WRITE
-/// quorum, and the canonical claim closure is stored before the proof record.
-/// The proof activates matching COMMITs by `recipient` when a later collection
-/// snapshot performs WRITE admission; local publication itself remains
-/// unconditional.
+/// quorum. The resulting proof activates matching COMMITs by `recipient` when
+/// a later collection snapshot performs WRITE admission; local publication
+/// itself remains unconditional.
 pub fn grant_collection_write<S>(
     store: &mut S,
     collection: CollectionHandle,
     root: &SigningKey,
     recipient: VerifyingKey,
 ) -> Result<
-    CapabilityProofBundle,
+    CapabilityProof,
     CollectionWriteGrantError<
         <S as SnapshotSource>::SnapshotError,
         <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
-        <S as BlobStorePut>::PutError,
         <S as CapabilityProofStore>::InsertError,
     >,
 >
 where
-    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    S: SnapshotSource + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
     grant_collection_action(store, collection, root, recipient, ACTION_WRITE)
@@ -1320,16 +1230,15 @@ fn grant_collection_action<S>(
     recipient: VerifyingKey,
     action: Id,
 ) -> Result<
-    CapabilityProofBundle,
+    CapabilityProof,
     CollectionGrantError<
         <S as SnapshotSource>::SnapshotError,
         <<S as SnapshotSource>::Snapshot as BlobStoreGet>::GetError<Infallible>,
-        <S as BlobStorePut>::PutError,
         <S as CapabilityProofStore>::InsertError,
     >,
 >
 where
-    S: SnapshotSource + BlobStorePut + CapabilityProofStore,
+    S: SnapshotSource + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
     let snapshot = store.snapshot().map_err(CollectionGrantError::Snapshot)?;
@@ -1353,27 +1262,21 @@ where
     }
     drop(snapshot);
 
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(action),
+    let proof = CapabilityProof::issue_root(
+        root,
         CapabilityResource::from(collection),
+        Capability::new(CapabilityAction::new(action), CapabilityMode::Invoke),
+        None,
+        recipient,
     );
-    let claim = crate::capability::CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
-    let bundle = CapabilityProofBundle::issue_root(root, claim, recipient)
-        .expect("the root READ claim constructed here has no parent");
-
-    for claim in bundle.claims().iter().cloned() {
-        store
-            .put::<SimpleArchive, _>(claim)
-            .map_err(CollectionGrantError::ClaimPut)?;
-    }
     store
-        .insert_proof(bundle.proof().clone())
+        .insert_proof(proof.clone())
         .map_err(CollectionGrantError::ProofInsert)?;
-    Ok(bundle)
+    Ok(proof)
 }
 
 /// Decide READ admission for an untyped collection handle from explicitly
-/// supplied portable proof bundles.
+/// supplied portable proofs.
 ///
 /// Network discovery starts from the descriptor handle carried on the wire,
 /// before its member encoding is known. This boundary therefore validates the
@@ -1383,7 +1286,7 @@ pub fn collection_reader_is_admitted_by_at<S>(
     snapshot: &S,
     collection: CollectionHandle,
     subject: VerifyingKey,
-    bundles: &[CapabilityProofBundle],
+    proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
 where
@@ -1394,7 +1297,7 @@ where
         collection,
         &loaded.policy,
         subject,
-        bundles,
+        proofs,
         instant,
     ))
 }
@@ -1408,55 +1311,54 @@ pub fn collection_reader_is_admitted_by_policy_at(
     collection: CollectionHandle,
     policy: &CollectionPolicy,
     subject: VerifyingKey,
-    bundles: &[CapabilityProofBundle],
+    proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> bool {
-    let evidence = admission_evidence_from_bundles(
+    let evidence = admission_evidence_from_proofs(
         policy.read(),
         ACTION_READ,
         CapabilityMode::Invoke,
         collection,
-        bundles.to_vec().into(),
+        proofs.to_vec().into(),
     );
     evidence.authorizes(subject, instant)
 }
 
 /// Enumerate the READ audience from an already validated collection policy.
 ///
-/// Restricted admission is evaluated once as a least fixed point over the
-/// supplied complete proof bundles. Configured roots plus all reachable
-/// intermediate and final delegates participate, so a principal authorized by
-/// a proof prefix is included even when that prefix is not separately stored.
-/// Invalid, incomplete, unrelated, or invalid-at-`instant` bundles are inert.
+/// Restricted admission is evaluated over independent root paths in the
+/// supplied self-contained proofs. Configured roots plus every independently
+/// valid signed prefix participate, so a principal authorized by a proof prefix
+/// is included even when that prefix is not separately stored. Invalid,
+/// unrelated, or invalid-at-`instant` proofs are inert.
 /// Open admission remains explicit because it cannot be finitely enumerated.
 pub fn collection_read_audience_by_policy_at(
     collection: CollectionHandle,
     policy: &CollectionPolicy,
-    bundles: &[CapabilityProofBundle],
+    proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> CollectionReadAudience {
-    admission_evidence_from_bundles(
+    admission_evidence_from_proofs(
         policy.read(),
         ACTION_READ,
         CapabilityMode::Invoke,
         collection,
-        bundles.to_vec().into(),
+        proofs.to_vec().into(),
     )
     .authorized_subjects(instant)
 }
 
 /// Discover and enumerate the READ audience from one coherent store snapshot.
 ///
-/// Native proofs whose claim blobs are not resident grant nothing until those
-/// exact handles arrive through ordinary blob acquisition. A failed proof-store
-/// observation is reported rather than confused with an empty audience.
+/// A failed proof-store observation is reported rather than confused with an
+/// empty audience. Invalid or unrelated proofs simply grant nothing.
 pub fn collection_read_audience_at<S>(
     snapshot: &S,
     collection: CollectionHandle,
     instant: hifitime::Epoch,
 ) -> Result<CollectionReadAudience, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
 where
-    S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+    S: BlobStoreGet + CapabilityProofRead,
 {
     let loaded = load_collection_descriptor(snapshot, collection)
         .map_err(CollectionAdmissionError::Descriptor)?;
@@ -1481,15 +1383,15 @@ pub fn collection_writer_is_admitted_by_policy_at(
     collection: CollectionHandle,
     policy: &CollectionPolicy,
     subject: VerifyingKey,
-    bundles: &[CapabilityProofBundle],
+    proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> bool {
-    let evidence = admission_evidence_from_bundles(
+    let evidence = admission_evidence_from_proofs(
         policy.write(),
         ACTION_WRITE,
         CapabilityMode::Invoke,
         collection,
-        bundles.to_vec().into(),
+        proofs.to_vec().into(),
     );
     evidence.authorizes(subject, instant)
 }
@@ -1543,8 +1445,8 @@ impl<L: CollectionEncoding> Collection<L> {
     /// Decide whether `subject` is admitted as a writer at `instant`.
     ///
     /// Open policy admits every subject. A quorum admits the subject only when
-    /// the exact-action proof forest carries support from enough distinct
-    /// configured roots.
+    /// independently rooted exact-action proofs carry support from enough
+    /// distinct configured roots.
     pub fn writer_is_admitted_at<S>(
         self,
         snapshot: &S,
@@ -1552,7 +1454,7 @@ impl<L: CollectionEncoding> Collection<L> {
         instant: hifitime::Epoch,
     ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
     where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+        S: BlobStoreGet + CapabilityProofRead,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())
             .map_err(CollectionAdmissionError::Descriptor)?;
@@ -1579,7 +1481,7 @@ impl<L: CollectionEncoding> Collection<L> {
         instant: hifitime::Epoch,
     ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
     where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead,
+        S: BlobStoreGet + CapabilityProofRead,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())
             .map_err(CollectionAdmissionError::Descriptor)?;
@@ -1599,19 +1501,19 @@ impl<L: CollectionEncoding> Collection<L> {
     /// This is the network-facing counterpart of [`Self::reader_is_admitted_at`].
     /// It loads only the immutable collection descriptor from `snapshot`; it
     /// neither enumerates nor persists ambient proof-store state. An open READ
-    /// policy therefore succeeds with an empty bundle slice, while a quorum is
-    /// evaluated over every supplied bundle as one fixed-point proof forest.
+    /// policy therefore succeeds with an empty proof slice, while a quorum is
+    /// evaluated over the independently rooted supplied paths.
     pub fn reader_is_admitted_by_at<S>(
         self,
         snapshot: &S,
         subject: VerifyingKey,
-        bundles: &[CapabilityProofBundle],
+        proofs: &[CapabilityProof],
         instant: hifitime::Epoch,
     ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
     where
         S: BlobStoreGet,
     {
-        collection_reader_is_admitted_by_at(snapshot, self.handle(), subject, bundles, instant)
+        collection_reader_is_admitted_by_at(snapshot, self.handle(), subject, proofs, instant)
     }
 
     /// Discover the exact payload cover admitted at `instant`.
@@ -1757,112 +1659,6 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
-/// Acquire the useful claim prefix named by every bounded, signature-valid
-/// proof rooted in one admission policy.
-///
-/// Root keys and signatures are inline in a native proof record, so forged
-/// evidence and proofs from unrelated roots are rejected before any
-/// attacker-chosen claim handle can trigger exact-H acquisition. Each newly
-/// resident claim is then checked before the next handle is followed: a wrong
-/// atom or parent, an impossible mode meet, expired validity, or a parent
-/// without delegation authority makes the remaining tail irrelevant. Final
-/// quorum admission remains at the pure admission boundary. This operation
-/// never records a WANT.
-async fn acquire_admission_proof_closure<S>(
-    store: &mut S,
-    frontier: &OperationFrontier<S::Snapshot>,
-    policy: &AdmissionPolicy,
-    atom: CapabilityAtom,
-    instant: hifitime::Epoch,
-    attempted: &mut BTreeSet<CollectionData>,
-) -> Result<(), CollectionRealizationError>
-where
-    S: Store + AsyncBlobStoreAcquire,
-{
-    let candidate_proofs = if let Some(roots) = policy.roots() {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("open bounded proof snapshot", error)
-        })?;
-        let bounded = frontier.view(snapshot);
-        let proofs = bounded
-            .proofs()
-            .map_err(|error| {
-                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
-            })?
-            .into_iter()
-            .filter(|proof| roots.contains(&proof.root_key()) && proof.verify_signatures().is_ok())
-            .collect::<Vec<_>>();
-        proofs
-    } else {
-        Vec::new()
-    };
-
-    'proof: for proof in candidate_proofs {
-        let mut previous = None;
-        let mut effective_mode: Option<CapabilityMode> = None;
-        for claim_handle in proof.claim_handles() {
-            if effective_mode.is_some_and(|mode| !mode.delegates()) {
-                break;
-            }
-
-            let claim_blob = loop {
-                let snapshot = store.snapshot().map_err(|error| {
-                    CollectionRealizationError::storage("inspect proof dependency snapshot", error)
-                })?;
-                let bounded = frontier.view(snapshot);
-                let resident = bounded.contains_blob(claim_handle).map_err(|error| {
-                    CollectionRealizationError::storage("inspect proof dependency residency", error)
-                })?;
-                if resident {
-                    break bounded
-                        .get::<Blob<SimpleArchive>, SimpleArchive>(claim_handle)
-                        .map_err(|error| {
-                            CollectionRealizationError::storage(
-                                "read resident proof dependency",
-                                error,
-                            )
-                        })?;
-                }
-
-                drop(bounded);
-                let member = Handle::<SimpleArchive>::to_hash(claim_handle);
-                if !super::exact_derived::acquire_missing(store, attempted, member).await? {
-                    continue 'proof;
-                }
-            };
-
-            let Ok(claim) = CapabilityClaim::from_blob(claim_blob) else {
-                break;
-            };
-            if claim.parent() != previous || claim.atom() != atom {
-                break;
-            }
-            let mode = match effective_mode {
-                None => claim.mode(),
-                Some(parent) => {
-                    let Some(mode) = parent.meet(claim.mode()) else {
-                        break;
-                    };
-                    mode
-                }
-            };
-            if claim
-                .validity()
-                .is_some_and(|validity| !validity.contains(instant))
-            {
-                break;
-            }
-            previous = Some(claim_handle);
-            effective_mode = Some(mode);
-        }
-    }
-    Ok(())
-}
-
 async fn admitted_support_and_commits_with_acquisition<S, E>(
     store: &mut S,
     target: Collection<E>,
@@ -1891,37 +1687,9 @@ where
         }
     };
 
-    // Claim closure is acquired only for proofs rooted in this collection's
-    // WRITE policy.
-    let snapshot = store.snapshot().map_err(|error| {
-        CollectionRealizationError::storage("open bounded proof snapshot", error)
-    })?;
-    let bounded = frontier.view(snapshot);
-    let descriptor =
-        load_collection_descriptor(&bounded, foundation.handle()).map_err(|error| {
-            CollectionRealizationError::Resolution(format!(
-                "load foundation descriptor for active admission: {error}"
-            ))
-        })?;
-    let write_policy = descriptor.policy.write().clone();
-    drop(bounded);
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(foundation.handle()),
-    );
-    acquire_admission_proof_closure(
-        store,
-        frontier,
-        &write_policy,
-        atom,
-        instant,
-        &mut attempted,
-    )
-    .await?;
-
-    // With proof closure resident, decide authorization before acquiring any
-    // attacker-supplied payload. Only strictly signed COMMITs by an admitted
-    // writer can cause data or metadata acquisition.
+    // Decide authorization before acquiring any attacker-supplied payload.
+    // Self-contained proofs need no blob acquisition; only strictly signed
+    // COMMITs by an admitted writer can cause data or metadata acquisition.
     let snapshot = store.snapshot().map_err(|error| {
         CollectionRealizationError::storage("open bounded commit snapshot", error)
     })?;
@@ -2143,7 +1911,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     ///
     /// `control` supplies the exact collection-record and capability-proof
     /// frontier. Later store snapshots contribute only blob residency: missing
-    /// descriptors, useful WRITE claims, and direct dependencies of authorized
+    /// descriptors and direct dependencies of authorized
     /// COMMITs may be acquired by exact content handle without recording WANTs.
     /// A COMMIT whose complete direct closure still cannot be acquired remains
     /// semantically invisible in the returned support. Concurrent records and
@@ -2199,12 +1967,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// Acquire and enumerate one collection's frozen READ audience.
     ///
     /// The collection identity and capability-proof frontier are frozen at
-    /// entry. Its missing content-addressed descriptor, then missing claim
-    /// blobs named by signature-valid proofs rooted in the descriptor's READ
-    /// policy, are acquired by exact content handle without recording WANTs.
-    /// Audience evaluation uses that original proof frontier over the later
-    /// blob residency, so concurrent proof arrival is deliberately deferred
-    /// to the next call.
+    /// entry. Its missing content-addressed descriptor is acquired by exact
+    /// handle without recording a WANT. Capability proofs are self-contained,
+    /// so audience evaluation can use the original proof frontier immediately;
+    /// concurrent proof arrival is deliberately deferred to the next call.
     fn acquire_read_audience_at(
         &mut self,
         collection: CollectionHandle,
@@ -2220,7 +1986,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let frontier = OperationFrontier::new(control);
 
             let mut attempted = BTreeSet::new();
-            let read_policy = loop {
+            loop {
                 let snapshot = self.snapshot().map_err(|error| {
                     CollectionRealizationError::storage("open bounded READ policy snapshot", error)
                 })?;
@@ -2232,13 +1998,12 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                     )
                 })?;
                 if resident {
-                    let descriptor =
-                        load_collection_descriptor(&bounded, collection).map_err(|error| {
-                            CollectionRealizationError::Resolution(format!(
-                                "load collection descriptor for active READ audience: {error}"
-                            ))
-                        })?;
-                    break descriptor.policy.read().clone();
+                    load_collection_descriptor(&bounded, collection).map_err(|error| {
+                        CollectionRealizationError::Resolution(format!(
+                            "load collection descriptor for active READ audience: {error}"
+                        ))
+                    })?;
+                    break;
                 }
 
                 drop(bounded);
@@ -2246,21 +2011,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 if !super::exact_derived::acquire_missing(self, &mut attempted, member).await? {
                     return Err(CollectionRealizationError::MissingDependency { member });
                 }
-            };
-
-            let atom = CapabilityAtom::new(
-                CapabilityAction::new(ACTION_READ),
-                CapabilityResource::from(collection),
-            );
-            acquire_admission_proof_closure(
-                self,
-                &frontier,
-                &read_policy,
-                atom,
-                instant,
-                &mut attempted,
-            )
-            .await?;
+            }
 
             let snapshot = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze hydrated READ audience snapshot", error)

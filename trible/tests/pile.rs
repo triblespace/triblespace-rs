@@ -19,7 +19,7 @@ use triblespace_core::collection::{
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::repo::pile::{Pile, PileRecordContent, PileRecords};
-use triblespace_core::repo::{CapabilityProofRead, WantRequest, WantStore};
+use triblespace_core::repo::{CapabilityProofRead, WantRead, WantRequest, WantStore};
 use triblespace_core::trible::TribleSet;
 
 fn opaque_envelope(needle: Option<[u8; 32]>) -> Vec<u8> {
@@ -298,7 +298,9 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
         ));
 
     let mut before = Pile::open(&source_path).unwrap();
-    assert!(before.wants().unwrap().next().is_none());
+    let before_snapshot = before.snapshot().unwrap();
+    assert!(before_snapshot.wants().unwrap().next().is_none());
+    drop(before_snapshot);
     before.close().unwrap();
 
     Command::cargo_bin("trible")
@@ -351,14 +353,16 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
     drop(appended);
 
     let mut reopened = Pile::open(&source_path).unwrap();
+    let reopened_snapshot = reopened.snapshot().unwrap();
     assert_eq!(
-        reopened
+        reopened_snapshot
             .wants()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap(),
         vec![WantRequest::blob(active)]
     );
+    drop(reopened_snapshot);
     reopened.close().unwrap();
 
     Command::cargo_bin("trible")
@@ -373,14 +377,16 @@ fn monotone_want_migration_is_explicit_additive_and_idempotent() {
             "retired WANT log records: 4 -> 0 (dropped)",
         ));
     let mut compacted = Pile::open(&destination_path).unwrap();
+    let compacted_snapshot = compacted.snapshot().unwrap();
     assert_eq!(
-        compacted
+        compacted_snapshot
             .wants()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap(),
         vec![WantRequest::blob(active)]
     );
+    drop(compacted_snapshot);
     compacted.close().unwrap();
 }
 
@@ -635,7 +641,10 @@ fn collection_grant_read_is_replay_idempotent_and_admits_the_endpoint() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(proofs.len(), 1);
-    let _: Blob<SimpleArchive> = snapshot.get(proofs[0].leaf_claim()).unwrap();
+    assert_eq!(proofs[0].root_key(), root.verifying_key());
+    assert_eq!(proofs[0].leaf_key(), reader.verifying_key());
+    assert_eq!(proofs[0].resource().as_bytes(), &collection.handle().raw);
+    proofs[0].verify_signatures().unwrap();
     drop(snapshot);
     pile.close().unwrap();
 }
@@ -708,7 +717,10 @@ fn collection_grant_write_is_replay_idempotent_and_admits_the_author() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
     assert_eq!(proofs.len(), 1);
-    let _: Blob<SimpleArchive> = snapshot.get(proofs[0].leaf_claim()).unwrap();
+    assert_eq!(proofs[0].root_key(), root.verifying_key());
+    assert_eq!(proofs[0].leaf_key(), writer.verifying_key());
+    assert_eq!(proofs[0].resource().as_bytes(), &collection.handle().raw);
+    proofs[0].verify_signatures().unwrap();
     drop(snapshot);
     pile.close().unwrap();
 }

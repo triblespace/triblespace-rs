@@ -20,7 +20,7 @@ names directly:
 | `COMMIT` | collection descriptor, data, metadata |
 | `MERGE` | collection descriptor, low input, high input, result |
 | `DERIVE` | target descriptor, input, output |
-| authorization proof | every claim handle in proof order |
+| authorization proof | none; the proof is self-contained |
 | `WANT Blob(H)` | `H` |
 | `WANT Merge(C, A, B)` | `C`, `A`, `B` |
 | `WANT Derive(C, A)` | `C`, `A` |
@@ -38,7 +38,9 @@ collection admission, or decide whether an equation is algebraically useful.
 Those are semantic questions for a reader. Physical preservation must remain
 stable when later evidence changes what a record means, and it must not let an
 authorization bug silently destroy bytes. Conversely, retaining bytes grants
-no authority.
+no authority. A retained proof has no blob closure: its opaque resource bytes
+do not become a lifetime edge even when an application interprets them as a
+collection descriptor handle.
 
 The typed reference enumeration lives on the records themselves. MemoryRepo,
 Pile rewrites, and Yard collection all consume the same enumeration rather

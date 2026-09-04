@@ -10,8 +10,7 @@ use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{Blob, BlobEncoding, Bytes, IntoBlob, TryFromBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityResource,
+    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
 };
 use triblespace_core::collection::simplearchive_union;
 use triblespace_core::collection::{
@@ -172,21 +171,14 @@ fn support(
         .collect();
     writers.sort_unstable_by_key(VerifyingKey::to_bytes);
     writers.dedup();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection.handle()),
-    );
     for writer in writers {
-        let bundle = CapabilityProofBundle::issue_root(
+        let proof = CapabilityProof::issue_root(
             &root,
-            CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+            CapabilityResource::from(collection.handle()),
+            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            None,
             writer,
-        )
-        .unwrap();
-        let (proof, claims) = bundle.into_parts();
-        for claim in claims {
-            store.put::<SimpleArchive, _>(claim).unwrap();
-        }
+        );
         store.insert_proof(proof).unwrap();
     }
     collection
@@ -457,7 +449,7 @@ fn existing_target_merge_is_selected_as_one_physical_member() {
 }
 
 #[test]
-fn absent_source_bytes_report_the_foundational_member() {
+fn absent_source_bytes_hide_the_commit_from_admitted_support() {
     let mut store = CollectionOnly::default();
     let (source, target) = test_paths(&mut store, "paths", plus());
     let absent = edge(1, 2).to_blob();
@@ -472,12 +464,11 @@ fn absent_source_bytes_report_the_foundational_member() {
     );
     publish(&mut store, commit);
     let support = support(&mut store, source, [commit]);
+    assert!(support.is_empty());
     let snapshot = store.snapshot().unwrap();
-    assert!(matches!(
-        snapshot.collection_exact(target, &support),
-        Err(CollectionRealizationError::IncompleteCover {
-            unsupported_members,
-            ..
-        }) if unsupported_members == vec![commit.data()]
-    ));
+    assert!(snapshot
+        .collection_exact(target, &support)
+        .unwrap()
+        .cover()
+        .is_empty());
 }

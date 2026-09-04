@@ -6,10 +6,10 @@ use hifitime::Epoch;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
 use triblespace_core::blob::encodings::utf8string::UTF8String;
-use triblespace_core::blob::{Blob, BlobEncoding, IntoBlob};
+use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityRequest, CapabilityResource,
+    Capability, CapabilityAction, CapabilityAtom, CapabilityIssueError, CapabilityMode,
+    CapabilityProof, CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::{
@@ -121,14 +121,6 @@ fn atom(action: triblespace_core::id::Id, collection: Collection<SimpleArchive>)
     )
 }
 
-fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
-    let (proof, claims) = bundle.into_parts();
-    for claim in claims {
-        store.put::<SimpleArchive, _>(claim).unwrap();
-    }
-    store.insert_proof(proof).unwrap();
-}
-
 #[test]
 fn root_creation_registers_a_self_contained_descriptor() {
     let root = key(1);
@@ -237,7 +229,7 @@ fn typed_collection_open_rejects_an_invalid_descriptor() {
 }
 
 #[test]
-fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
+fn read_grant_is_root_checked_and_replay_deterministic() {
     let root = key(25);
     let reader = key(26);
     let mut store = CountingRepo::default();
@@ -253,21 +245,19 @@ fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
         reader.verifying_key(),
     )
     .unwrap();
-    let claim_handle = first.proof().leaf_claim();
-    assert_eq!(
-        store.events,
-        vec![
-            StoreEvent::Put(claim_handle.raw),
-            StoreEvent::Proof(first.proof().id().raw),
-        ]
-    );
+    assert_eq!(store.events, vec![StoreEvent::Proof(first.id().raw)]);
 
-    let claim = CapabilityClaim::from_blob(first.claims()[0].clone()).unwrap();
-    assert_eq!(claim.parent(), None);
-    assert_eq!(claim.mode(), CapabilityMode::Invoke);
-    assert_eq!(claim.validity(), None);
-    assert_eq!(claim.atom(), atom(ACTION_READ, collection));
-    assert_eq!(first.proof().leaf_key(), reader.verifying_key());
+    assert_eq!(first.resource(), atom(ACTION_READ, collection).resource());
+    assert_eq!(first.root_key(), root.verifying_key());
+    assert_eq!(
+        first.capabilities().collect::<Vec<_>>(),
+        vec![Capability::new(
+            CapabilityAction::new(ACTION_READ),
+            CapabilityMode::Invoke,
+        )]
+    );
+    assert_eq!(first.validities().collect::<Vec<_>>(), vec![None]);
+    assert_eq!(first.leaf_key(), reader.verifying_key());
 
     store.events.clear();
     let replay = grant_collection_read(
@@ -278,13 +268,7 @@ fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
     )
     .unwrap();
     assert_eq!(replay, first);
-    assert_eq!(
-        store.events,
-        vec![
-            StoreEvent::Put(claim_handle.raw),
-            StoreEvent::Proof(first.proof().id().raw),
-        ]
-    );
+    assert_eq!(store.events, vec![StoreEvent::Proof(first.id().raw)]);
 
     let snapshot = store.snapshot().unwrap();
     let proofs = snapshot
@@ -292,9 +276,7 @@ fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
         .unwrap()
         .collect::<Result<Vec<_>, _>>()
         .unwrap();
-    assert_eq!(proofs, vec![first.proof().clone()]);
-    let stored_claim: Blob<SimpleArchive> = snapshot.get(claim_handle).unwrap();
-    assert_eq!(stored_claim, first.claims()[0]);
+    assert_eq!(proofs, vec![first]);
     assert!(collection
         .reader_is_admitted_at(
             &snapshot,
@@ -305,7 +287,7 @@ fn read_grant_is_root_checked_commit_last_and_replay_deterministic() {
 }
 
 #[test]
-fn write_grant_is_root_checked_commit_last_and_activates_recipient_commits() {
+fn write_grant_is_root_checked_and_activates_recipient_commits() {
     let root = key(34);
     let writer = key(35);
     let mut store = CountingRepo::default();
@@ -327,28 +309,26 @@ fn write_grant_is_root_checked_commit_last_and_activates_recipient_commits() {
     drop(snapshot);
     store.events.clear();
 
-    let bundle = grant_collection_write(
+    let proof = grant_collection_write(
         &mut store,
         collection.handle(),
         &root,
         writer.verifying_key(),
     )
     .unwrap();
-    let claim_handle = bundle.proof().leaf_claim();
-    assert_eq!(
-        store.events,
-        vec![
-            StoreEvent::Put(claim_handle.raw),
-            StoreEvent::Proof(bundle.proof().id().raw),
-        ]
-    );
+    assert_eq!(store.events, vec![StoreEvent::Proof(proof.id().raw)]);
 
-    let claim = CapabilityClaim::from_blob(bundle.claims()[0].clone()).unwrap();
-    assert_eq!(claim.parent(), None);
-    assert_eq!(claim.mode(), CapabilityMode::Invoke);
-    assert_eq!(claim.validity(), None);
-    assert_eq!(claim.atom(), atom(ACTION_WRITE, collection));
-    assert_eq!(bundle.proof().leaf_key(), writer.verifying_key());
+    assert_eq!(proof.resource(), atom(ACTION_WRITE, collection).resource());
+    assert_eq!(proof.root_key(), root.verifying_key());
+    assert_eq!(
+        proof.capabilities().collect::<Vec<_>>(),
+        vec![Capability::new(
+            CapabilityAction::new(ACTION_WRITE),
+            CapabilityMode::Invoke,
+        )]
+    );
+    assert_eq!(proof.validities().collect::<Vec<_>>(), vec![None]);
+    assert_eq!(proof.leaf_key(), writer.verifying_key());
 
     let snapshot = store.snapshot().unwrap();
     assert!(collection
@@ -594,7 +574,7 @@ fn read_and_write_policies_are_independent() {
 }
 
 #[test]
-fn direct_policy_accepts_root_grants_but_blocks_redelegation() {
+fn invoke_only_root_proof_admits_recipient_but_blocks_redelegation() {
     let root = key(5);
     let intermediary = key(6);
     let leaf = key(7);
@@ -609,34 +589,23 @@ fn direct_policy_accepts_root_grants_but_blocks_redelegation() {
         )
         .unwrap();
     let write_atom = atom(ACTION_WRITE, collection);
-    let parent_bundle = CapabilityProofBundle::issue_root(
+    let parent_proof = CapabilityProof::issue_root(
         &root,
-        CapabilityClaim::root(write_atom, CapabilityMode::InvokeAndDelegate, None),
+        write_atom.resource(),
+        Capability::new(write_atom.action(), CapabilityMode::Invoke),
+        None,
         intermediary.verifying_key(),
-    )
-    .unwrap();
-    let parent = parent_bundle
-        .verify(
-            root.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-            intermediary.verifying_key(),
-            CapabilityRequest::new(write_atom, CapabilityMode::InvokeAndDelegate),
-        )
-        .unwrap();
-    let child_bundle = parent
-        .delegate(
+    );
+    let error = parent_proof
+        .extend(
             &intermediary,
-            CapabilityClaim::delegated(
-                parent.claim_handle(),
-                write_atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
+            Capability::new(write_atom.action(), CapabilityMode::Invoke),
+            None,
             leaf.verifying_key(),
         )
-        .unwrap();
-    store_bundle(&mut store, parent_bundle);
-    store_bundle(&mut store, child_bundle);
+        .unwrap_err();
+    assert_eq!(error, CapabilityIssueError::ParentCannotDelegate);
+    store.insert_proof(parent_proof).unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let instant = Epoch::from_tai_seconds(0.0);
@@ -663,15 +632,15 @@ fn read_grants_use_the_distinct_read_action() {
         )
         .unwrap();
     let read_atom = atom(ACTION_READ, collection);
-    store_bundle(
-        &mut store,
-        CapabilityProofBundle::issue_root(
+    store
+        .insert_proof(CapabilityProof::issue_root(
             &root,
-            CapabilityClaim::root(read_atom, CapabilityMode::Invoke, None),
+            read_atom.resource(),
+            Capability::new(read_atom.action(), CapabilityMode::Invoke),
+            None,
             reader.verifying_key(),
-        )
-        .unwrap(),
-    );
+        ))
+        .unwrap();
 
     let snapshot = store.snapshot().unwrap();
     let instant = Epoch::from_tai_seconds(0.0);
@@ -684,11 +653,10 @@ fn read_grants_use_the_distinct_read_action() {
 }
 
 #[test]
-fn read_audience_uses_complete_snapshot_closure_and_includes_proof_prefixes() {
+fn read_audience_includes_valid_proof_prefixes() {
     let root = key(83);
     let intermediary = key(84);
     let leaf = key(85);
-    let incomplete = key(86);
     let mut store = MemoryRepo::default();
     let collection = store
         .collection(
@@ -700,43 +668,22 @@ fn read_audience_uses_complete_snapshot_closure_and_includes_proof_prefixes() {
         )
         .unwrap();
     let read_atom = atom(ACTION_READ, collection);
-    let parent_bundle = CapabilityProofBundle::issue_root(
+    let parent_proof = CapabilityProof::issue_root(
         &root,
-        CapabilityClaim::root(read_atom, CapabilityMode::InvokeAndDelegate, None),
+        read_atom.resource(),
+        Capability::new(read_atom.action(), CapabilityMode::InvokeAndDelegate),
+        None,
         intermediary.verifying_key(),
-    )
-    .unwrap();
-    let parent = parent_bundle
-        .verify(
-            root.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-            intermediary.verifying_key(),
-            CapabilityRequest::new(read_atom, CapabilityMode::InvokeAndDelegate),
-        )
-        .unwrap();
-    let child_bundle = parent
-        .delegate(
+    );
+    let child_proof = parent_proof
+        .extend(
             &intermediary,
-            CapabilityClaim::delegated(
-                parent.claim_handle(),
-                read_atom,
-                CapabilityMode::Invoke,
-                None,
-            ),
+            Capability::new(read_atom.action(), CapabilityMode::Invoke),
+            None,
             leaf.verifying_key(),
         )
         .unwrap();
-    store_bundle(&mut store, child_bundle);
-
-    let incomplete_proof = CapabilityProofBundle::issue_root(
-        &root,
-        CapabilityClaim::root(read_atom, CapabilityMode::Invoke, None),
-        incomplete.verifying_key(),
-    )
-    .unwrap()
-    .proof()
-    .clone();
-    store.insert_proof(incomplete_proof).unwrap();
+    store.insert_proof(child_proof).unwrap();
 
     let CollectionReadAudience::Restricted(readers) = collection_read_audience_at(
         &store.snapshot().unwrap(),
@@ -749,7 +696,6 @@ fn read_audience_uses_complete_snapshot_closure_and_includes_proof_prefixes() {
     assert!(readers.contains(&root.verifying_key()));
     assert!(readers.contains(&intermediary.verifying_key()));
     assert!(readers.contains(&leaf.verifying_key()));
-    assert!(!readers.contains(&incomplete.verifying_key()));
 }
 
 #[test]
@@ -775,28 +721,28 @@ fn collection_quorum_needs_support_from_distinct_roots() {
     let write_atom = atom(ACTION_WRITE, collection);
     let instant = Epoch::from_tai_seconds(0.0);
 
-    store_bundle(
-        &mut store,
-        CapabilityProofBundle::issue_root(
+    store
+        .insert_proof(CapabilityProof::issue_root(
             &first_root,
-            CapabilityClaim::root(write_atom, CapabilityMode::Invoke, None),
+            write_atom.resource(),
+            Capability::new(write_atom.action(), CapabilityMode::Invoke),
+            None,
             writer.verifying_key(),
-        )
-        .unwrap(),
-    );
+        ))
+        .unwrap();
     assert!(!collection
         .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
         .unwrap());
 
-    store_bundle(
-        &mut store,
-        CapabilityProofBundle::issue_root(
+    store
+        .insert_proof(CapabilityProof::issue_root(
             &second_root,
-            CapabilityClaim::root(write_atom, CapabilityMode::Invoke, None),
+            write_atom.resource(),
+            Capability::new(write_atom.action(), CapabilityMode::Invoke),
+            None,
             writer.verifying_key(),
-        )
-        .unwrap(),
-    );
+        ))
+        .unwrap();
     assert!(collection
         .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
         .unwrap());

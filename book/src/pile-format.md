@@ -21,7 +21,7 @@ memory map never exposes half-written records.
 
 Every record the pile writes begins with the same **64-byte common prefix** and
 occupies a **256-byte multiple**. Fixed records fit in one 256-byte frame; blobs
-and longer capability proofs continue after it and are zero-padded to their
+and variable capability proofs continue after it and are zero-padded to their
 declared span:
 
 | Offset | Width | Field |
@@ -36,12 +36,14 @@ The magic was minted on 2026-08-20 as two `trible genid` calls,
 concatenated and truncated to 28 bytes. Those widths are chosen so the body
 starts at byte 64, and two things follow from that.
 
-**Every field lands on a 32-byte boundary.** A 32-byte digest, handle, or
-signature component in the body begins at a multiple of 32 — and because
+**Fixed-record fields and blob payloads align.** A 32-byte digest, handle, or
+signature component in a fixed record begins at a multiple of 32 — and because
 records themselves begin on 256-byte boundaries, the alignment holds at
 absolute file offsets, not merely within the record. The predecessor framing
-put a 36-byte prefix in front of the body, which left every 32-byte field four
-bytes short of a boundary and made each one straddle two.
+put a 36-byte prefix in front of the body, which left every such field four
+bytes short of a boundary and made each one straddle two. Capability proofs are
+the deliberate exception: their compact, length-delimited grammar packs
+145-byte edges and promises no internal field alignment.
 
 **The record kind resolves.** 32 bytes is a blob handle, and the handle names a
 `SimpleArchive` describing the record kind: its name, the exact byte layout of
@@ -65,11 +67,13 @@ STORE_SCOPE kinds remain recognized by their pinned constants and decoder, but
 fresh piles neither write nor advertise those dead formats.
 
 The arithmetic works out exactly. A signed commit contains six 32-byte fields,
-so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge direct capability
-proof also ends at byte 256. Longer proofs use more blocks without changing
-their canonical body.
+so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge capability
+proof has a 225-byte body after its 96-byte envelope prefix and therefore uses
+two blocks. Longer proofs use the minimal additional whole blocks without
+changing their canonical body.
 
-A collection descriptor and every capability claim remain ordinary blobs.
+A collection descriptor remains an ordinary blob. Capability proofs are
+self-contained native records and have no companion claim blobs.
 One typed WANT kind stores a grow-only request set; retired assertion,
 retraction, and pin records remain structurally readable as explicit migration
 input but have no current replay effect.
@@ -439,8 +443,8 @@ BLAKE3 fingerprint only as a fixed-width lookup and deduplication key.
 The collection itself is identified by a canonical `SimpleArchive` descriptor.
 Its 32-byte blob handle is the sole `CollectionHandle`. Records carry this
 handle directly; there is no definition record or registry. Consequently a
-transferred claim names the exact descriptor bytes needed to interpret it,
-using the ordinary blob store.
+transferred collection record names the exact descriptor bytes needed to
+interpret it, using the ordinary blob store.
 
 The descriptor archive holds a descriptor entity carrying:
 
@@ -454,10 +458,13 @@ The descriptor archive holds a descriptor entity carrying:
   a lineage it does not have;
 - `collection_read_policy` and `collection_write_policy`, each linking one
   self-contained policy entity. An open policy needs no proof. A quorum policy
-  carries a canonical nonempty set of Ed25519 roots, an invoke threshold, and
-  an optional delegation threshold. Roots and derivations state both policies
-  independently; source walking never supplies authority. Their ordinary
-  facts participate directly in the descriptor handle;
+  carries a canonical nonempty set of Ed25519 roots and one semantic quorum
+  threshold. The byte-compatible descriptor may still contain the earlier
+  optional delegation-threshold fact, but authorization ignores it; a signed
+  proof edge's mode alone determines whether its root share can be delegated
+  onward. Roots and derivations state both policies independently; source
+  walking never supplies authority. Their ordinary facts participate directly
+  in the descriptor handle;
 - `collection_representation`, naming the canonical member encoding. The
   encoding owns validation and the intra-encoding join;
 - on a derivation, `collection_mapping`, linking a concrete mapping entity.
@@ -535,7 +542,14 @@ replay.
 ## Native Capability Proof Records
 
 `CapabilityProofStore` is a second grow-only native set. Each member is the
-canonical direct proof body `K0 (S C K)+`; its logical key is
+canonical self-contained prefix-signed proof body
+
+```text
+magic16 | resource32 | root32 |
+    (action16 | flags1 | validity32 | delegate32 | signature64)+
+```
+
+Its logical key is
 `CapabilityProofId = BLAKE3(body)`. The ID is reconstructed during replay and
 is not duplicated in the frame.
 
@@ -543,30 +557,57 @@ is not duplicated in the frame.
 |---:|---:|---|
 | `0..28` | 28 | Framing magic |
 | `28..32` | 4 | Minimal total 256-byte-block span, little-endian |
-| `32..64` | 32 | Proof kind `29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053`, rooted at `CD21D2250D6C7B3C6E2EC94817BD73C9` |
+| `32..64` | 32 | Proof kind `334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5`, rooted at `C1E5E9D46B4D72AAC1D22170E546C144` |
 | `64..72` | 8 | Exact proof-body byte length, little-endian |
 | `72..96` | 24 | Reserved zeros |
 | `96..96+length` | variable | Canonical proof body |
 | remainder | variable | Zero padding to the declared span |
 
-The body length must be exactly `32 + 128n` for `1 <= n <= 255`. Replay parses
-every Ed25519 key, requires the declared span to be the smallest span containing
-the body, and rejects any nonzero reserved or padding byte as corruption. One
-edge is 160 body bytes and therefore fills exactly one 256-byte record;
-additional edges preserve 32-byte alignment.
+The proof header is exactly 80 bytes:
+
+| Body offset | Width | Field |
+|---:|---:|---|
+| `0..16` | 16 | Grammar magic `5C154102198D7FED2EA797720C2E258D` |
+| `16..48` | 32 | Opaque resource identity |
+| `48..80` | 32 | Root Ed25519 public key |
+
+Each following edge is exactly 145 bytes:
+
+| Edge offset | Width | Field |
+|---:|---:|---|
+| `0..16` | 16 | Exact non-nil action ID |
+| `16..17` | 1 | Invoke/delegate mode bits plus validity-presence bit |
+| `17..49` | 32 | Two signed big-endian 128-bit TAI-nanosecond bounds, or canonical zeros |
+| `49..81` | 32 | Delegate Ed25519 public key |
+| `81..145` | 64 | Ed25519 signature over the exact body prefix through this delegate |
+
+The body length must be exactly `80 + 145n` for `1 <= n <= 255`. Replay parses
+every Ed25519 key, requires a nonzero action and known nonempty mode on each
+edge, validates the optional inclusive interval encoding, requires the declared
+span to be the smallest span containing the body, and rejects any nonzero
+reserved or padding byte as corruption. The low two flag bits encode Invoke,
+Delegate, or both; bit 2 marks a present interval; all higher bits must be zero.
+A one-edge body is 225 bytes, so its pile record occupies two 256-byte blocks.
 
 Insertion of identical bytes is idempotent. Different bytes reconstructing to
 the same proof ID are a collision and fail. Exact lookup is only by proof ID;
-the store does not discover proofs from keys or claim handles, and record
-presence grants no authority.
+the store does not infer a proof from a key, resource, or request, and record
+presence grants no authority. Each signature is last and covers every earlier
+body byte through its own delegate, including prior signatures. An exact prefix
+ending after any signature is therefore a complete proof for that intermediate
+delegate.
 
-Conservative rewrites preserve every canonical proof record. Each proof makes
-every independently resident claim handle in its body a recursive blob root,
-without consulting signature validity or semantic authorization. Missing
-claims remain absent without fetching and do not suppress resident siblings.
-Full semantic verification still needs the external trust root, expected leaf,
-instant, request, and exact ordered claim blobs; physical retention grants no
-authority.
+Conservative rewrites preserve every current canonical proof record but create
+no blob lifetime edge from it. In particular, the opaque resource field is not
+interpreted as a blob handle by storage. Full semantic verification still
+needs the external trust root, expected subject, instant, and exact request;
+physical retention grants no authority.
+
+The earlier `K(S,C,K)+` proof record kind remains structurally recognizable as
+an inert frame so an append-only pile can be traversed safely. Fresh writers do
+not emit it, replay projects no authorization evidence from it, and semantic
+rewrites may drop it. Its signatures covered a different grammar and cannot be
+mechanically migrated; the relevant private keys must reissue authority.
 
 ## Retired Team-Era Records
 

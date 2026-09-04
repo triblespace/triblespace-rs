@@ -71,8 +71,9 @@ let library = storage.collection(
 ```
 
 Each policy is either `Open` or a canonical threshold over capability roots.
-`AdmissionPolicy::direct(root)` admits that root and direct grants it signs,
-without letting a grantee redelegate. The two policies are deliberately
+`AdmissionPolicy::direct(root)` records one such root. Each signed proof edge
+then says whether its recipient may invoke, delegate, or do both. The two
+policies are deliberately
 independent: a collection can have many writers but few readers, or public
 READ with tightly held WRITE. Both policies participate in the descriptor
 handle, so there is no ambient team scope or separate reach flag.

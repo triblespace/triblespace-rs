@@ -14,9 +14,8 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityProofId, CapabilityRequest, CapabilityResource,
-    CapabilityValidity,
+    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityProofId,
+    CapabilityResource, CapabilityValidity,
 };
 use crate::collection::{
     collection_read_audience_at, AdmissionPolicy, CollectionCommit, CollectionMerge,
@@ -64,20 +63,16 @@ where
 fn append_adversarial_proof_edge(
     proof: CapabilityProof,
     issuer: &SigningKey,
-    claim: Inline<Handle<SimpleArchive>>,
+    action: CapabilityAction,
     delegate: VerifyingKey,
 ) -> CapabilityProof {
-    let mut transcript = Vec::new();
-    transcript.extend_from_slice(b"triblespace.capability.proof-edge\0");
-    transcript.extend_from_slice(&1_u32.to_be_bytes());
-    transcript.extend_from_slice(&issuer.verifying_key().to_bytes());
-    transcript.extend_from_slice(&claim.raw);
-    transcript.extend_from_slice(&delegate.to_bytes());
-
     let mut bytes = proof.into_bytes();
-    bytes.extend_from_slice(&issuer.sign(&transcript).to_bytes());
-    bytes.extend_from_slice(&claim.raw);
+    bytes.extend_from_slice(&action.id().raw());
+    bytes.push(1); // CapabilityMode::Invoke
+    bytes.extend_from_slice(&[0; 32]); // Unbounded validity.
     bytes.extend_from_slice(&delegate.to_bytes());
+    let signature = issuer.sign(&bytes);
+    bytes.extend_from_slice(&signature.to_bytes());
     CapabilityProof::from_bytes(&bytes).expect("adversarial proof wire remains structurally valid")
 }
 
@@ -923,68 +918,7 @@ fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
 }
 
 #[test]
-fn async_ensure_hydrates_relevant_proof_before_authorized_commit_payload() {
-    let authority = SigningKey::from_bytes(&[43; 32]);
-    let writer = SigningKey::from_bytes(&[44; 32]);
-    let restricted = CollectionPolicy::new(
-        AdmissionPolicy::Open,
-        AdmissionPolicy::direct(authority.verifying_key()),
-    );
-    let mut inner = MemoryRepo::default();
-    let root = inner.collection("restricted-root", restricted).unwrap();
-    let first = inner.derive::<FirstEncoding>(root, (), policy()).unwrap();
-    let source = archive(2, 2);
-    let metadata = inner
-        .put::<SimpleArchive, _>(TribleSet::new().to_blob())
-        .unwrap();
-    inner
-        .insert(CollectionRecord::Commit(CollectionCommit::sign(
-            &writer,
-            root.handle(),
-            data(&source),
-            metadata,
-        )))
-        .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(root.handle()),
-    );
-    let bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-        writer.verifying_key(),
-    )
-    .unwrap();
-    let (proof, claims) = bundle.into_parts();
-    inner.insert_proof(proof).unwrap();
-
-    let claim_members = claims.iter().map(data).collect::<Vec<_>>();
-    let mut store = GuardStore::new(inner);
-    for claim in &claims {
-        store.offer(claim);
-    }
-    store.offer(&source);
-
-    let snapshot = block_on(store.ensure(first)).unwrap();
-
-    assert_eq!(
-        &store.acquired[..claim_members.len()],
-        claim_members.as_slice(),
-        "proof closure is acquired before payload authorization",
-    );
-    assert_eq!(store.acquired.last(), Some(&data(&source)));
-    assert_eq!(snapshot.wants().unwrap().count(), 0);
-    let observed = snapshot
-        .collection_at(first, hifitime::Epoch::from_tai_seconds(0.0))
-        .unwrap();
-    assert_eq!(
-        observed.support().data_members().collect::<Vec<_>>(),
-        vec![data(&source)]
-    );
-}
-
-#[test]
-fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_concurrency() {
+fn caller_bounded_support_acquisition_hydrates_commit_closure_and_defers_concurrency() {
     let authority = SigningKey::from_bytes(&[83; 32]);
     let first_writer = SigningKey::from_bytes(&[84; 32]);
     let concurrent_writer = SigningKey::from_bytes(&[85; 32]);
@@ -998,28 +932,21 @@ fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_co
         .collection("bounded-cold-write", restricted)
         .unwrap();
     let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(root.handle()),
-    );
-
-    let first_bundle = CapabilityProofBundle::issue_root(
+    let resource = CapabilityResource::from(root.handle());
+    let write = Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke);
+    let first_proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(
-            atom,
-            CapabilityMode::Invoke,
-            Some(
-                CapabilityValidity::new(
-                    hifitime::Epoch::from_tai_seconds(-1.0),
-                    hifitime::Epoch::from_tai_seconds(1.0),
-                )
-                .unwrap(),
-            ),
+        resource,
+        write,
+        Some(
+            CapabilityValidity::new(
+                hifitime::Epoch::from_tai_seconds(-1.0),
+                hifitime::Epoch::from_tai_seconds(1.0),
+            )
+            .unwrap(),
         ),
         first_writer.verifying_key(),
-    )
-    .unwrap();
-    let (first_proof, first_claims) = first_bundle.into_parts();
+    );
     let first_source = archive(31, 31);
     let first_metadata = archive(32, 32);
     let first_commit = CollectionCommit::sign(
@@ -1029,13 +956,13 @@ fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_co
         first_metadata.get_handle(),
     );
 
-    let concurrent_bundle = CapabilityProofBundle::issue_root(
+    let concurrent_proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        resource,
+        write,
+        None,
         concurrent_writer.verifying_key(),
-    )
-    .unwrap();
-    let (concurrent_proof, concurrent_claims) = concurrent_bundle.into_parts();
+    );
     let concurrent_source = archive(33, 33);
     let concurrent_metadata = archive(34, 34);
     let concurrent_commit = CollectionCommit::sign(
@@ -1050,18 +977,12 @@ fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_co
     inner
         .insert(CollectionRecord::Commit(first_commit))
         .unwrap();
-    for blob in concurrent_claims
-        .iter()
-        .chain([&concurrent_source, &concurrent_metadata])
-    {
+    for blob in [&concurrent_source, &concurrent_metadata] {
         inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
     }
 
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
-    for claim in &first_claims {
-        store.offer(claim);
-    }
     store.offer(&first_source);
     store.offer(&first_metadata);
     store.inject_record_on_acquire = Some(CollectionRecord::Commit(concurrent_commit));
@@ -1077,9 +998,11 @@ fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_co
     let (first_support, first_commits) =
         block_on(store.acquire_admitted_with_commits_at(root, &control, instant)).unwrap();
 
-    let mut expected_acquisitions = vec![data(&descriptor)];
-    expected_acquisitions.extend(first_claims.iter().map(data));
-    expected_acquisitions.extend([data(&first_source), data(&first_metadata)]);
+    let expected_acquisitions = vec![
+        data(&descriptor),
+        data(&first_source),
+        data(&first_metadata),
+    ];
     assert_eq!(store.acquired, expected_acquisitions);
     assert_eq!(first_commits, vec![first_commit]);
     assert_eq!(
@@ -1105,52 +1028,7 @@ fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_co
 }
 
 #[test]
-fn active_read_audience_acquires_relevant_claims_without_want() {
-    let authority = SigningKey::from_bytes(&[61; 32]);
-    let reader = SigningKey::from_bytes(&[62; 32]);
-    let mut inner = MemoryRepo::default();
-    let collection = inner
-        .collection(
-            "restricted-read",
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(authority.verifying_key()),
-                AdmissionPolicy::Open,
-            ),
-        )
-        .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
-    );
-    let bundle = CapabilityProofBundle::issue_root(
-        &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
-        reader.verifying_key(),
-    )
-    .unwrap();
-    let (proof, claims) = bundle.into_parts();
-    inner.insert_proof(proof).unwrap();
-
-    let expected_claims = claims.iter().map(data).collect::<Vec<_>>();
-    let mut store = GuardStore::new(inner);
-    for claim in &claims {
-        store.offer(claim);
-    }
-
-    let audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
-
-    assert_eq!(store.acquired, expected_claims);
-    let mut expected = vec![authority.verifying_key(), reader.verifying_key()];
-    expected.sort_unstable_by_key(VerifyingKey::to_bytes);
-    assert_eq!(audience, CollectionReadAudience::Restricted(expected));
-    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
-}
-
-#[test]
-fn active_read_audience_acquires_a_cold_descriptor_before_its_claims() {
+fn active_read_audience_acquires_a_cold_descriptor() {
     let authority = SigningKey::from_bytes(&[70; 32]);
     let reader = SigningKey::from_bytes(&[71; 32]);
     let mut registry = MemoryRepo::default();
@@ -1169,34 +1047,25 @@ fn active_read_audience_acquires_a_cold_descriptor_before_its_claims() {
         .get(collection.handle())
         .unwrap();
 
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
-    );
-    let bundle = CapabilityProofBundle::issue_root(
+    let proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        CapabilityResource::from(collection.handle()),
+        Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+        None,
         reader.verifying_key(),
-    )
-    .unwrap();
-    let (proof, claims) = bundle.into_parts();
+    );
     let mut inner = MemoryRepo::default();
     inner.insert_proof(proof).unwrap();
 
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
-    for claim in &claims {
-        store.offer(claim);
-    }
 
     let audience = block_on(
         store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
     )
     .unwrap();
 
-    let mut expected_acquisitions = vec![data(&descriptor)];
-    expected_acquisitions.extend(claims.iter().map(data));
-    assert_eq!(store.acquired, expected_acquisitions);
+    assert_eq!(store.acquired, vec![data(&descriptor)]);
     let mut expected_audience = vec![authority.verifying_key(), reader.verifying_key()];
     expected_audience.sort_unstable_by_key(VerifyingKey::to_bytes);
     assert_eq!(
@@ -1207,7 +1076,7 @@ fn active_read_audience_acquires_a_cold_descriptor_before_its_claims() {
 }
 
 #[test]
-fn active_read_audience_does_not_acquire_irrelevant_or_forged_proofs() {
+fn active_read_audience_ignores_irrelevant_or_forged_proofs() {
     let authority = SigningKey::from_bytes(&[63; 32]);
     let irrelevant_authority = SigningKey::from_bytes(&[64; 32]);
     let irrelevant_reader = SigningKey::from_bytes(&[65; 32]);
@@ -1222,37 +1091,32 @@ fn active_read_audience_does_not_acquire_irrelevant_or_forged_proofs() {
             ),
         )
         .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
-    );
+    let resource = CapabilityResource::from(collection.handle());
+    let read = Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke);
 
-    let irrelevant = CapabilityProofBundle::issue_root(
+    let irrelevant_proof = CapabilityProof::issue_root(
         &irrelevant_authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        resource,
+        read,
+        None,
         irrelevant_reader.verifying_key(),
-    )
-    .unwrap();
-    let (irrelevant_proof, irrelevant_claims) = irrelevant.into_parts();
+    );
     inner.insert_proof(irrelevant_proof).unwrap();
 
-    let forged = CapabilityProofBundle::issue_root(
+    let forged_proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        resource,
+        read,
+        None,
         forged_reader.verifying_key(),
-    )
-    .unwrap();
-    let (forged_proof, forged_claims) = forged.into_parts();
+    );
     let mut forged_bytes = forged_proof.into_bytes();
-    forged_bytes[32] ^= 1;
+    *forged_bytes.last_mut().unwrap() ^= 1;
     inner
         .insert_proof(CapabilityProof::from_bytes(&forged_bytes).unwrap())
         .unwrap();
 
     let mut store = GuardStore::new(inner);
-    for claim in irrelevant_claims.iter().chain(&forged_claims) {
-        store.offer(claim);
-    }
 
     let audience = block_on(
         store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
@@ -1268,7 +1132,7 @@ fn active_read_audience_does_not_acquire_irrelevant_or_forged_proofs() {
 }
 
 #[test]
-fn active_read_audience_walks_a_valid_delegated_claim_prefix() {
+fn active_read_audience_walks_a_valid_delegated_proof_path() {
     let authority = SigningKey::from_bytes(&[75; 32]);
     let intermediate = SigningKey::from_bytes(&[76; 32]);
     let reader = SigningKey::from_bytes(&[77; 32]);
@@ -1282,44 +1146,32 @@ fn active_read_audience_walks_a_valid_delegated_claim_prefix() {
             ),
         )
         .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
-    );
-    let root_claim = CapabilityClaim::root(atom, CapabilityMode::InvokeAndDelegate, None);
-    let root_bundle =
-        CapabilityProofBundle::issue_root(&authority, root_claim, intermediate.verifying_key())
-            .unwrap();
-    let verified = root_bundle
-        .verify(
-            authority.verifying_key(),
-            hifitime::Epoch::from_tai_seconds(0.0),
-            intermediate.verifying_key(),
-            CapabilityRequest::new(atom, CapabilityMode::InvokeAndDelegate),
-        )
-        .unwrap();
-    let bundle = verified
-        .delegate(
-            &intermediate,
-            CapabilityClaim::delegated(root_claim.handle(), atom, CapabilityMode::Invoke, None),
-            reader.verifying_key(),
-        )
-        .unwrap();
-    let (proof, claims) = bundle.into_parts();
+    let resource = CapabilityResource::from(collection.handle());
+    let action = CapabilityAction::new(ACTION_READ);
+    let proof = CapabilityProof::issue_root(
+        &authority,
+        resource,
+        Capability::new(action, CapabilityMode::InvokeAndDelegate),
+        None,
+        intermediate.verifying_key(),
+    )
+    .extend(
+        &intermediate,
+        Capability::new(action, CapabilityMode::Invoke),
+        None,
+        reader.verifying_key(),
+    )
+    .unwrap();
     inner.insert_proof(proof).unwrap();
 
-    let expected_acquisitions = claims.iter().map(data).collect::<Vec<_>>();
     let mut store = GuardStore::new(inner);
-    for claim in &claims {
-        store.offer(claim);
-    }
 
     let audience = block_on(
         store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
     )
     .unwrap();
 
-    assert_eq!(store.acquired, expected_acquisitions);
+    assert!(store.acquired.is_empty());
     let mut expected_audience = vec![
         authority.verifying_key(),
         intermediate.verifying_key(),
@@ -1348,37 +1200,32 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
             ),
         )
         .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
+    let resource = CapabilityResource::from(collection.handle());
+    let action = CapabilityAction::new(ACTION_READ);
+    let root_proof = CapabilityProof::issue_root(
+        &authority,
+        resource,
+        Capability::new(action, CapabilityMode::Invoke),
+        None,
+        direct_reader.verifying_key(),
     );
-    let root_claim = CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
-    let root_bundle =
-        CapabilityProofBundle::issue_root(&authority, root_claim, direct_reader.verifying_key())
-            .unwrap();
-    let (root_proof, root_claims) = root_bundle.into_parts();
-    let tail_claim =
-        CapabilityClaim::delegated(root_claim.handle(), atom, CapabilityMode::Invoke, None)
-            .to_blob();
     let proof = append_adversarial_proof_edge(
         root_proof,
         &direct_reader,
-        tail_claim.get_handle(),
+        action,
         tail_reader.verifying_key(),
     );
     proof.verify_signatures().unwrap();
     inner.insert_proof(proof).unwrap();
 
     let mut store = GuardStore::new(inner);
-    store.offer(&root_claims[0]);
-    store.offer(&tail_claim);
 
     let audience = block_on(
         store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
     )
     .unwrap();
 
-    assert_eq!(store.acquired, vec![data(&root_claims[0])]);
+    assert!(store.acquired.is_empty());
     assert_eq!(
         audience,
         CollectionReadAudience::Restricted(vec![authority.verifying_key()])
@@ -1391,8 +1238,8 @@ fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
     let authority = SigningKey::from_bytes(&[67; 32]);
     let first_reader = SigningKey::from_bytes(&[68; 32]);
     let concurrent_reader = SigningKey::from_bytes(&[69; 32]);
-    let mut inner = MemoryRepo::default();
-    let collection = inner
+    let mut registry = MemoryRepo::default();
+    let collection = registry
         .collection(
             "frozen-read-evidence",
             CollectionPolicy::new(
@@ -1401,44 +1248,39 @@ fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
             ),
         )
         .unwrap();
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(ACTION_READ),
-        CapabilityResource::from(collection.handle()),
-    );
-    let first = CapabilityProofBundle::issue_root(
+    let descriptor: Blob<SimpleArchive> = registry
+        .snapshot()
+        .unwrap()
+        .get(collection.handle())
+        .unwrap();
+    let resource = CapabilityResource::from(collection.handle());
+    let read = Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke);
+    let first_proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        resource,
+        read,
+        None,
         first_reader.verifying_key(),
-    )
-    .unwrap();
-    let (first_proof, first_claims) = first.into_parts();
+    );
+    let mut inner = MemoryRepo::default();
     inner.insert_proof(first_proof).unwrap();
 
-    let concurrent = CapabilityProofBundle::issue_root(
+    let concurrent_proof = CapabilityProof::issue_root(
         &authority,
-        CapabilityClaim::root(
-            atom,
-            CapabilityMode::Invoke,
-            Some(
-                CapabilityValidity::new(
-                    hifitime::Epoch::from_tai_seconds(-1.0),
-                    hifitime::Epoch::from_tai_seconds(1.0),
-                )
-                .unwrap(),
-            ),
+        resource,
+        read,
+        Some(
+            CapabilityValidity::new(
+                hifitime::Epoch::from_tai_seconds(-1.0),
+                hifitime::Epoch::from_tai_seconds(1.0),
+            )
+            .unwrap(),
         ),
         concurrent_reader.verifying_key(),
-    )
-    .unwrap();
-    let (concurrent_proof, concurrent_claims) = concurrent.into_parts();
-    for claim in concurrent_claims {
-        inner.put::<SimpleArchive, _>(claim).unwrap();
-    }
+    );
 
     let mut store = GuardStore::new(inner);
-    for claim in &first_claims {
-        store.offer(claim);
-    }
+    store.offer(&descriptor);
     store.inject_proof_on_acquire = Some(concurrent_proof);
 
     let first_audience = block_on(
@@ -1451,6 +1293,7 @@ fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
         first_audience,
         CollectionReadAudience::Restricted(first_expected)
     );
+    assert_eq!(store.acquired, vec![data(&descriptor)]);
 
     let second_audience = block_on(
         store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),

@@ -333,9 +333,8 @@ where
                             tracing::warn!(?error, "admitting collection repair record failed")
                         }
                     },
-                    // Proof repair carries evidence, not blob demand. Referenced
-                    // claims stay inert until an actual consumer follows them
-                    // through the ordinary H-addressed blob data plane.
+                    // Proof repair carries complete inline evidence, not blob
+                    // demand. No content closure is implied by admission.
                     NetEvent::CapabilityProof(proof) => match store.insert_proof(proof) {
                         Ok(()) => self.pending_network_flush = true,
                         Err(error) => {
@@ -648,8 +647,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
     use triblespace_core::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -741,7 +739,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn native_authorization_proof_does_not_assert_claim_blob_demand() {
+    async fn native_authorization_proof_does_not_assert_blob_demand() {
         let key = SigningKey::from_bytes(&[94; 32]);
         let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
         let (sender, receiver, wiring) = host::wire(id);
@@ -751,21 +749,16 @@ mod tests {
             sender,
             receiver,
         );
-        let proof = CapabilityProofBundle::issue_root(
+        let proof = CapabilityProof::issue_root(
             &key,
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
-                    CapabilityResource::new([95; 32]),
-                ),
+            CapabilityResource::new([95; 32]),
+            Capability::new(
+                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
                 CapabilityMode::Invoke,
-                None,
             ),
+            None,
             SigningKey::from_bytes(&[96; 32]).verifying_key(),
-        )
-        .unwrap()
-        .proof()
-        .clone();
+        );
         let mut batch = NetEventBatch::default();
         batch
             .try_push(NetEvent::CapabilityProof(proof.clone()))

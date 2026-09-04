@@ -87,7 +87,7 @@ fn build(
     mapping: Mapping,
 ) -> (
     triblespace_core::collection::DiscoveredCollectionRecords,
-    BTreeSet<Id>,
+    BTreeSet<CollectionCommit>,
     CollectionHandle,
     usize,
     usize,
@@ -194,7 +194,7 @@ fn build(
     }
     let snapshot = store.snapshot().unwrap();
     let records = discover_collection_records(&snapshot).unwrap();
-    let authorized = commits.iter().map(CollectionCommit::id).collect();
+    let authorized = commits.iter().copied().collect();
     (
         records,
         authorized,

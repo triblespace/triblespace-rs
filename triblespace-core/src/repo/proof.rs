@@ -3,7 +3,7 @@
 //! A proof store is a grow-only set of canonical [`CapabilityProof`] values.
 //! Proof ids are content identities useful for indexing exact bytes; possession
 //! of an id is not authorization and this interface does not discover proofs
-//! from keys or claims.
+//! from roots, subjects, actions, or resources.
 
 use std::error::Error;
 use std::fmt::Debug;
@@ -29,7 +29,8 @@ pub trait CapabilityProofRead {
     /// Look up one proof by the BLAKE3 identity of its exact canonical bytes.
     ///
     /// This is physical selection for a caller that already holds an id. It
-    /// does not discover credentials by key or claim and confers no authority.
+    /// does not discover credentials by their semantic fields and confers no
+    /// authority.
     fn proof(&self, id: CapabilityProofId) -> Result<Option<CapabilityProof>, Self::ProofsError> {
         for proof in self.proofs()? {
             let proof = proof?;

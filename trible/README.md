@@ -125,8 +125,8 @@ with the encoding and mapping-algorithm descriptions.
   counts. The handle is accepted with or without the `blake3:` prefix.
 - `pile collection grant-read <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
   issue one deterministic, unbounded READ/Invoke proof from a configured READ
-  root to an Ed25519 public key. Claims are persisted before the proof;
-  replaying the exact command is idempotent.
+  root to an Ed25519 public key and insert that one self-contained proof;
+  replaying the exact command is idempotent and writes no companion blobs.
 - `pile collection grant-write <PILE> <COLLECTION> <RECIPIENT> [--key PATH]` —
   issue the symmetric deterministic WRITE/Invoke proof from a configured WRITE
   root to an author key.
@@ -137,21 +137,22 @@ Built on `triblespace-net` (authenticated iroh QUIC, collection-scoped PATCH
 anti-entropy, stock-gossip wakeups, and DHT provider lookup). Opening a
 transport connection grants no collection authority. Each repair request names
 one exact collection and may carry bounded native READ(C) proofs for cold
-bootstrap. The server admits only from complete collection-scoped evidence in
-its pinned local snapshot before disclosing a manifest or PATCH leaf. A new
-proof lands inertly, records ordinary `Blob(H)` WANTs for its claim handles,
-and can authorize a later retry after that closure arrives.
+bootstrap. The server admits only from collection-scoped proof evidence in its
+pinned local snapshot before disclosing a manifest or PATCH leaf. A new
+self-contained proof lands inertly and can authorize a later retry; it never
+changes admission for the immutable current session or creates blob WANTs.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
-The exact repair state is the product of the collection's native record,
-collection-scoped authorization-evidence, and resident-disclosure PATCHes.
-Authorization repair carries native READ(C)/WRITE(C) proof records only; claim
-blobs stay on the ordinary H path. The record PATCH contains every valid signed
-COMMIT(C), while each receiver derives WRITE admission locally; a later WRITE
-proof can therefore activate an older commit without inventing a second
-synchronization protocol or requiring the publisher to possess its grant.
+The exact repair state is the product of the collection's native-record and
+collection-scoped authorization-evidence PATCHes.
+Authorization repair carries complete self-contained READ(C)/WRITE(C) proof
+records only, with no companion blob acquisition. The record PATCH contains
+every valid signed COMMIT(C), while each receiver derives WRITE admission
+locally; a later WRITE proof can therefore activate an older commit without
+inventing a second synchronization protocol or requiring the publisher to
+possess its grant.
 Production peers subscribe to stock `iroh-gossip` topics keyed by the
 domain-separated image of the collection handle; signed opaque-root
 mismatches accelerate ordinary repair, while periodic anti-entropy remains
@@ -163,9 +164,8 @@ resident blob may publish an opaque KDF(H) lease with an H-bound endpoint
 token. Direct GET sends
 only that locator: the provider proves H first, the requester second, both
 proofs bind the authenticated endpoints, and returned bytes must hash to H.
-Collection READ(C) remains exclusively the admission boundary for collection
-anti-entropy and Full repair. The network host neither uses nor writes durable
-team/PEER routing state.
+Collection READ(C) gates only collection anti-entropy, never exact GET. The
+network host neither uses nor writes durable team/PEER routing state.
 
 ### Work with remote stores
 

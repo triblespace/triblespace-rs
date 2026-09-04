@@ -11,11 +11,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Add collection-scoped anti-entropy over one direct stream. Each request
   may carry native READ(C) bootstrap proofs and, once admitted from pinned
-  local closure, pins the exact product of the native record and
+  local proof evidence, pins the exact product of the native record and
   collection-scoped authorization-evidence PATCHes. Authorization repair
-  carries native proof bytes only and collection repair never transfers blob
-  bytes. The record PATCH contains signature-valid exact-C COMMITs independent
-  of WRITE admission.
+  carries complete self-contained proof bytes only and collection repair never
+  transfers blob bytes. The record PATCH contains signature-valid exact-C
+  COMMITs independent of WRITE admission.
 - Add stock `iroh-gossip` wake subscriptions keyed by a domain-separated image
   of the collection handle. A 145-byte nonce-v4 signed origin wake carries one
   opaque repair root and accelerates the same bounded participant repair path;
@@ -35,8 +35,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   uses one endpoint-bound KDF(C) lease per active served collection. Exact
   content has a separate global KDF(H) directory populated from resident
   blobs; exact GET consults neither collection identity nor READ(C).
-- Move the incompatible direct protocol to ALPN
-  `/triblespace/pile-sync/22`. Anti-entropy is receiver-authorized by READ(C).
+- Move the incompatible direct protocol, including self-contained proof
+  payloads, to ALPN `/triblespace/pile-sync/23`. Anti-entropy is
+  receiver-authorized by READ(C).
   Exact bearer GET instead uses a provider-first, requester-second mutual
   proof of H bound to both authenticated endpoint identities; raw H never
   crosses TLS, and returned bytes must hash to H. Unsigned remote derived

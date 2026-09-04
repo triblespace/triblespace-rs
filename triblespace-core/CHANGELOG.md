@@ -9,19 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `CollectionStoreExt::acquire_read_audience_at` for active exact-H
-  hydration of a missing collection descriptor and the frozen READ(C) proof
-  forest without implicit WANTs. Pure snapshot admission remains resident-only
-  and inert.
+- Add `CollectionStoreExt::acquire_read_audience_at` for active acquisition of
+  a missing collection descriptor and READ(C) audience evaluation over one
+  frozen self-contained proof set. Pure snapshot admission remains
+  resident-only and inert; the live operation emits no WANT.
 
 - Make canonical `WantRequest::Blob(H)` the sole durable exact-content
   request. Repository implementations retain its exact identity, and Yard
   charges one bounded-retention slot per requested handle.
 
 - Add independent descriptor-local READ and WRITE admission policies. Each is
-  `Open` or a canonical multi-root quorum with invocation and optional
-  delegation thresholds; the proof-forest evaluator counts distinct roots and
-  adds exact `ACTION_READ` authorization beside `ACTION_WRITE`.
+  `Open` or a canonical multi-root quorum with one invocation threshold. The
+  evaluator counts independently valid paths from distinct roots and adds
+  exact `ACTION_READ` authorization beside `ACTION_WRITE`; delegation comes
+  only from the mode signed into each path. The byte-compatible legacy
+  delegation-threshold descriptor field is ignored by authorization.
 
 - Add store-owned collection construction:
   `collection(name, policy)`, `derive(source, mapping, policy)`, and the raw
@@ -59,21 +61,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concrete parameters, while exact derived lifecycles bind one
   `CollectionMapping<Source, Target>` whose law is a join homomorphism.
 
-- Add top-level `capability`, a direct authorization kernel. Keyless canonical
-  `SimpleArchive` claims carry one exact action/resource atom, invoke/delegate
-  mode, optional inclusive validity interval, and optional parent claim handle.
-  Canonical native proofs use `K0 (S C K)+`; every strict Ed25519 signature
-  binds issuer key, exact claim handle, and delegate key, and BLAKE3 over the
-  complete proof is its stable identity. A bounded portable bundle carries the
-  exact ordered claims. Verification takes an external trust root, expected
-  leaf, explicit instant, and request, then computes the claims' atom, mode,
-  and validity meet without ambient lookup.
+- Add top-level `capability`, a direct authorization kernel. One canonical
+  self-contained proof encodes
+  `magic16 | resource32 | root32 |`
+  `N*(action16 | flags1 | validity32 | delegate32 | signature64)`. Each strict
+  Ed25519 signature is last and covers the exact prefix through its delegate,
+  so every signed prefix is itself a proof and paths cannot be grafted or
+  reordered. Root and delegate encodings are canonical non-weak principals;
+  validity remains exact over the signed `i128` nanosecond domain without
+  silently saturating clock boundaries. BLAKE3 over the exact proof bytes is
+  its stable identity.
+  Verification takes an external trust root, expected leaf, explicit instant,
+  and request, then computes the path-local action, mode, and validity meet
+  without ambient or blob lookup.
 - Add `CapabilityProofStore` to `MemoryRepo`, `Pile`, and `Yard` as a native
-  grow-only proof set with deterministic enumeration and exact proof-ID lookup.
-  Pile records use bounded canonical framing. Conservative collection preserves
-  proof records and treats every claim named by a signature-valid proof as an
-  exact direct root. It never scans opaque claim values as child handles, and
-  proof presence alone grants no authority.
+  grow-only set of self-contained proofs with deterministic enumeration and
+  exact proof-ID lookup. V2 pile records use bounded canonical framing.
+  Conservative collection preserves exact proof records directly; there is no
+  companion blob closure or retention traversal, and proof presence alone
+  grants no authority.
 
 ### Changed
 

@@ -131,9 +131,10 @@ attributes! {
     /// Anchor minted with `trible genid` on 2026-08-30:
     /// `AF874E4D44C3A6565754D3EE8EDE48B5`.
     "AF874E4D44C3A6565754D3EE8EDE48B5" as pub admission_invoke_threshold: U256;
-    /// Number of distinct roots required for a non-root principal to delegate.
+    /// Legacy delegation threshold retained as identity-bearing policy data.
     ///
-    /// Absence means that downstream delegation is disabled.
+    /// Capability proof modes now govern delegation. This attribute remains
+    /// part of the descriptor grammar so existing handles round-trip exactly.
     /// Anchor minted with `trible genid` on 2026-08-30:
     /// `1300EF404FE61D26FC091B0CEC1C41EC`.
     "1300EF404FE61D26FC091B0CEC1C41EC" as pub admission_delegate_threshold: U256;

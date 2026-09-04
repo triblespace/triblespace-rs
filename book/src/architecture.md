@@ -43,12 +43,14 @@ committed facts from which it can be rebuilt.
 
 Who may make that signed assertion can be proven without making storage a
 policy oracle. A descriptor carries independent READ and WRITE policies. Each
-is open or a canonical quorum over external trust roots, with separate invoke
-and delegation thresholds. Resident `K0 (S C K)+` paths bind each issuer,
-exact keyless claim handle, and delegate key; the ordered claim blobs carry the
-action/resource, mode, validity, and parent-claim restrictions. Ordinary
-collection operations evaluate the proof forest directly at one clock instant
-against exact `ACTION_WRITE` on the descriptor. Merely finding an unverified
+is open or a canonical quorum over external trust roots with one semantic
+threshold.
+Each resident proof is one self-contained, prefix-signed path from one root:
+its header binds the exact resource, and every edge carries the action, mode,
+optional validity interval, delegate, and signature over the complete prefix.
+Ordinary collection operations count independently valid rooted paths at one
+clock instant against exact `ACTION_WRITE` on the descriptor. Sibling paths
+cannot lend one another delegation authority, and merely finding an unverified
 or irrelevant proof in storage grants nothing.
 
 ## Architectural layers
@@ -168,8 +170,8 @@ Mappings between two foreign encoding types use the explicit
 signer, fragment)` publishes attachments, canonical data, canonical metadata,
 and the signed native record in dependency order. Local publication performs
 no authorization check and no implicit flush: authorization governs which
-resident claims another operation admits, not what a process may append to its
-own store.
+resident assertions another operation admits, not what a process may append to
+its own store.
 
 Reads are exact about what they observed, not magical about global time:
 
@@ -187,9 +189,9 @@ Reads are exact about what they observed, not magical about global time:
   materialization at the same caller-supplied instant.
 
 Cover identity is the collection descriptor plus distinct payload handles.
-Signer, signature, and metadata claims currently known to the store remain
-queryable, but no claim is required for replay, and another claim over the same
-payload does not change the cover or repeat data work.
+Signer, signature, and metadata attestations currently known to the store
+remain queryable, but no attestation is required for replay, and another one
+over the same payload does not change the cover or repeat data work.
 
 Each store snapshot observes one known prefix of an append-only store. A
 concurrent commit may appear now or on the next call, but one observation never
@@ -294,12 +296,13 @@ records in one
 append-only log. `ObjectStoreRemote` places immutable collection records under
 content-derived object keys. The network layer uses an opaque collection-topic
 wake and READ(C)-authorized Merkle walks to union that collection's records and
-structurally relevant native READ(C)/WRITE(C) proof records. Referenced claim
-blobs remain on the ordinary H path. Independently, every resident blob may
+structurally relevant native READ(C)/WRITE(C) proof records. Each proof record
+is the complete authorization value and has no referenced blob closure.
+Independently, every resident blob may
 publish an opaque XOR-DHT lease under KDF(H); knowing H is the bearer capability
 for its exact bytes regardless of collection policy or collection-repair
-direction. Collection READ(C) still gates collection anti-entropy and Full
-repair, but never exact GET. Merge/derive questions are answered from the
+direction. Collection READ(C) gates collection anti-entropy, but never exact
+GET. Merge/derive questions are answered from the
 converged local record index.
 In every case convergence means unioning evidence; it does not mean electing a
 winner.

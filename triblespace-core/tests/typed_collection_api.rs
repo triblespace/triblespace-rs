@@ -8,13 +8,13 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityResource, CapabilityValidity,
+    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+    CapabilityValidity,
 };
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
-    AdmissionPolicy, Collection, CollectionCommit, CollectionPolicy, CollectionRead,
-    CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    AdmissionPolicy, CollectionCommit, CollectionPolicy, CollectionRead, CollectionRecord,
+    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -32,19 +32,8 @@ fn one_fact(seed: u8) -> TribleSet {
     facts
 }
 
-fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
-    let (proof, claims) = bundle.into_parts();
-    for claim in claims {
-        store.put::<SimpleArchive, _>(claim).unwrap();
-    }
-    store.insert_proof(proof).unwrap();
-}
-
-fn write_atom(collection: Collection<SimpleArchive>) -> CapabilityAtom {
-    CapabilityAtom::new(
-        CapabilityAction::new(ACTION_WRITE),
-        CapabilityResource::from(collection.handle()),
-    )
+fn write_capability() -> Capability {
+    Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke)
 }
 
 #[test]
@@ -197,19 +186,15 @@ fn collection_at_uses_the_supplied_authorization_instant() {
     let validity =
         CapabilityValidity::new(Epoch::from_tai_seconds(10.0), Epoch::from_tai_seconds(20.0))
             .unwrap();
-    store_bundle(
-        &mut store,
-        CapabilityProofBundle::issue_root(
+    store
+        .insert_proof(CapabilityProof::issue_root(
             &authority,
-            CapabilityClaim::root(
-                write_atom(collection),
-                CapabilityMode::Invoke,
-                Some(validity),
-            ),
+            CapabilityResource::from(collection.handle()),
+            write_capability(),
+            Some(validity),
             writer.verifying_key(),
-        )
-        .unwrap(),
-    );
+        ))
+        .unwrap();
 
     let snapshot = store.snapshot().unwrap();
     assert!(snapshot
@@ -340,7 +325,7 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
 }
 
 #[test]
-fn dangling_capability_proof_is_raw_but_semantically_visible_only_later() {
+fn self_contained_capability_proof_activates_commit_without_blob_closure() {
     let root = SigningKey::from_bytes(&[48; 32]);
     let writer = SigningKey::from_bytes(&[49; 32]);
     let policy = CollectionPolicy::new(
@@ -356,33 +341,31 @@ fn dangling_capability_proof_is_raw_but_semantically_visible_only_later() {
     store
         .commit(collection, &writer, Fragment::from(expected))
         .unwrap();
-    let bundle = CapabilityProofBundle::issue_root(
-        &root,
-        CapabilityClaim::root(write_atom(collection), CapabilityMode::Invoke, None),
-        writer.verifying_key(),
-    )
-    .unwrap();
-    let (proof, claims) = bundle.into_parts();
-    store.insert_proof(proof.clone()).unwrap();
 
     let before = store.snapshot().unwrap();
+    assert!(collection
+        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
+        .unwrap()
+        .is_empty());
+
+    let proof = CapabilityProof::issue_root(
+        &root,
+        CapabilityResource::from(collection.handle()),
+        write_capability(),
+        None,
+        writer.verifying_key(),
+    );
+    store.insert_proof(proof.clone()).unwrap();
+
+    let after = store.snapshot().unwrap();
     assert_eq!(
-        before
+        after
             .proofs()
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap(),
         vec![proof]
     );
-    assert!(collection
-        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
-
-    for claim in claims {
-        store.put::<SimpleArchive, _>(claim).unwrap();
-    }
-    let after = store.snapshot().unwrap();
     assert_eq!(
         collection
             .admitted_at(&after, Epoch::from_tai_seconds(0.0))

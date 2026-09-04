@@ -671,8 +671,8 @@ mod tests {
     use hifitime::Epoch;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource, CapabilityValidity,
+        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+        CapabilityValidity,
     };
     use triblespace_core::collection::{
         ACTION_WRITE, AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle,
@@ -784,16 +784,6 @@ mod tests {
         commit
     }
 
-    fn store_bundle(store: &mut MemoryRepo, bundle: CapabilityProofBundle) {
-        use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-
-        let (proof, claims) = bundle.into_parts();
-        for claim in claims {
-            store.put::<SimpleArchive, _>(claim).unwrap();
-        }
-        store.insert_proof(proof).unwrap();
-    }
-
     #[test]
     fn publication_set_contains_only_explicit_collection_participation() {
         let writer = signing_key(11);
@@ -872,22 +862,17 @@ mod tests {
                 ),
             )
             .unwrap();
-        let write = CapabilityAtom::new(
-            CapabilityAction::new(ACTION_WRITE),
-            CapabilityResource::from(collection.handle()),
-        );
         let validity =
             CapabilityValidity::new(Epoch::from_tai_seconds(0.0), Epoch::from_tai_seconds(10.0))
                 .unwrap();
-        store_bundle(
-            &mut store,
-            CapabilityProofBundle::issue_root(
-                &root,
-                CapabilityClaim::root(write, CapabilityMode::Invoke, Some(validity)),
-                writer.verifying_key(),
-            )
-            .unwrap(),
+        let proof = CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::from(collection.handle()),
+            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            Some(validity),
+            writer.verifying_key(),
         );
+        store.insert_proof(proof).unwrap();
         let member = put_blob(&mut store, 33);
         commit(&mut store, collection.handle(), &writer, member);
 

@@ -456,9 +456,10 @@ pub trait BlobStoreKeep {
 ///   [`reachable`].
 ///
 /// These caller-selected roots supplement native-record ownership. Every
-/// retained collection record, capability proof, and WANT owns its resident
-/// direct references recursively; backends discover those edges separately
-/// from this explicit policy value and without semantic admission.
+/// retained collection record and WANT owns its resident direct references
+/// recursively; backends discover those edges separately from this explicit
+/// policy value and without semantic admission. Capability proofs are
+/// self-contained and therefore own no blobs.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RetentionRoots {
     direct: BTreeSet<[u8; INLINE_LEN]>,

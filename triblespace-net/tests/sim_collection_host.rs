@@ -11,8 +11,7 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-    CapabilityResource,
+    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
 };
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::{
@@ -56,39 +55,19 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn bundle(
+fn proof(
     root: &SigningKey,
     leaf: &SigningKey,
-    action: triblespace_core::capability::CapabilityAction,
+    action: CapabilityAction,
     collection: CollectionHandle,
-) -> CapabilityProofBundle {
-    CapabilityProofBundle::issue_root(
+) -> CapabilityProof {
+    CapabilityProof::issue_root(
         root,
-        CapabilityClaim::root(
-            CapabilityAtom::new(action, CapabilityResource::from(collection)),
-            CapabilityMode::Invoke,
-            None,
-        ),
+        CapabilityResource::from(collection),
+        Capability::new(action, CapabilityMode::Invoke),
+        None,
         leaf.verifying_key(),
     )
-    .unwrap()
-}
-
-fn store_bundle(
-    store: &mut MemoryRepo,
-    bundle: CapabilityProofBundle,
-) -> Vec<Inline<Handle<UnknownBlob>>> {
-    let references = bundle
-        .proof()
-        .claim_handles()
-        .map(|claim| Inline::new(claim.raw))
-        .collect();
-    let (proof, claims) = bundle.into_parts();
-    for claim in claims {
-        store.put::<SimpleArchive, _>(claim).unwrap();
-    }
-    store.insert_proof(proof).unwrap();
-    references
 }
 
 fn register(store: &mut MemoryRepo, policy: CollectionPolicy) -> Collection<SimpleArchive> {
@@ -206,15 +185,13 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
 
         let mut issuer_store = MemoryRepo::default();
         let collection = register(&mut issuer_store, policy);
-        store_bundle(
-            &mut issuer_store,
-            bundle(
-                &issuer_key,
-                &recipient_key,
-                CapabilityAction::new(ACTION_READ),
-                collection.handle(),
-            ),
+        let read_proof = proof(
+            &issuer_key,
+            &recipient_key,
+            CapabilityAction::new(ACTION_READ),
+            collection.handle(),
         );
+        issuer_store.insert_proof(read_proof.clone()).unwrap();
         let payload_handle = issuer_store
             .put::<SimpleArchive, _>(TribleSet::new().to_blob())
             .unwrap();
@@ -272,9 +249,9 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap()
         };
 
-        // With C resident, normal collection repair uses the issuer's complete
-        // READ(C) closure to admit this endpoint and sends only native proof
-        // and collection records.
+        // With C resident, normal collection repair uses the issuer's
+        // self-contained READ(C) proof to admit this endpoint and sends only
+        // native proof and collection records.
         advance(&clock, &mut [&mut issuer, &mut recipient], 32).await;
         let dangling = recipient.snapshot().unwrap();
         assert_eq!(dangling.records().unwrap().count(), 1);
@@ -283,31 +260,18 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
             .unwrap()
             .map(Result::unwrap)
             .collect::<Vec<_>>();
-        assert_eq!(received.len(), 1);
+        assert_eq!(received, [read_proof]);
         assert!(
-            !recipient_collection
+            recipient_collection
                 .reader_is_admitted_at(&dangling, recipient_key.verifying_key(), clock::epoch_now())
                 .unwrap(),
-            "the repaired proof stays inert until exact-H supplies its claims",
+            "the repaired self-contained proof admits its recipient",
         );
         assert_eq!(dangling.wants().unwrap().count(), 0);
         drop(dangling);
 
-        // The proof's claims and committed payload remain ordinary exact-H
-        // bearer reads. Repair manufactures no durable WANT.
-        for claim in received[0].claim_handles() {
-            assert!(
-                acquire_once(
-                    &clock,
-                    &mut recipient,
-                    Inline::new(claim.raw),
-                    &mut [&mut issuer],
-                )
-                .await
-                .is_some(),
-                "the discovered proof's claim follows the ordinary exact-H path",
-            );
-        }
+        // The committed payload remains an ordinary exact-H bearer read.
+        // Repair manufactures no durable WANT.
         assert!(
             acquire_once(
                 &clock,
@@ -376,7 +340,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
                 payload_handle,
             )))
             .unwrap();
-        let write = bundle(
+        let write = proof(
             &write_root,
             &writer,
             CapabilityAction::new(ACTION_WRITE),
@@ -386,15 +350,14 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy);
         assert_eq!(reader_collection.handle(), collection.handle());
-        let read_claims = store_bundle(
-            &mut reader_store,
-            bundle(
+        reader_store
+            .insert_proof(proof(
                 &read_root,
                 &reader_key,
                 CapabilityAction::new(ACTION_READ),
                 collection.handle(),
-            ),
-        );
+            ))
+            .unwrap();
 
         let server_id = server_key.verifying_key().to_bytes();
         let mut server = bring_up(
@@ -416,7 +379,8 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
 
         advance(&clock, &mut [&mut server, &mut reader], 3).await;
         let before = reader.snapshot().unwrap();
-        assert_eq!(before.records().unwrap().count(), 0);
+        // Background collection repair may already have transferred the
+        // signed record. Without WRITE evidence it remains semantically inert.
         assert!(
             reader_collection
                 .admitted_at(&before, clock::epoch_now())
@@ -436,15 +400,6 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
             "proof receipt must not manufacture a durable blob WANT"
         );
         assert_eq!(server.snapshot().unwrap().wants().unwrap().count(), 0);
-
-        for claim in read_claims {
-            assert!(
-                acquire_once(&clock, &mut server, claim, &mut [&mut reader])
-                    .await
-                    .is_some(),
-                "active authorization use acquires its exact claim dependency",
-            );
-        }
 
         advance(&clock, &mut [&mut server, &mut reader], 32).await;
         let repaired = reader.snapshot().unwrap();
@@ -471,7 +426,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
 
         // The grant can arrive after the record at the receiver. The
         // WriteOnly publisher never receives or presents it.
-        store_bundle(&mut reader.store(), write);
+        reader.store().insert_proof(write).unwrap();
         reader.refresh();
         let after = reader.snapshot().unwrap();
         assert_eq!(after.records().unwrap().count(), 1);
@@ -519,13 +474,13 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
 
         let mut server_store = MemoryRepo::default();
         let collection = register(&mut server_store, policy.clone());
-        let write = bundle(
+        let write = proof(
             &write_root,
             &writer_key,
             CapabilityAction::new(ACTION_WRITE),
             collection.handle(),
         );
-        let write_claims = store_bundle(&mut server_store, write.clone());
+        server_store.insert_proof(write.clone()).unwrap();
         let payload = TribleSet::new().to_blob();
         let payload_handle = server_store.put::<SimpleArchive, _>(payload).unwrap();
         server_store
@@ -539,18 +494,17 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
 
         let mut reader_store = MemoryRepo::default();
         let reader_collection = register(&mut reader_store, policy.clone());
-        let read_claims = store_bundle(
-            &mut reader_store,
-            bundle(
+        reader_store
+            .insert_proof(proof(
                 &read_root,
                 &reader_key,
                 CapabilityAction::new(ACTION_READ),
                 collection.handle(),
-            ),
-        );
+            ))
+            .unwrap();
         let mut writer_store = MemoryRepo::default();
         register(&mut writer_store, policy);
-        store_bundle(&mut writer_store, write);
+        writer_store.insert_proof(write).unwrap();
 
         let server_id = server_key.verifying_key().to_bytes();
         let mut server = bring_up(
@@ -591,19 +545,6 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             "proof receipt must not manufacture a durable blob WANT"
         );
         assert_eq!(server.snapshot().unwrap().wants().unwrap().count(), 0);
-        for claim in read_claims {
-            assert!(
-                acquire_once(
-                    &clock,
-                    &mut server,
-                    claim,
-                    &mut [&mut reader, &mut writer_only],
-                )
-                .await
-                .is_some(),
-                "active READ admission acquires its exact claim dependency",
-            );
-        }
         advance(
             &clock,
             &mut [&mut server, &mut reader, &mut writer_only],
@@ -620,35 +561,22 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         .await;
         assert_eq!(
             stats.fulfilled, 0,
-            "raw repaired proofs remain inert until an active consumer follows them"
+            "proof repair must not manufacture a durable blob WANT"
         );
         let dangling = reader.snapshot().unwrap();
         assert_eq!(
             dangling.proofs().unwrap().count(),
             2,
-            "the WRITE proof record repairs before its claim blobs",
+            "the self-contained WRITE proof repairs with the collection records",
         );
         assert!(
             reader_collection
                 .admitted_at(&dangling, clock::epoch_now())
                 .unwrap()
                 .is_empty(),
-            "a frozen snapshot hides a proof whose referenced claims are absent",
+            "a frozen snapshot hides a commit whose payload is absent",
         );
         drop(dangling);
-        for claim in write_claims {
-            assert!(
-                acquire_once(
-                    &clock,
-                    &mut reader,
-                    claim,
-                    &mut [&mut server, &mut writer_only],
-                )
-                .await
-                .is_some(),
-                "active WRITE admission acquires its exact claim dependency",
-            );
-        }
         assert!(
             acquire_once(
                 &clock,

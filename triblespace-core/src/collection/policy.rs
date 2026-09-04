@@ -10,6 +10,7 @@ use std::fmt;
 
 use ed25519_dalek::VerifyingKey;
 
+use crate::capability::is_valid_capability_principal;
 use crate::id::{id_hex, Id};
 use crate::metadata;
 use crate::prelude::entity;
@@ -34,6 +35,8 @@ pub const KIND_ADMISSION_POLICY_QUORUM: Id = id_hex!("DC81E78C55E759F71AFFA645A0
 pub enum AdmissionPolicyError {
     /// A quorum has no roots.
     EmptyRoots,
+    /// A root is not a unique, usable Ed25519 principal encoding.
+    InvalidRoot { key: [u8; 32] },
     /// A threshold is zero or exceeds the number of distinct roots.
     InvalidThreshold {
         /// Which threshold failed.
@@ -49,6 +52,9 @@ impl fmt::Display for AdmissionPolicyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::EmptyRoots => formatter.write_str("an admission quorum needs at least one root"),
+            Self::InvalidRoot { .. } => {
+                formatter.write_str("an admission root must be a canonical, non-weak Ed25519 key")
+            }
             Self::InvalidThreshold {
                 field,
                 threshold,
@@ -68,8 +74,11 @@ impl Error for AdmissionPolicyError {}
 pub enum AdmissionPolicy {
     /// Every principal is admitted without evidence.
     Open,
-    /// Distinct roots jointly support invocation and, optionally, downstream
-    /// delegation.
+    /// Distinct roots jointly support invocation.
+    ///
+    /// The encoded policy may also retain a legacy delegation threshold as
+    /// identity-bearing descriptor data. Delegation authority itself is now
+    /// carried only by the signed mode on each self-contained proof prefix.
     Quorum(ValidatedQuorum),
 }
 
@@ -96,7 +105,11 @@ impl ValidatedQuorum {
         self.invoke_threshold
     }
 
-    /// Number of distinct roots required to extend authority, when allowed.
+    /// Legacy identity-bearing delegation threshold.
+    ///
+    /// This value is round-tripped because it participates in existing
+    /// descriptor handles. It is not consulted by capability admission;
+    /// signed proof-prefix modes govern delegation.
     pub const fn delegate_threshold(&self) -> Option<u32> {
         self.delegate_threshold
     }
@@ -110,6 +123,14 @@ impl AdmissionPolicy {
         delegate_threshold: Option<u32>,
     ) -> Result<Self, AdmissionPolicyError> {
         let mut roots: Vec<_> = roots.into_iter().collect();
+        if let Some(root) = roots
+            .iter()
+            .find(|root| !is_valid_capability_principal(root))
+        {
+            return Err(AdmissionPolicyError::InvalidRoot {
+                key: root.to_bytes(),
+            });
+        }
         roots.sort_unstable_by_key(VerifyingKey::to_bytes);
         roots.dedup_by_key(|key| key.to_bytes());
         if roots.is_empty() {
@@ -126,12 +147,19 @@ impl AdmissionPolicy {
         }))
     }
 
-    /// One root may invoke or issue direct grants; grantees cannot redelegate.
+    /// One-root policy whose legacy delegation-threshold field is absent.
+    ///
+    /// This constructor does not constrain proof delegation. A proof issued
+    /// with [`crate::capability::CapabilityMode::Invoke`] cannot be extended;
+    /// one issued with a delegating mode can.
     pub fn direct(root: VerifyingKey) -> Self {
         Self::quorum([root], 1, None).expect("one-root direct policy is valid")
     }
 
-    /// One root may invoke and may delegate both invocation and delegation.
+    /// One-root policy retaining the legacy delegation-threshold value `1`.
+    ///
+    /// This remains available solely to reproduce existing descriptor
+    /// identities. Proof-prefix modes, not this field, govern delegation.
     pub fn delegable(root: VerifyingKey) -> Self {
         Self::quorum([root], 1, Some(1)).expect("one-root delegable policy is valid")
     }
@@ -171,8 +199,10 @@ impl AdmissionPolicy {
         }
     }
 
-    /// Downstream-delegation threshold. `None` also covers open admission,
-    /// where delegation evidence is irrelevant.
+    /// Legacy identity-bearing delegation threshold.
+    ///
+    /// Capability admission ignores this value; it remains observable so a
+    /// decoded descriptor can be reproduced byte-for-byte.
     pub const fn delegate_threshold(&self) -> Option<u32> {
         match self {
             Self::Open => None,
@@ -243,5 +273,11 @@ mod tests {
         assert!(AdmissionPolicy::quorum([], 1, None).is_err());
         assert!(AdmissionPolicy::quorum([key(1)], 0, None).is_err());
         assert!(AdmissionPolicy::quorum([key(1)], 1, Some(2)).is_err());
+
+        let weak = VerifyingKey::from_bytes(&[0; 32]).unwrap();
+        assert_eq!(
+            AdmissionPolicy::quorum([weak], 1, None),
+            Err(AdmissionPolicyError::InvalidRoot { key: [0; 32] })
+        );
     }
 }

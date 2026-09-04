@@ -73,6 +73,12 @@ pub const KIND_WANT_ASSERT: RawInline =
 pub const KIND_WANT_RETRACT: RawInline =
     hex_literal::hex!("A57C866A83A90635090A947D92464B19D9F898C0C961AB7A91C79A979F9F1483");
 
+/// Historical K(S,C,K)+ capability-proof kind, retained only so old piles can
+/// cross it as a known inert frame. Fresh piles do not publish or write this
+/// retired kind.
+pub const KIND_AUTH_PROOF_V1: RawInline =
+    hex_literal::hex!("29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -171,13 +177,13 @@ record_kinds! {
         "pile-collection-derive-v5",
         "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
 
-    /// A complete direct capability proof.
+    /// A self-contained prefix-signed capability proof.
     ///
-    /// Kind id minted with `trible genid` on 2026-08-25.
-    CapabilityProofRecordV1 = KIND_ID_AUTH_PROOF "CD21D2250D6C7B3C6E2EC94817BD73C9",
-        KIND_AUTH_PROOF "29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053",
-        "pile-auth-proof-v1",
-        "A canonical complete capability proof in K(S,C,K)+ order. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with the 32-byte root Ed25519 public key, followed by one or more 128-byte edges: a 64-byte Ed25519 signature, a 32-byte SimpleArchive claim handle, and the next 32-byte public key. The declared length is exactly 32 + 128n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
+    /// Kind id minted with `trible genid` on 2026-09-04.
+    CapabilityProofRecordV2 = KIND_ID_AUTH_PROOF "C1E5E9D46B4D72AAC1D22170E546C144",
+        KIND_AUTH_PROOF "334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5",
+        "pile-auth-proof-v2",
+        "A canonical self-contained prefix-signed capability proof. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with a 16-byte grammar magic, a 32-byte opaque resource, and the 32-byte root Ed25519 public key, followed by one or more 145-byte edges. Each edge holds a 16-byte action id, one flags byte whose low two bits encode invocation and delegation and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix through its edge's delegate, including all preceding signatures. The declared length is exactly 80 + 145n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
 
 }
 

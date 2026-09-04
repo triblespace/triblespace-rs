@@ -37,9 +37,10 @@ endpoint-bound tokens, never either raw handle.
 
 READ and WRITE are independent `AdmissionPolicy` values embedded in the
 descriptor. Each is either `Open` or a canonical quorum over Ed25519 roots with
-separate invoke and delegation thresholds. A derived collection chooses its
-own policies. Source ancestry, routing knowledge, and possession of a blob do
-not silently supply collection authority.
+one semantic threshold. A derived collection chooses its own policies. Source
+ancestry, routing knowledge, and possession of a blob do not silently supply
+collection authority. Downstream delegation is a restriction signed into each
+proof path, not a second descriptor threshold.
 
 Local stores remain permissive grow-only ledgers. They may contain a COMMIT
 whose signer does not currently satisfy WRITE(C), or a proof irrelevant to any
@@ -53,32 +54,30 @@ For one collection, semantic repair derives two independent grow-only sets:
 - every structurally valid native collection record naming exact C: signed
   `COMMIT`s independent of current WRITE(C) admission, plus unsigned `MERGE`
   and `DERIVE` equations; and
-- every native proof with complete resident claim closure which is structurally
-  relevant to exact READ(C) or WRITE(C) and begins at that action policy's
-  roots.
+- every self-contained native proof which is structurally relevant to exact
+  READ(C) or WRITE(C) and begins at that action policy's roots.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
 canonical value; authorization evidence is keyed by its 32-byte proof ID and its
-repair leaf is only the canonical native proof body. Claim blobs remain
-ordinary H-addressed content. The opaque semantic repair root
+repair leaf is the complete canonical native proof body. There is no companion
+claim blob or authorization closure. The opaque semantic repair root
 commits to C, both PATCH roots, and both leaf counts under a versioned domain.
 
 The authorization projection is structural rather than a snapshot of who is
 admitted now. Expired, not-yet-valid, delegate-only, and quorum-incomplete
 branches remain immutable evidence. Time, mode, and quorum are derived checks
-at the operation instant. A proof with incomplete local claim closure is inert
-until ordinary blob acquisition supplies every named H.
+at the operation instant. Each root path is evaluated independently; no
+fixed-point over sibling paths can create delegation support.
 
 The only initial handoff is the delegation itself: a grantor may give the new
-subject an application-level portable proof bundle. That is the existing
-capability invitation boundary, not a Secrets-specific delivery channel. Once
-one collection participant has the native proof with complete claim closure,
-authorization-evidence repair distributes the proof record to READ(C) peers;
-ordinary H-DHT acquisition fills missing claims. A Secrets writer can therefore
-derive a restricted collection's current finite READ audience from the same
-snapshot and materialize recipient envelopes without a separate envelope RPC
-or roster. Open READ remains explicitly non-enumerable.
+subject the self-contained proof bytes. That is the capability invitation
+boundary, not a Secrets-specific delivery channel. Once one collection
+participant has the proof, authorization-evidence repair distributes that one
+record to READ(C) peers without a second content-acquisition phase. A Secrets
+writer can therefore derive a restricted collection's current finite READ
+audience from the same snapshot and materialize recipient envelopes without a
+separate envelope RPC or roster. Open READ remains explicitly non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
@@ -130,15 +129,14 @@ subscription.
 
 After observing a changed wake root—or when periodically sampling live signed
 wake origins—a node opens one bidirectional collection-repair stream to that
-origin. Its hello names C and may carry a bounded native READ proof forest for
-cold bootstrap. The server admits the TLS-authenticated client only from
-complete READ(C) evidence in its pinned local projection before returning any
+origin. Its hello names C and may carry a bounded set of self-contained READ
+proofs for cold bootstrap. The server admits the TLS-authenticated client only
+from READ(C) evidence in its pinned local projection before returning any
 manifest. Unknown hello proofs are signature/root checked and stored inertly.
-The current session remains rejected; if a later authorization consumer follows
-a missing claim handle, ordinary exact-H acquisition and a new coherent
-snapshot can make a retry succeed. For `Open` READ the bootstrap is empty. A
-WRITE-only publisher needs no READ authority merely to serve an authorized
-replica.
+The current session remains rejected; a new coherent snapshot and session can
+admit the now-resident proof without fetching any companion blob. For `Open`
+READ the bootstrap is empty. A WRITE-only publisher needs no READ authority
+merely to serve an authorized replica.
 
 The server loads one immutable repair overlay for C and applies the
 descriptor's exact READ policy at one instant. Rejection returns no manifest.
@@ -149,9 +147,9 @@ receive missing leaf bodies:
 - canonical signature-valid `COMMIT(C)` records, whether active or inert;
 - native structurally relevant READ(C)/WRITE(C) proofs.
 
-The claim bytes never travel in the collection session. Records may land before
-their WRITE closure and remain harmlessly inactive until a later snapshot
-derives admission.
+Each proof leaf already contains the complete path and all of its restrictions.
+Records may land before sufficient WRITE proof evidence and remain harmlessly
+inactive until a later snapshot derives admission.
 
 The exact-repair scheduler samples at a 30-second cadence. Participant leases
 last five minutes and every successful repair, including an identical result,
@@ -165,8 +163,8 @@ recovery after restarts and partitions.
 Every request pins the manifest's expected component root. The server serves
 the whole stream from one immutable overlay lease, so responses cannot splice
 two moments together and need no historical-root cache. The client validates
-node summaries, intrinsic leaf keys, record bodies, proof signatures, and claim
-handles before insertion.
+node summaries, intrinsic leaf keys, record bodies, canonical proof bytes, and
+proof signatures before insertion.
 
 Exact-content GET is not part of this collection stream. An independent
 exact-content request is authorized solely by knowledge of H.
@@ -245,10 +243,11 @@ A node can repair the small semantic overlay and use its resident exact merge
 and derivation results while planning a cover. Missing derived results are
 computed by the ordinary live `ensure` path, which may acquire exact missing
 dependencies and publishes missing `DERIVE` work only. `maintain` additionally
-publishes deterministic size-tiered `MERGE` work. Those unsigned equations are not remote publication
-authority and are not reused over the network in this release. Evidence and
-computation still converge by union; no central scheduler or query planner is
-required.
+publishes deterministic size-tiered `MERGE` work. Those unsigned equations
+repair as reusable computation evidence but grant no remote publication
+authority; their referenced artifact blobs remain separate exact-H content.
+Evidence and computation still converge by union; no central scheduler or
+query planner is required.
 
 Durable WANT remains orthogonal operational policy.
 `WantRequest::Blob(H)` is the sole exact-content request. The reconciler
@@ -261,7 +260,7 @@ WRITE, retention, or membership semantics.
 
 ## Wire surface
 
-Protocol version 22 keeps the direct operation set narrow:
+Protocol version 23 keeps the direct operation set narrow:
 
 | Operation | Code | Meaning |
 |---|---:|---|

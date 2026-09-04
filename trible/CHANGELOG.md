@@ -20,13 +20,13 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Changed
 
 - Let each repair request carry bounded native READ(C) proofs only as cold
-  bootstrap input. Same-session admission uses complete collection-scoped
-  evidence pinned locally; new proof claims arrive through ordinary durable
-  `Blob(H)` WANTs before a later retry can succeed. Direction now governs only
-  collection repair, so all modes continue to publish, serve, and acquire exact
-  H-addressed blobs. Signed COMMITs repair independently of WRITE admission;
-  receivers derive activation locally and publishers need not hold their own
-  grant.
+  bootstrap input. Same-session admission uses self-contained
+  collection-scoped proof evidence pinned locally; newly supplied proofs land
+  inertly and can authorize only a later retry, without companion blob WANTs.
+  Direction now governs only collection repair, so all modes continue to
+  publish, serve, and acquire exact H-addressed blobs. Signed COMMITs repair
+  independently of WRITE admission; receivers derive activation locally and
+  publishers need not hold their own grant.
 
 ### Removed
 

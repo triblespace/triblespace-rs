@@ -129,8 +129,8 @@ pub enum Command {
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
     /// The signing key must be one of the collection descriptor's READ roots.
-    /// Claim blobs are stored before the native proof record, and repeating
-    /// the exact command is idempotent.
+    /// One self-contained native proof record is stored, and repeating the
+    /// exact command is idempotent.
     GrantRead {
         /// Path to the pile file to update.
         pile: PathBuf,
@@ -147,8 +147,8 @@ pub enum Command {
     /// Grant one author unbounded WRITE access to an existing collection.
     ///
     /// The signing key must be one of the collection descriptor's WRITE roots.
-    /// Claim blobs are stored before the native proof record, and repeating
-    /// the exact command is idempotent.
+    /// One self-contained native proof record is stored, and repeating the
+    /// exact command is idempotent.
     GrantWrite {
         /// Path to the pile file to update.
         pile: PathBuf,
@@ -387,7 +387,7 @@ fn policy_text(policy: &AdmissionPolicy, long: bool) -> String {
                 .join(",");
             let delegate = quorum
                 .delegate_threshold()
-                .map(|threshold| format!(" delegate={threshold}"))
+                .map(|threshold| format!(" legacy-delegate={threshold}(ignored)"))
                 .unwrap_or_default();
             format!(
                 "{}/{} [{}]{delegate}",
@@ -963,7 +963,7 @@ fn run_grant(
         let collection = resolve(&rows, &reference)?;
         drop(snapshot);
 
-        let bundle = match action {
+        let proof = match action {
             GrantAction::Read => grant_collection_read(&mut pile, collection, &root, recipient),
             GrantAction::Write => grant_collection_write(&mut pile, collection, &root, recipient),
         }
@@ -974,10 +974,7 @@ fn run_grant(
             hex::encode_upper(root.verifying_key().to_bytes())
         );
         println!("recipient:  {}", hex::encode(recipient.to_bytes()));
-        println!(
-            "proof:      blake3:{}",
-            hex::encode(bundle.proof().id().raw)
-        );
+        println!("proof:      blake3:{}", hex::encode(proof.id().raw));
         Ok(())
     })();
     let close_res = pile

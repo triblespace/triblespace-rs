@@ -132,8 +132,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ```
 
 The descriptor's independent READ and WRITE policies participate in collection
-identity. Here both are one-root direct policies: the root acts directly and
-may grant another principal the exact action, while grantees cannot redelegate.
+identity. Here both are one-root policies. Whether a recipient may extend its
+authority is carried by the mode signed into that recipient's proof prefix,
+not by a second collection-policy threshold.
 Other strictly verified signers become visible only when
 `library.admitted_at(&snapshot, instant)` observes sufficient root support for exact
 `ACTION_WRITE` on this descriptor handle in the same immutable store snapshot.

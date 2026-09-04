@@ -1,262 +1,180 @@
-# Direct Capability Proofs
+# Resource Capability Proofs
 
-TribleSpace authorization is one direct, portable proof. Semantic restrictions
-live in content-addressed claim blobs; principals and signatures live in a
-compact native proof:
+TribleSpace authorization is a self-contained, prefix-signed path. A proof
+names one opaque resource and carries one trust root's authority through one
+or more delegates:
 
 ```text
-K0 (S0 C0 K1) (S1 C1 K2) ... (Sn Cn Kn+1)
+magic | resource | root |
+    (action | mode/validity flags | validity | delegate | signature)+
 ```
 
-`K0` is an externally chosen Ed25519 trust root. Each `Si` is a signature by
-`Ki`, `Ci` is the exact BLAKE3 handle of a claim blob, and `Ki+1` is the next
-principal. The verifier also receives the expected final key. Nothing is
-inferred from possession, storage enumeration, append order, or a mutable
-membership head.
+The high-entropy magic identifies this exact grammar. An incompatible grammar
+gets a new magic rather than a version branch inside the decoder. `resource`
+is an uninterpreted 32-byte identity: collections use their descriptor handle,
+while another subsystem may give the same kernel a different kind of resource.
+`root` and every delegate are canonical, non-weak Ed25519 public keys. This
+makes each exact 32-byte value one usable principal rather than allowing
+multiple encodings of the same curve point to count as distinct quorum roots.
 
-## Keyless claims
+Each edge contains one exact 128-bit action, an invocation/delegation mode, an
+optional inclusive TAI interval, the next delegate, and a signature by the
+current issuer. The signature comes last and signs every preceding byte of the
+proof through that delegate. It therefore covers the magic, resource, root,
+all earlier edges including their signatures, and the current restrictions.
+Edges cannot be reordered, grafted onto another path, or moved to another
+resource without invalidating a signature.
 
-A `CapabilityClaim` is one closed canonical `SimpleArchive` containing:
-
-| Field | Meaning |
-|---|---|
-| action | one exact, uninterpreted 128-bit operation ID |
-| resource | one exact opaque 32-byte resource identity |
-| mode | `Invoke`, `Delegate`, or `InvokeAndDelegate` |
-| parent | zero or one exact parent **claim** handle |
-| validity | zero or one inclusive TAI interval |
-
-Claims contain no public key and no signature. A root claim has no parent; each
-later claim names the immediately preceding claim. The same semantic claim DAG
-can therefore be used in distinct principal paths without changing claim
+Every exact byte prefix ending after a signature is itself a complete proof.
+A valid longer proof consequently also provides evidence for its intermediate
+delegates. Truncating at any other byte is malformed. A stored value with a
+malformed or invalid tail is inert as a whole; a sender that wants to publish
+the valid prefix publishes those exact prefix bytes under their own content
 identity.
 
-Actions and resources are exact atoms. There are no wildcards, implicit action
-hierarchies, or ambient resource namespaces in the kernel. Applications define
-the conversion from a concrete resource to its 32-byte identity.
+## Canonical wire value
 
-## The native proof
+The proof header is 80 bytes:
 
-The canonical proof body is `K0 (S C K)+`: one 32-byte root followed by one or
-more 128-byte edges. There is no count, padding, or alternate field ordering in
-the body. Every edge signature covers:
+| bytes | field |
+|---:|---|
+| 16 | grammar magic |
+| 32 | opaque resource identity |
+| 32 | root public key |
 
-```text
-"triblespace.capability.proof-edge\0"
-|| 1:u32be
-|| issuer_key
-|| claim_handle
-|| delegate_key
-```
+Every edge is 145 bytes:
 
-Binding both keys and the exact claim handle prevents key substitution,
-cross-claim replay, and path splicing. Ed25519 verification is strict. The
-proof ID is BLAKE3 over the complete canonical body, so the same proof has one
-stable lookup identity in memory, a pile, or another store.
+| bytes | field |
+|---:|---|
+| 16 | exact action ID |
+| 1 | mode and validity-presence flags |
+| 32 | signed inclusive validity bounds, or canonical zeros when absent |
+| 32 | delegate public key |
+| 64 | Ed25519 signature over the complete preceding prefix |
 
-`CapabilityProofStore` is a grow-only set of these native proofs. It supports
-insertion, deterministic enumeration, and exact lookup by proof ID. It does
-not search by key or claim and it grants no authority merely because a proof
-is present.
+There is no count, padding, parent pointer, claim handle, or alternate field
+order in the proof body. Its exact length determines the nonzero edge count,
+which is bounded at 255. Decoding rejects unknown flag bits, nil actions,
+malformed, noncanonical, or weak keys, inverted intervals, nonzero
+absent-validity bytes, trailing bytes, and overlong paths. Signature
+verification is strict. The proof ID is BLAKE3 over the exact canonical body.
 
-## Verification is a meet
+The old `K(S,C,K)+` format separated semantic restrictions into claim blobs.
+That indirection is gone. A proof no longer depends on a blob closure, needs no
+portable bundle wrapper, and can be verified or repaired as one value.
 
-`CapabilityProofBundle::verify` takes four explicit boundary values:
+## Attenuation is a meet
 
-- the external trust-root key;
-- the expected leaf key, normally authenticated by the transport or named by
-  the collection commit;
-- the exact verification instant; and
-- the requested action/resource atom and minimum mode.
+The three nonempty modes are `Invoke`, `Delegate`, and
+`InvokeAndDelegate`. Effective authority is the meet of every edge:
 
-It then checks the native signatures, hashes and parses the ordered claim
-blobs, and evaluates the root-to-leaf restrictions:
+- the action must remain exactly equal;
+- mode bits combine by intersection;
+- validity intervals combine by inclusive intersection; and
+- every non-final issuer must still have effective `Delegate` authority.
 
-1. the first claim has no parent;
-2. each later claim names the previous claim handle;
-3. the effective parent mode contains `Delegate` before another edge follows;
-4. every action/resource atom is exactly equal;
-5. modes combine by bit intersection; and
-6. bounded validity intervals combine by inclusive intersection and contain
-   the supplied instant.
+A syntactically wider child is harmless: it cannot restore a mode bit or time
+range removed by an ancestor. An empty mode or interval intersection rejects
+the path. Verification additionally receives the expected trust root, subject,
+instant, resource/action request, and required mode; the proof cannot nominate
+those boundary values on the verifier's behalf.
 
-This is attenuation by meet, not a syntactic “child must be narrower” rule. A
-child that repeats a wider mode cannot restore a bit removed earlier; it simply
-adds no restriction for that bit. An empty atom, mode, or validity meet rejects
-the proof. A valid prefix cannot stand in for a descendant because verification
-also checks the expected leaf key.
+`CapabilityProof::issue_root` creates the first signed edge.
+`CapabilityProof::extend` appends an edge only when the supplied signing key is
+the current leaf and the effective prefix still delegates. A
+`VerifiedCapability` reports the subject and effective restrictions and can be
+used as the same extension boundary.
 
-The result reports the effective atom, mode, validity interval, leaf claim,
-leaf key, and proof ID. A holder may extend it only when its effective mode
-still delegates, the signing key equals the verified leaf, and the child names
-the exact leaf claim.
+## Quorum is independent root paths
 
-## Portable bundles
+One proof carries exactly one root's share. For a policy with roots
+`{r1, r2, ...}` and threshold `t`, a subject is admitted when at least `t`
+distinct configured roots independently provide a valid prefix for that
+subject and request at the chosen instant. Two paths from one root never count
+twice. A configured root inherently supplies its own share.
 
-A `CapabilityProofBundle` carries the native proof together with the exact
-claim blobs in root-to-leaf order. Its bounded version-1 transport form is:
+There is no fixed-point authority forest and no way for one sibling proof to
+lend delegation support to another. If a threshold-authorized delegate wants
+to delegate onward, it extends each independently rooted proof path it holds.
+The edge's signed mode states whether that particular share remains
+delegable; the descriptor needs no second delegation threshold.
 
-```text
-version:u8 = 1
-step_count:u8
-proof: 32 + step_count * 128 bytes
-repeat step_count times:
-    claim_length:u16be
-    claim:bytes
-```
-
-The count is nonzero and at most 255. Claim lengths are bounded by the closed
-canonical claim shape; decoders reject truncation, trailing bytes, noncanonical
-lengths, malformed keys, and oversized outer frames before treating the bundle
-as evidence. The bundle is self-contained for one verification round trip.
-Possessing it does not authorize a different key because the proof and caller
-both bind the expected leaf.
+This path-local rule makes proof arrival order irrelevant. Set union of proofs
+is the only synchronization operation, and evaluating the same set at the same
+instant produces the same authority.
 
 ## Storage and lifetime
 
-Claims are ordinary blobs. The native proof record is the direct lifetime edge
-for its claim closure: conservative collection preserves every canonical proof
-record and makes every independently resident claim handle a recursive root.
-The collector does not verify signatures or authorization before applying this
-structural ownership rule, and it follows resident handles found inside each
-claim through the ordinary conservative blob walk. A missing claim remains
-missing without fetching or weakening ownership of resident siblings.
-Trust-root selection and semantic claim verification remain caller
-responsibilities; retaining evidence grants no authority.
+`CapabilityProofStore` is a grow-only set of canonical proof values. It offers
+insertion, deterministic enumeration, and exact lookup by proof ID. Storage is
+evidence, not authority: callers still choose roots, request, subject, and
+instant when verifying it.
 
-There is no second retention collection. Storing a proof and its claims is
-enough. The storage layer publishes claim blobs before the proof record so an
-observer never mistakes a partially written local bundle for complete local
-evidence.
+A proof is a native record and has no blob references. Conservative collection
+retains the proof record and its record-kind description, but does not invent a
+blob lifetime edge. Re-inserting identical proof bytes is idempotent.
 
-## Collection-local admission
+The proof grammar's magic, the pile record kind, and the network protocol are
+separate compatibility boundaries. The new proof body uses a fresh pile record
+kind; the previous development-only proof kind remains recognizable as inert
+so old append-only piles can still be crossed safely. Old signatures cannot be
+mechanically migrated because they signed different bytes. Delegated authority
+must be reissued by the relevant private keys.
 
-Collection descriptors carry two independent policies. Each policy is either
-open or a quorum over a canonical set of Ed25519 roots, with separate invoke
-and optional delegation thresholds:
+## Collections consume authority
+
+A collection descriptor supplies independent READ and WRITE policies. Each is
+open or a quorum over a canonical root set:
 
 ```text
-READ(C)  = CapabilityAtom(ACTION_READ,  resource = C)
-WRITE(C) = CapabilityAtom(ACTION_WRITE, resource = C)
+READ(C)  = action ACTION_READ  over resource C
+WRITE(C) = action ACTION_WRITE over resource C
 ```
 
-The resource is the exact 32-byte collection descriptor handle. There is no
-ambient team, owner field, wildcard namespace, or transport-wide inventory
-grant. A derived collection states its own policies; neither source ancestry
-nor possession of another collection's proof implies anything about it.
+Here `C` is the exact descriptor handle. The generic capability kernel does not
+know what a collection, team, secret, or query is. Collection admission merely
+interprets its own resource and action IDs.
 
-A policy root contributes inherent support. Other principals contribute only
-through strictly verified proof paths beginning at canonical policy roots.
-Quorum evaluation unions the distinct roots which support the requested leaf
-at one instant; two paths from the same root do not count twice. Invoke and
-delegate support are evaluated separately, so permission to use an action need
-not permit issuing another grant.
+WRITE admission decides which strictly signed COMMIT records contribute to an
+observed collection. Local insertion remains unconditional: an inactive commit
+may arrive before its proof and become visible monotonically when enough proof
+paths arrive. READ admission decides which authenticated peers may participate
+in that collection's repair session. Exact blob retrieval remains orthogonal;
+knowledge of a blob handle is the read capability for those bytes.
 
-WRITE(C) decides which signed COMMITs are active when a store snapshot is
-observed. Local insertion remains unconditional: a store may retain an inactive
-commit, and later proof evidence may activate it monotonically. READ(C) is the
-collection-evidence disclosure boundary. A collection repair server evaluates
-the TLS-authenticated endpoint against complete READ(C) paths already in its
-pinned collection-scoped authorization projection. The request may additionally
-carry bounded native proofs for cold bootstrap. They cannot admit the current
-immutable session: the server stores them inertly and evaluates them only from
-a later coherent snapshot. Merely receiving a proof neither fetches nor
-asserts demand for the claim blobs it names. An actual consumer which follows
-a missing claim handle resolves H through the ordinary blob data plane, exactly
-like every other content-addressed dependency.
-Collection repair likewise carries every structurally valid signed COMMIT(C)
-without asking the sender to prove WRITE. The receiver derives activity from
-its own snapshot, so a grant and its commit may arrive in either order and the
-publisher need never receive its own grant.
-Exact blob retrieval is orthogonal to collection admission. Every served
-resident H may publish only its domain-separated locator KDF(H) and an H-bound
-endpoint token; directory nodes never receive H. On the exact stream the
-provider proves H first and the requester second, with both proofs bound to the
-authenticated endpoint identities. H is never transmitted, and the requester
-hash-verifies the returned bytes. READ(C) is therefore neither required nor
-consulted by exact GET.
+The common root-grant helpers are:
 
-This is a bearer capability, not an entropy amplifier. KDF(H) and the proof
-tokens avoid disclosing H but do not make guessable plaintext secret: anyone
-who can guess the bytes can compute H and exercise the same capability. Data
-whose content must not be guessable should be randomized or encrypted before
-content addressing.
+```text
+grant_collection_read(&mut store, collection, &root, recipient)
+grant_collection_write(&mut store, collection, &root, recipient)
+```
 
-The iroh connection itself already authenticates endpoint keys. TribleSpace
-therefore adds no generic CONNECT capability and no second team-inventory
-session. Every collection request is authorized against the exact descriptor
-it names.
+They validate the descriptor and matching root against one snapshot, create an
+unbounded `Invoke` proof, and insert that one proof record. Open policies need
+no proof. Under a threshold policy, each participating root issues its own
+proof. More elaborate delegation uses the capability API directly.
 
-## WANT and synchronization boundaries
+`collection_read_audience_at` evaluates every currently stored proof and
+returns the finite restricted audience in canonical key order, including valid
+intermediate delegates. It returns `Open` for an open READ policy because no
+finite key list describes that audience.
 
-Capability proof records are durable local set evidence, but there is no global
-proof inventory or claim-specific WANT. Collection-scoped repair
-projects native proof records whose complete resident claim closures are
-structurally relevant to exact READ(C) or WRITE(C). Its PATCH leaves contain
-only canonical proof bytes. Proof receipt does not fetch or WANT its referenced
-claims. If later evaluation follows a missing claim handle, it resolves H
-through the generic H-addressed blob data plane; an explicit WANT may delegate
-durable fulfillment but is never protocol bookkeeping. Portable bundles remain
-application-level invitation artifacts, not a network representation.
+## Repair and discovery
 
-This separation is intentional:
+Authorization repair exchanges proof records only. There are no claim blobs,
+proof bundles, claim-specific WANTs, or hidden out-of-band closure. A collection
+session projects only proofs relevant to its descriptor's READ or WRITE action;
+the receiver applies its own policy and instant.
+
+This leaves the layers deliberately independent:
 
 - proof presence is not authority;
-- routing, gossip, or DHT presence is not authorization;
-- WANT is local demand, not authorization; and
-- blob availability is not semantic validity.
+- routing, gossip, and DHT presence are not authority;
+- collection repair moves records, not payload closure;
+- WANT records local durable demand, not protocol bookkeeping; and
+- blob residency is not semantic validity.
 
-## Bootstrap and grants
-
-Collection bootstrap is descriptor construction. The creator chooses READ and
-WRITE policies explicitly, registers the canonical descriptor, and retains the
-root signing keys needed by those policies. An open action needs no grant. A
-root acting directly needs no stored proof. A delegated principal receives a
-self-contained proof bundle whose atom names the exact action and collection.
-
-The recipient verifies the bundle against the descriptor's externally known
-root set and its own expected key before storing it. The artifact therefore
-cannot nominate its own authority, collection, or subject. There is no global
-roster to enumerate and no requirement that two collections share roots or
-delegation geometry.
-
-`grant_collection_read(&mut store, collection, &root, recipient)` and
-`grant_collection_write(&mut store, collection, &root, recipient)` are the
-root-only persistence seams for the common direct cases. Each validates the
-exact descriptor and matching action root against one snapshot, creates an
-unbounded Invoke bundle, stores its claim closure, and only then inserts the
-native proof record. Repeating the same inputs reproduces the same identities.
-Under a threshold policy, invoke the helper once for each distinct root whose
-support should participate in the quorum.
-
-`collection_read_audience_at(&snapshot, collection, instant)` evaluates the
-restricted READ forest once and returns every currently admitted root,
-intermediate delegate, and leaf in canonical key order. It returns
-`CollectionReadAudience::Open` for open READ, because no finite principal list
-can represent that audience; incomplete claim closure and invalid-at-instant
-paths remain inert.
-
-When a live consumer actually needs the complete audience named by its current
-local proof frontier, `store.acquire_read_audience_at(collection, instant)`
-freezes that frontier, acquires the content-addressed collection descriptor if
-it is missing, acquires the missing claim blobs by exact H, and then evaluates
-it over the later residency. It records no WANT and does not admit a proof
-which arrived while acquisition was in flight; that additive evidence is
-observed by the next call. Snapshot methods themselves remain resident-only
-and inert.
-
-The equivalent pile operations are:
-
-```text
-trible pile collection grant-read PILE COLLECTION RECIPIENT [--key PATH]
-trible pile collection grant-write PILE COLLECTION RECIPIENT [--key PATH]
-```
-
-`RECIPIENT` is an Ed25519 public key in the same hex or z-base-32 spelling as
-an iroh endpoint id. Each command refuses an open policy (which needs no
-proof) and keys absent from the descriptor's roots for that action.
-
-Validity bounds are optional monotone restrictions, not mutable revocation.
-Ending an unexpired grant requires changing the served trust root or another
-explicit application epoch. That cost keeps the kernel local, portable, and
-independent of a second authorization database.
+Validity bounds are monotone restrictions, not mutable revocation. Ending
+unexpired authority requires changing the trusted policy epoch or another
+explicit application-level act; ordinary expiry merely makes the same durable
+proof inactive after its signed upper bound.

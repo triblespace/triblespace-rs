@@ -479,29 +479,22 @@ pub(crate) async fn recv_repair_node_response<R: AsyncRead + Unpin>(
 mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::capability::{
-        CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
+        Capability, CapabilityAction, CapabilityMode, CapabilityResource,
     };
 
     use super::*;
 
     fn proof() -> CapabilityProof {
-        CapabilityProofBundle::issue_root(
+        CapabilityProof::issue_root(
             &SigningKey::from_bytes(&[1; 32]),
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    triblespace_core::capability::CapabilityAction::new(
-                        triblespace_core::collection::ACTION_READ,
-                    ),
-                    triblespace_core::capability::CapabilityResource::new([2; 32]),
-                ),
+            CapabilityResource::new([2; 32]),
+            Capability::new(
+                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
                 CapabilityMode::Invoke,
-                None,
             ),
+            None,
             SigningKey::from_bytes(&[3; 32]).verifying_key(),
         )
-        .unwrap()
-        .proof()
-        .clone()
     }
 
     #[tokio::test]

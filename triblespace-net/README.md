@@ -59,12 +59,12 @@ does not create an ambient collection registry.
 The QUIC/TLS connection authenticates endpoint identities but grants no team
 or collection authority. Every collection repair request names exactly one
 collection. The repair client may present bounded native READ(C) proofs for
-cold bootstrap. Same-session admission uses only complete collection-scoped
-READ evidence already pinned in the server's local overlay. An unknown proof
-is ingested inertly; if an actual authorization consumer later follows a
-missing claim handle, ordinary exact-H acquisition may obtain it. The server
-verifies the TLS client before revealing a manifest or PATCH leaf; the
-publisher itself needs no READ(C). Claims and proofs are
+cold bootstrap. Same-session admission uses only self-contained
+collection-scoped READ proofs already pinned in the server's local overlay. An
+unknown proof is ingested inertly and may authorize a later retry, but it never
+changes admission for the immutable current session and needs no companion
+blob acquisition. The server verifies the TLS client before revealing a
+manifest or PATCH leaf; the publisher itself needs no READ(C). Proofs are
 non-secret authorization certificates. A caller without READ(C) receives no
 collection manifest, PATCH leaf, record, authorization evidence, or root;
 merely knowing C grants no disclosure.
@@ -88,7 +88,8 @@ Periodic pairwise repair is authoritative anti-entropy. For each active
 collection, the caller opens one bidirectional stream, establishes READ(C),
 pins the returned record and authorization-evidence roots, and walks only
 missing PATCH nodes. Authorization leaves carry canonical native proof bytes
-only. Claim and collection payload blobs never travel in this stream.
+only; each leaf is a complete signed path. Collection payload blobs never
+travel in this stream.
 
 Production iroh peers also subscribe to stock `iroh-gossip` topics keyed by a
 domain-separated one-way image of the 32-byte collection handle. A 145-byte

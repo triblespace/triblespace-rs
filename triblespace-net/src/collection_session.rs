@@ -75,7 +75,7 @@ where
         .collect::<Vec<_>>();
     let read_evidence = overlay
         .authorization_evidence()
-        .bundles()
+        .proofs()
         .cloned()
         .collect::<Vec<_>>();
     let admitted = collection_reader_is_admitted_by_policy_at(
@@ -187,7 +187,7 @@ fn node_response(
 /// Pull one exact collection overlay over an already authenticated iroh
 /// connection. TLS binds `conn.remote_id()`; the supplied native proof forest
 /// can bootstrap a cold server, while same-session READ(C) comes only from its
-/// already pinned local closure.
+/// already pinned local evidence.
 pub(crate) async fn pull_collection<C: Conn>(
     conn: &C,
     local: &CollectionRepairOverlay,
@@ -423,29 +423,20 @@ async fn require_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::capability::{
-        CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProofBundle,
-        CapabilityResource,
+        Capability, CapabilityAction, CapabilityMode, CapabilityResource,
     };
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
         CollectionStore, CollectionStoreExt, empty_metadata_handle,
     };
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+    use triblespace_core::repo::{CapabilityProofStore, SnapshotSource};
 
     use crate::collection_activation::collection_repair_overlay;
     use crate::protocol::recv_u8;
 
     use super::*;
-
-    fn store_bundle(store: &mut MemoryRepo, bundle: &CapabilityProofBundle) {
-        for claim in bundle.claims().iter().cloned() {
-            store.put::<SimpleArchive, _>(claim).unwrap();
-        }
-        store.insert_proof(bundle.proof().clone()).unwrap();
-    }
 
     #[tokio::test]
     async fn one_stream_repairs_records_without_global_inventory() {
@@ -507,20 +498,17 @@ mod tests {
         );
         let mut server_store = MemoryRepo::default();
         let server_collection = server_store.collection("private", policy.clone()).unwrap();
-        let bundle = CapabilityProofBundle::issue_root(
+        let proof = CapabilityProof::issue_root(
             &root,
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
-                    CapabilityResource::from(server_collection.handle()),
-                ),
+            CapabilityResource::from(server_collection.handle()),
+            Capability::new(
+                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
                 CapabilityMode::Invoke,
-                None,
             ),
+            None,
             reader.verifying_key(),
-        )
-        .unwrap();
-        store_bundle(&mut server_store, &bundle);
+        );
+        server_store.insert_proof(proof.clone()).unwrap();
         let server_snapshot = server_store.snapshot().unwrap();
         let server = Arc::new(
             collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
@@ -553,7 +541,7 @@ mod tests {
         let delta = pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![])
             .await
             .unwrap();
-        assert_eq!(delta.authorization_evidence, [bundle.proof().clone()]);
+        assert_eq!(delta.authorization_evidence, [proof]);
         assert!(delta.records.is_empty());
         server_task.await.unwrap();
     }
@@ -569,36 +557,26 @@ mod tests {
         );
         let mut server_store = MemoryRepo::default();
         let server_collection = server_store.collection("cold", policy.clone()).unwrap();
-        let proof = CapabilityProofBundle::issue_root(
+        let proof = CapabilityProof::issue_root(
             &root,
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
-                    CapabilityResource::from(server_collection.handle()),
-                ),
+            CapabilityResource::from(server_collection.handle()),
+            Capability::new(
+                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
                 CapabilityMode::Invoke,
-                None,
             ),
+            None,
             reader.verifying_key(),
-        )
-        .unwrap()
-        .proof()
-        .clone();
-        let other_proof = CapabilityProofBundle::issue_root(
+        );
+        let other_proof = CapabilityProof::issue_root(
             &root,
-            CapabilityClaim::root(
-                CapabilityAtom::new(
-                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
-                    CapabilityResource::from(server_collection.handle()),
-                ),
+            CapabilityResource::from(server_collection.handle()),
+            Capability::new(
+                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
                 CapabilityMode::Invoke,
-                None,
             ),
+            None,
             other_reader.verifying_key(),
-        )
-        .unwrap()
-        .proof()
-        .clone();
+        );
         let server_snapshot = server_store.snapshot().unwrap();
         let server = Arc::new(
             collection_repair_overlay(&server_snapshot, server_collection.handle()).unwrap(),
