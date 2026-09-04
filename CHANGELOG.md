@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add `CollectionStoreExt::acquire_read_audience_at` as the live counterpart
+  to inert snapshot audience discovery. It freezes the proof/control frontier,
+  acquires the exact collection descriptor and claim handles from
+  signature-valid proofs rooted in READ(C), emits no WANT, and excludes
+  concurrently arriving proofs until the next call. Reuse the same
+  candidate-proof hydration for WRITE admission.
 - Make each derived target encoding own its canonical `Source`, runtime
   `Argument`, descriptor binding, and member map through
   `CollectionDerivation`. `derive::<Target>(source, argument, policy)` still

@@ -236,6 +236,15 @@ intermediate delegate, and leaf in canonical key order. It returns
 can represent that audience; incomplete claim closure and invalid-at-instant
 paths remain inert.
 
+When a live consumer actually needs the complete audience named by its current
+local proof frontier, `store.acquire_read_audience_at(collection, instant)`
+freezes that frontier, acquires the content-addressed collection descriptor if
+it is missing, acquires the missing claim blobs by exact H, and then evaluates
+it over the later residency. It records no WANT and does not admit a proof
+which arrived while acquisition was in flight; that additive evidence is
+observed by the next call. Snapshot methods themselves remain resident-only
+and inert.
+
 The equivalent pile operations are:
 
 ```text

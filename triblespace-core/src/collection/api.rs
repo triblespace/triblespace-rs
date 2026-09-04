@@ -1757,6 +1757,63 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
+/// Acquire the claim closure named by every bounded, signature-valid proof
+/// rooted in one admission policy.
+///
+/// Root keys and signatures are inline in a native proof record, so forged
+/// evidence and proofs from unrelated roots are rejected before any
+/// attacker-chosen claim handle can trigger exact-H acquisition. The claim
+/// contents decide action, resource, mode, and validity later at the pure
+/// admission boundary. This operation never records a WANT.
+async fn acquire_admission_proof_closure<S>(
+    store: &mut S,
+    frontier: &OperationFrontier<S::Snapshot>,
+    policy: &AdmissionPolicy,
+    attempted: &mut BTreeSet<CollectionData>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+{
+    let proof_references = if let Some(roots) = policy.roots() {
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("open bounded proof snapshot", error)
+        })?;
+        let bounded = frontier.view(snapshot);
+        let references = bounded
+            .proofs()
+            .map_err(|error| {
+                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| {
+                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
+            })?
+            .into_iter()
+            .filter(|proof| roots.contains(&proof.root_key()) && proof.verify_signatures().is_ok())
+            .flat_map(|proof| proof.blob_references().collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        references
+    } else {
+        Vec::new()
+    };
+
+    for reference in proof_references {
+        let snapshot = store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("inspect proof dependency snapshot", error)
+        })?;
+        let bounded = frontier.view(snapshot);
+        let resident = bounded.contains_blob(reference).map_err(|error| {
+            CollectionRealizationError::storage("inspect proof dependency residency", error)
+        })?;
+        drop(bounded);
+        if !resident {
+            let member = Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference);
+            let _ = super::exact_derived::acquire_missing(store, attempted, member).await?;
+        }
+    }
+    Ok(())
+}
+
 async fn admitted_support_with_acquisition<S, E>(
     store: &mut S,
     target: Collection<E>,
@@ -1785,9 +1842,8 @@ where
         }
     };
 
-    // A proof's root key is in its fixed record bytes, so irrelevant roots can
-    // be rejected without fetching a single claim. Claim closure is acquired
-    // only for proofs rooted in this collection's WRITE policy.
+    // Claim closure is acquired only for proofs rooted in this collection's
+    // WRITE policy.
     let snapshot = store.snapshot().map_err(|error| {
         CollectionRealizationError::storage("open bounded proof snapshot", error)
     })?;
@@ -1798,43 +1854,9 @@ where
                 "load foundation descriptor for active admission: {error}"
             ))
         })?;
-    let roots = descriptor.policy.write().roots();
-    let proof_references = if let Some(roots) = roots {
-        bounded
-            .proofs()
-            .map_err(|error| {
-                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
-            })?
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| {
-                CollectionRealizationError::storage("enumerate bounded capability proofs", error)
-            })?
-            .into_iter()
-            // Root and every signature are inline in the proof record. Reject
-            // forged evidence before any attacker-chosen claim handle can
-            // trigger active exact-H acquisition.
-            .filter(|proof| roots.contains(&proof.root_key()) && proof.verify_signatures().is_ok())
-            .flat_map(|proof| proof.blob_references().collect::<Vec<_>>())
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
+    let write_policy = descriptor.policy.write().clone();
     drop(bounded);
-
-    for reference in proof_references {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("inspect proof dependency snapshot", error)
-        })?;
-        let bounded = frontier.view(snapshot);
-        let resident = bounded.contains_blob(reference).map_err(|error| {
-            CollectionRealizationError::storage("inspect proof dependency residency", error)
-        })?;
-        drop(bounded);
-        if !resident {
-            let member = Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference);
-            let _ = super::exact_derived::acquire_missing(store, &mut attempted, member).await?;
-        }
-    }
+    acquire_admission_proof_closure(store, frontier, &write_policy, &mut attempted).await?;
 
     // With proof closure resident, decide authorization before acquiring any
     // attacker-supplied payload. Only strictly signed COMMITs by an admitted
@@ -2037,6 +2059,70 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             &mapping,
             policy,
         ))
+    }
+
+    /// Acquire and enumerate one collection's frozen READ audience.
+    ///
+    /// The collection identity and capability-proof frontier are frozen at
+    /// entry. Its missing content-addressed descriptor, then missing claim
+    /// blobs named by signature-valid proofs rooted in the descriptor's READ
+    /// policy, are acquired by exact content handle without recording WANTs.
+    /// Audience evaluation uses that original proof frontier over the later
+    /// blob residency, so concurrent proof arrival is deliberately deferred
+    /// to the next call.
+    fn acquire_read_audience_at(
+        &mut self,
+        collection: CollectionHandle,
+        instant: hifitime::Epoch,
+    ) -> impl Future<Output = Result<CollectionReadAudience, CollectionRealizationError>> + Send + '_
+    where
+        Self: Store + AsyncBlobStoreAcquire + Send,
+    {
+        async move {
+            let control = self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze READ audience frontier", error)
+            })?;
+            let frontier = OperationFrontier::new(control);
+
+            let mut attempted = BTreeSet::new();
+            let read_policy = loop {
+                let snapshot = self.snapshot().map_err(|error| {
+                    CollectionRealizationError::storage("open bounded READ policy snapshot", error)
+                })?;
+                let bounded = frontier.view(snapshot);
+                let resident = bounded.contains_blob(collection).map_err(|error| {
+                    CollectionRealizationError::storage(
+                        "inspect READ collection descriptor residency",
+                        error,
+                    )
+                })?;
+                if resident {
+                    let descriptor =
+                        load_collection_descriptor(&bounded, collection).map_err(|error| {
+                            CollectionRealizationError::Resolution(format!(
+                                "load collection descriptor for active READ audience: {error}"
+                            ))
+                        })?;
+                    break descriptor.policy.read().clone();
+                }
+
+                drop(bounded);
+                let member = Handle::<SimpleArchive>::to_hash(collection);
+                if !super::exact_derived::acquire_missing(self, &mut attempted, member).await? {
+                    return Err(CollectionRealizationError::MissingDependency { member });
+                }
+            };
+
+            acquire_admission_proof_closure(self, &frontier, &read_policy, &mut attempted).await?;
+
+            let snapshot = self.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("freeze hydrated READ audience snapshot", error)
+            })?;
+            let bounded = frontier.view(snapshot);
+            collection_read_audience_at(&bounded, collection, instant).map_err(|error| {
+                CollectionRealizationError::storage("enumerate hydrated READ audience", error)
+            })
+        }
     }
 
     /// Ensure the currently admitted support in one derived collection.

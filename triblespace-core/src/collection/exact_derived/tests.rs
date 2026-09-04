@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anybytes::Bytes;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use futures::executor::block_on;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -15,12 +15,13 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityProofId, CapabilityResource,
+    CapabilityProofBundle, CapabilityProofId, CapabilityResource, CapabilityValidity,
 };
 use crate::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy, CollectionRead,
-    CollectionRecordFingerprint, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    collection_read_audience_at, AdmissionPolicy, CollectionCommit, CollectionMerge,
+    CollectionPolicy, CollectionRead, CollectionReadAudience, CollectionRecordFingerprint,
+    CollectionRecordSelector, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    ACTION_READ, ACTION_WRITE,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -546,6 +547,7 @@ struct GuardStore {
     acquirable: BTreeMap<CollectionData, Bytes>,
     acquired: Vec<CollectionData>,
     inject_record_on_acquire: Option<CollectionRecord>,
+    inject_proof_on_acquire: Option<CapabilityProof>,
 }
 
 impl GuardStore {
@@ -562,6 +564,7 @@ impl GuardStore {
             acquirable: BTreeMap::new(),
             acquired: Vec::new(),
             inject_record_on_acquire: None,
+            inject_proof_on_acquire: None,
         }
     }
 
@@ -603,6 +606,11 @@ impl AsyncBlobStoreAcquire for GuardStore {
             if let Some(record) = self.inject_record_on_acquire.take() {
                 self.inner
                     .insert(record)
+                    .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
+            }
+            if let Some(proof) = self.inject_proof_on_acquire.take() {
+                self.inner
+                    .insert_proof(proof)
                     .map_err(|error| GuardStoreError::Backend(error.to_string()))?;
             }
             Ok(bytes)
@@ -949,6 +957,261 @@ fn async_ensure_hydrates_relevant_proof_before_authorized_commit_payload() {
         observed.support().data_members().collect::<Vec<_>>(),
         vec![data(&source)]
     );
+}
+
+#[test]
+fn active_read_audience_acquires_relevant_claims_without_want() {
+    let authority = SigningKey::from_bytes(&[61; 32]);
+    let reader = SigningKey::from_bytes(&[62; 32]);
+    let mut inner = MemoryRepo::default();
+    let collection = inner
+        .collection(
+            "restricted-read",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+    let bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        reader.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    inner.insert_proof(proof).unwrap();
+
+    let expected_claims = claims.iter().map(data).collect::<Vec<_>>();
+    let mut store = GuardStore::new(inner);
+    for claim in &claims {
+        store.offer(claim);
+    }
+
+    let audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+
+    assert_eq!(store.acquired, expected_claims);
+    let mut expected = vec![authority.verifying_key(), reader.verifying_key()];
+    expected.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(audience, CollectionReadAudience::Restricted(expected));
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+}
+
+#[test]
+fn active_read_audience_acquires_a_cold_descriptor_before_its_claims() {
+    let authority = SigningKey::from_bytes(&[70; 32]);
+    let reader = SigningKey::from_bytes(&[71; 32]);
+    let mut registry = MemoryRepo::default();
+    let collection = registry
+        .collection(
+            "cold-restricted-read",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let descriptor: Blob<SimpleArchive> = registry
+        .snapshot()
+        .unwrap()
+        .get(collection.handle())
+        .unwrap();
+
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+    let bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        reader.verifying_key(),
+    )
+    .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    let mut inner = MemoryRepo::default();
+    inner.insert_proof(proof).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&descriptor);
+    for claim in &claims {
+        store.offer(claim);
+    }
+
+    let audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+
+    let mut expected_acquisitions = vec![data(&descriptor)];
+    expected_acquisitions.extend(claims.iter().map(data));
+    assert_eq!(store.acquired, expected_acquisitions);
+    let mut expected_audience = vec![authority.verifying_key(), reader.verifying_key()];
+    expected_audience.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(
+        audience,
+        CollectionReadAudience::Restricted(expected_audience)
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+}
+
+#[test]
+fn active_read_audience_does_not_acquire_irrelevant_or_forged_proofs() {
+    let authority = SigningKey::from_bytes(&[63; 32]);
+    let irrelevant_authority = SigningKey::from_bytes(&[64; 32]);
+    let irrelevant_reader = SigningKey::from_bytes(&[65; 32]);
+    let forged_reader = SigningKey::from_bytes(&[66; 32]);
+    let mut inner = MemoryRepo::default();
+    let collection = inner
+        .collection(
+            "filtered-read-evidence",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+
+    let irrelevant = CapabilityProofBundle::issue_root(
+        &irrelevant_authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        irrelevant_reader.verifying_key(),
+    )
+    .unwrap();
+    let (irrelevant_proof, irrelevant_claims) = irrelevant.into_parts();
+    inner.insert_proof(irrelevant_proof).unwrap();
+
+    let forged = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        forged_reader.verifying_key(),
+    )
+    .unwrap();
+    let (forged_proof, forged_claims) = forged.into_parts();
+    let mut forged_bytes = forged_proof.into_bytes();
+    forged_bytes[32] ^= 1;
+    inner
+        .insert_proof(CapabilityProof::from_bytes(&forged_bytes).unwrap())
+        .unwrap();
+
+    let mut store = GuardStore::new(inner);
+    for claim in irrelevant_claims.iter().chain(&forged_claims) {
+        store.offer(claim);
+    }
+
+    let audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+
+    assert!(store.acquired.is_empty());
+    assert_eq!(
+        audience,
+        CollectionReadAudience::Restricted(vec![authority.verifying_key()])
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+}
+
+#[test]
+fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
+    let authority = SigningKey::from_bytes(&[67; 32]);
+    let first_reader = SigningKey::from_bytes(&[68; 32]);
+    let concurrent_reader = SigningKey::from_bytes(&[69; 32]);
+    let mut inner = MemoryRepo::default();
+    let collection = inner
+        .collection(
+            "frozen-read-evidence",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+    let first = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        first_reader.verifying_key(),
+    )
+    .unwrap();
+    let (first_proof, first_claims) = first.into_parts();
+    inner.insert_proof(first_proof).unwrap();
+
+    let concurrent = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(
+            atom,
+            CapabilityMode::Invoke,
+            Some(
+                CapabilityValidity::new(
+                    hifitime::Epoch::from_tai_seconds(-1.0),
+                    hifitime::Epoch::from_tai_seconds(1.0),
+                )
+                .unwrap(),
+            ),
+        ),
+        concurrent_reader.verifying_key(),
+    )
+    .unwrap();
+    let (concurrent_proof, concurrent_claims) = concurrent.into_parts();
+    for claim in concurrent_claims {
+        inner.put::<SimpleArchive, _>(claim).unwrap();
+    }
+
+    let mut store = GuardStore::new(inner);
+    for claim in &first_claims {
+        store.offer(claim);
+    }
+    store.inject_proof_on_acquire = Some(concurrent_proof);
+
+    let first_audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+    let mut first_expected = vec![authority.verifying_key(), first_reader.verifying_key()];
+    first_expected.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(
+        first_audience,
+        CollectionReadAudience::Restricted(first_expected)
+    );
+
+    let second_audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+    let mut second_expected = vec![
+        authority.verifying_key(),
+        first_reader.verifying_key(),
+        concurrent_reader.verifying_key(),
+    ];
+    second_expected.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(
+        second_audience,
+        CollectionReadAudience::Restricted(second_expected)
+    );
+    assert_eq!(
+        collection_read_audience_at(
+            &store.inner.snapshot().unwrap(),
+            collection.handle(),
+            hifitime::Epoch::from_tai_seconds(0.0),
+        )
+        .unwrap(),
+        second_audience,
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
 }
 
 #[test]

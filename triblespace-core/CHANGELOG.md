@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add `CollectionStoreExt::acquire_read_audience_at` for active exact-H
+  hydration of a missing collection descriptor and the frozen READ(C) proof
+  forest without implicit WANTs. Pure snapshot admission remains resident-only
+  and inert.
+
 - Make canonical `WantRequest::Blob(H)` the sole durable exact-content
   request. Repository implementations retain its exact identity, and Yard
   charges one bounded-retention slot per requested handle.
