@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use anybytes::Bytes;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use futures::executor::block_on;
 
 use crate::blob::encodings::simplearchive::SimpleArchive;
@@ -15,7 +15,8 @@ use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{
     CapabilityAction, CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof,
-    CapabilityProofBundle, CapabilityProofId, CapabilityResource, CapabilityValidity,
+    CapabilityProofBundle, CapabilityProofId, CapabilityRequest, CapabilityResource,
+    CapabilityValidity,
 };
 use crate::collection::{
     collection_read_audience_at, AdmissionPolicy, CollectionCommit, CollectionMerge,
@@ -25,6 +26,7 @@ use crate::collection::{
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
+use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::metadata::MetaDescribe;
 use crate::repo::memoryrepo::{MemoryRepo, MemoryRepoSnapshot};
@@ -57,6 +59,26 @@ where
     Handle<E>: crate::inline::InlineEncoding,
 {
     Handle::<E>::to_hash(blob.get_handle())
+}
+
+fn append_adversarial_proof_edge(
+    proof: CapabilityProof,
+    issuer: &SigningKey,
+    claim: Inline<Handle<SimpleArchive>>,
+    delegate: VerifyingKey,
+) -> CapabilityProof {
+    let mut transcript = Vec::new();
+    transcript.extend_from_slice(b"triblespace.capability.proof-edge\0");
+    transcript.extend_from_slice(&1_u32.to_be_bytes());
+    transcript.extend_from_slice(&issuer.verifying_key().to_bytes());
+    transcript.extend_from_slice(&claim.raw);
+    transcript.extend_from_slice(&delegate.to_bytes());
+
+    let mut bytes = proof.into_bytes();
+    bytes.extend_from_slice(&issuer.sign(&transcript).to_bytes());
+    bytes.extend_from_slice(&claim.raw);
+    bytes.extend_from_slice(&delegate.to_bytes());
+    CapabilityProof::from_bytes(&bytes).expect("adversarial proof wire remains structurally valid")
 }
 
 fn support(collection: Collection<SimpleArchive>, blobs: &[Blob<SimpleArchive>]) -> Support {
@@ -1115,6 +1137,125 @@ fn active_read_audience_does_not_acquire_irrelevant_or_forged_proofs() {
     .unwrap();
 
     assert!(store.acquired.is_empty());
+    assert_eq!(
+        audience,
+        CollectionReadAudience::Restricted(vec![authority.verifying_key()])
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+}
+
+#[test]
+fn active_read_audience_walks_a_valid_delegated_claim_prefix() {
+    let authority = SigningKey::from_bytes(&[75; 32]);
+    let intermediate = SigningKey::from_bytes(&[76; 32]);
+    let reader = SigningKey::from_bytes(&[77; 32]);
+    let mut inner = MemoryRepo::default();
+    let collection = inner
+        .collection(
+            "delegated-read",
+            CollectionPolicy::new(
+                AdmissionPolicy::delegable(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+    let root_claim = CapabilityClaim::root(atom, CapabilityMode::InvokeAndDelegate, None);
+    let root_bundle =
+        CapabilityProofBundle::issue_root(&authority, root_claim, intermediate.verifying_key())
+            .unwrap();
+    let verified = root_bundle
+        .verify(
+            authority.verifying_key(),
+            hifitime::Epoch::from_tai_seconds(0.0),
+            intermediate.verifying_key(),
+            CapabilityRequest::new(atom, CapabilityMode::InvokeAndDelegate),
+        )
+        .unwrap();
+    let bundle = verified
+        .delegate(
+            &intermediate,
+            CapabilityClaim::delegated(root_claim.handle(), atom, CapabilityMode::Invoke, None),
+            reader.verifying_key(),
+        )
+        .unwrap();
+    let (proof, claims) = bundle.into_parts();
+    inner.insert_proof(proof).unwrap();
+
+    let expected_acquisitions = claims.iter().map(data).collect::<Vec<_>>();
+    let mut store = GuardStore::new(inner);
+    for claim in &claims {
+        store.offer(claim);
+    }
+
+    let audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+
+    assert_eq!(store.acquired, expected_acquisitions);
+    let mut expected_audience = vec![
+        authority.verifying_key(),
+        intermediate.verifying_key(),
+        reader.verifying_key(),
+    ];
+    expected_audience.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(
+        audience,
+        CollectionReadAudience::Restricted(expected_audience)
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+}
+
+#[test]
+fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail() {
+    let authority = SigningKey::from_bytes(&[72; 32]);
+    let direct_reader = SigningKey::from_bytes(&[73; 32]);
+    let tail_reader = SigningKey::from_bytes(&[74; 32]);
+    let mut inner = MemoryRepo::default();
+    let collection = inner
+        .collection(
+            "invoke-only-read",
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority.verifying_key()),
+                AdmissionPolicy::Open,
+            ),
+        )
+        .unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_READ),
+        CapabilityResource::from(collection.handle()),
+    );
+    let root_claim = CapabilityClaim::root(atom, CapabilityMode::Invoke, None);
+    let root_bundle =
+        CapabilityProofBundle::issue_root(&authority, root_claim, direct_reader.verifying_key())
+            .unwrap();
+    let (root_proof, root_claims) = root_bundle.into_parts();
+    let tail_claim =
+        CapabilityClaim::delegated(root_claim.handle(), atom, CapabilityMode::Invoke, None)
+            .to_blob();
+    let proof = append_adversarial_proof_edge(
+        root_proof,
+        &direct_reader,
+        tail_claim.get_handle(),
+        tail_reader.verifying_key(),
+    );
+    proof.verify_signatures().unwrap();
+    inner.insert_proof(proof).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&root_claims[0]);
+    store.offer(&tail_claim);
+
+    let audience = block_on(
+        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
+    )
+    .unwrap();
+
+    assert_eq!(store.acquired, vec![data(&root_claims[0])]);
     assert_eq!(
         audience,
         CollectionReadAudience::Restricted(vec![authority.verifying_key()])

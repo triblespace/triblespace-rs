@@ -25,8 +25,8 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
     capability_quorum_authorized_subjects, capability_quorum_authorizes, CapabilityAction,
-    CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityProofBundle, CapabilityRequest,
-    CapabilityResource,
+    CapabilityAtom, CapabilityClaim, CapabilityMode, CapabilityProof, CapabilityProofBundle,
+    CapabilityRequest, CapabilityResource,
 };
 use crate::clock;
 use crate::id::Id;
@@ -1757,29 +1757,34 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
-/// Acquire the claim closure named by every bounded, signature-valid proof
-/// rooted in one admission policy.
+/// Acquire the useful claim prefix named by every bounded, signature-valid
+/// proof rooted in one admission policy.
 ///
 /// Root keys and signatures are inline in a native proof record, so forged
 /// evidence and proofs from unrelated roots are rejected before any
-/// attacker-chosen claim handle can trigger exact-H acquisition. The claim
-/// contents decide action, resource, mode, and validity later at the pure
-/// admission boundary. This operation never records a WANT.
+/// attacker-chosen claim handle can trigger exact-H acquisition. Each newly
+/// resident claim is then checked before the next handle is followed: a wrong
+/// atom or parent, an impossible mode meet, expired validity, or a parent
+/// without delegation authority makes the remaining tail irrelevant. Final
+/// quorum admission remains at the pure admission boundary. This operation
+/// never records a WANT.
 async fn acquire_admission_proof_closure<S>(
     store: &mut S,
     frontier: &OperationFrontier<S::Snapshot>,
     policy: &AdmissionPolicy,
+    atom: CapabilityAtom,
+    instant: hifitime::Epoch,
     attempted: &mut BTreeSet<CollectionData>,
 ) -> Result<(), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
 {
-    let proof_references = if let Some(roots) = policy.roots() {
+    let candidate_proofs = if let Some(roots) = policy.roots() {
         let snapshot = store.snapshot().map_err(|error| {
             CollectionRealizationError::storage("open bounded proof snapshot", error)
         })?;
         let bounded = frontier.view(snapshot);
-        let references = bounded
+        let proofs = bounded
             .proofs()
             .map_err(|error| {
                 CollectionRealizationError::storage("enumerate bounded capability proofs", error)
@@ -1790,25 +1795,69 @@ where
             })?
             .into_iter()
             .filter(|proof| roots.contains(&proof.root_key()) && proof.verify_signatures().is_ok())
-            .flat_map(|proof| proof.blob_references().collect::<Vec<_>>())
             .collect::<Vec<_>>();
-        references
+        proofs
     } else {
         Vec::new()
     };
 
-    for reference in proof_references {
-        let snapshot = store.snapshot().map_err(|error| {
-            CollectionRealizationError::storage("inspect proof dependency snapshot", error)
-        })?;
-        let bounded = frontier.view(snapshot);
-        let resident = bounded.contains_blob(reference).map_err(|error| {
-            CollectionRealizationError::storage("inspect proof dependency residency", error)
-        })?;
-        drop(bounded);
-        if !resident {
-            let member = Handle::<crate::blob::encodings::UnknownBlob>::to_hash(reference);
-            let _ = super::exact_derived::acquire_missing(store, attempted, member).await?;
+    'proof: for proof in candidate_proofs {
+        let mut previous = None;
+        let mut effective_mode: Option<CapabilityMode> = None;
+        for claim_handle in proof.claim_handles() {
+            if effective_mode.is_some_and(|mode| !mode.delegates()) {
+                break;
+            }
+
+            let claim_blob = loop {
+                let snapshot = store.snapshot().map_err(|error| {
+                    CollectionRealizationError::storage("inspect proof dependency snapshot", error)
+                })?;
+                let bounded = frontier.view(snapshot);
+                let resident = bounded.contains_blob(claim_handle).map_err(|error| {
+                    CollectionRealizationError::storage("inspect proof dependency residency", error)
+                })?;
+                if resident {
+                    break bounded
+                        .get::<Blob<SimpleArchive>, SimpleArchive>(claim_handle)
+                        .map_err(|error| {
+                            CollectionRealizationError::storage(
+                                "read resident proof dependency",
+                                error,
+                            )
+                        })?;
+                }
+
+                drop(bounded);
+                let member = Handle::<SimpleArchive>::to_hash(claim_handle);
+                if !super::exact_derived::acquire_missing(store, attempted, member).await? {
+                    continue 'proof;
+                }
+            };
+
+            let Ok(claim) = CapabilityClaim::from_blob(claim_blob) else {
+                break;
+            };
+            if claim.parent() != previous || claim.atom() != atom {
+                break;
+            }
+            let mode = match effective_mode {
+                None => claim.mode(),
+                Some(parent) => {
+                    let Some(mode) = parent.meet(claim.mode()) else {
+                        break;
+                    };
+                    mode
+                }
+            };
+            if claim
+                .validity()
+                .is_some_and(|validity| !validity.contains(instant))
+            {
+                break;
+            }
+            previous = Some(claim_handle);
+            effective_mode = Some(mode);
         }
     }
     Ok(())
@@ -1856,7 +1905,19 @@ where
         })?;
     let write_policy = descriptor.policy.write().clone();
     drop(bounded);
-    acquire_admission_proof_closure(store, frontier, &write_policy, &mut attempted).await?;
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(foundation.handle()),
+    );
+    acquire_admission_proof_closure(
+        store,
+        frontier,
+        &write_policy,
+        atom,
+        instant,
+        &mut attempted,
+    )
+    .await?;
 
     // With proof closure resident, decide authorization before acquiring any
     // attacker-supplied payload. Only strictly signed COMMITs by an admitted
@@ -2113,7 +2174,19 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
                 }
             };
 
-            acquire_admission_proof_closure(self, &frontier, &read_policy, &mut attempted).await?;
+            let atom = CapabilityAtom::new(
+                CapabilityAction::new(ACTION_READ),
+                CapabilityResource::from(collection),
+            );
+            acquire_admission_proof_closure(
+                self,
+                &frontier,
+                &read_policy,
+                atom,
+                instant,
+                &mut attempted,
+            )
+            .await?;
 
             let snapshot = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze hydrated READ audience snapshot", error)
