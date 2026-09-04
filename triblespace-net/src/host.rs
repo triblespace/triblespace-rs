@@ -801,6 +801,15 @@ impl WakeBootstrapPeers {
             .copied()
             .collect()
     }
+
+    /// Whether reopening the topic has any bootstrap route to retry.
+    ///
+    /// Configured endpoints remain generic topology seeds rather than repair
+    /// participants; they are nevertheless valid routes through which the
+    /// collection topic can reconnect to its mesh.
+    fn has_recovery_route(&self) -> bool {
+        !self.configured.is_empty() || !self.learned.is_empty()
+    }
 }
 
 fn observe_participant(
@@ -841,7 +850,7 @@ fn forget_participant(
     participants: &mut HashMap<[u8; 32], HashMap<PeerId, crate::clock::Mono>>,
     collection: [u8; 32],
     peer: PeerId,
-) {
+) -> bool {
     let empty = participants.get_mut(&collection).is_some_and(|peers| {
         peers.remove(&peer);
         peers.is_empty()
@@ -849,6 +858,7 @@ fn forget_participant(
     if empty {
         participants.remove(&collection);
     }
+    empty
 }
 
 struct PoolEntry<C> {
@@ -1274,6 +1284,7 @@ fn retain_active_repair_state<T>(state: &mut HashMap<RepairTarget, T>, active: &
 enum WakeCommand {
     Observe(CollectionWakeRoot),
     Join(Vec<EndpointId>),
+    Resubscribe,
     Shutdown,
 }
 
@@ -1310,6 +1321,7 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                             command = command_rx.recv() => match command {
                                 Some(WakeCommand::Observe(root)) => current_root = Some(root),
                                 Some(WakeCommand::Join(peers)) => bootstrap.remember(peers),
+                                Some(WakeCommand::Resubscribe) => {}
                                 Some(WakeCommand::Shutdown) | None => return,
                             },
                             () = tokio::time::sleep(crate::RETRY_BACKOFF_BASE) => {}
@@ -1335,6 +1347,12 @@ fn spawn_wake_topic<P: CollectionWakeNetwork>(
                             bootstrap.remember(peers.iter().copied());
                             if let Err(error) = topic.join_wake_peers(peers).await {
                                 debug!(%error, "joining DHT-discovered collection wake peers failed");
+                            }
+                        }
+                        Some(WakeCommand::Resubscribe) => {
+                            if bootstrap.has_recovery_route() {
+                                debug!("reopening collection wake subscription for recovery");
+                                break 'events;
                             }
                         }
                         Some(WakeCommand::Shutdown) | None => return,
@@ -1628,7 +1646,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     enqueue_repair(&mut immediate, &mut pending, outcome.target);
                 }
             } else {
-                forget_participant(
+                let participants_exhausted = forget_participant(
                     &mut participants.lock().unwrap(),
                     outcome.target.collection.raw,
                     outcome.target.peer,
@@ -1646,6 +1664,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                                 + crate::RETRY_BACKOFF_BASE.saturating_mul(1u32 << shift),
                         ),
                     );
+                }
+                if participants_exhausted
+                    && let Some(topic) = wake_topics.get(&outcome.target.collection.raw)
+                {
+                    let _ = topic.send(WakeCommand::Resubscribe);
                 }
                 next_discovery = next_discovery.min(crate::clock::mono_now());
             }
@@ -1682,7 +1705,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 .into_iter()
                 .filter(|peer| *peer != my_id)
                 .collect::<Vec<_>>();
-            if let Some(topic) = wake_topics.get(&collection.raw) {
+            if peers.is_empty() {
+                if let Some(topic) = wake_topics.get(&collection.raw) {
+                    let _ = topic.send(WakeCommand::Resubscribe);
+                }
+            } else if let Some(topic) = wake_topics.get(&collection.raw) {
                 let joined = peers
                     .iter()
                     .filter_map(|peer| EndpointId::from_bytes(peer).ok())
@@ -3703,10 +3730,15 @@ mod tests {
     fn learned_wake_peers_survive_resubscription_with_a_bounded_recent_set() {
         let configured = endpoint(0x51);
         let mut bootstrap = WakeBootstrapPeers::new(vec![configured]);
+        assert!(
+            bootstrap.has_recovery_route(),
+            "a configured topology seed can reopen the collection topic without becoming a repair participant"
+        );
         let learned = (0..=MAX_COLLECTION_PARTICIPANTS)
             .map(|index| endpoint((index as u8).wrapping_add(0x60)))
             .collect::<Vec<_>>();
         bootstrap.remember(learned.iter().copied());
+        assert!(bootstrap.has_recovery_route());
 
         let resubscribe = bootstrap.current();
         assert_eq!(resubscribe.first(), Some(&configured));
@@ -3716,6 +3748,25 @@ mod tests {
 
         bootstrap.remember([learned[1]]);
         assert_eq!(bootstrap.current().last(), Some(&learned[1]));
+    }
+
+    #[test]
+    fn gossip_recovery_waits_until_every_participant_failed() {
+        let collection = [0x71; 32];
+        let first = [0x72; 32];
+        let second = [0x73; 32];
+        let now = crate::clock::mono_now();
+        let mut participants = HashMap::new();
+        observe_participant(&mut participants, collection, first, now);
+        observe_participant(&mut participants, collection, second, now);
+
+        assert!(!forget_participant(&mut participants, collection, first));
+        assert_eq!(
+            live_participants(&mut participants, collection, now),
+            vec![second]
+        );
+        assert!(forget_participant(&mut participants, collection, second));
+        assert!(live_participants(&mut participants, collection, now).is_empty());
     }
 
     #[test]

@@ -49,6 +49,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Reopen a collection's stock-gossip topic through its configured and learned
+  bootstrap routes when every repair participant is lost. Recovery shares the
+  existing discovery backoff and does not promote generic configured routes to
+  collection participants.
 - Treat absence of an authenticated remote DHT replica as one topology outage,
   not as an independent failure of every resident provider key. The publisher
   preserves the complete pending set behind one exponentially backed-off probe
