@@ -560,6 +560,7 @@ impl CapabilityProofRead for GuardSnapshot {
 struct GuardStore {
     inner: MemoryRepo,
     live: Arc<AtomicUsize>,
+    expected_live_during_write: usize,
     semantic_probes: Arc<AtomicUsize>,
     events: Vec<WriteEvent>,
     put_calls: usize,
@@ -577,6 +578,7 @@ impl GuardStore {
         Self {
             inner,
             live: Arc::new(AtomicUsize::new(0)),
+            expected_live_during_write: 1,
             semantic_probes: Arc::new(AtomicUsize::new(0)),
             events: Vec::new(),
             put_calls: 0,
@@ -600,8 +602,8 @@ impl GuardStore {
     fn assert_only_control_snapshot(&self) {
         assert_eq!(
             self.live.load(Ordering::SeqCst),
-            1,
-            "write while a residency snapshot is live, or without the frozen control snapshot",
+            self.expected_live_during_write,
+            "unexpected number of live snapshots while acquiring immutable residency",
         );
     }
 }
@@ -979,6 +981,127 @@ fn async_ensure_hydrates_relevant_proof_before_authorized_commit_payload() {
         observed.support().data_members().collect::<Vec<_>>(),
         vec![data(&source)]
     );
+}
+
+#[test]
+fn caller_bounded_support_acquisition_hydrates_cold_write_evidence_and_defers_concurrency() {
+    let authority = SigningKey::from_bytes(&[83; 32]);
+    let first_writer = SigningKey::from_bytes(&[84; 32]);
+    let concurrent_writer = SigningKey::from_bytes(&[85; 32]);
+    let restricted = CollectionPolicy::new(
+        AdmissionPolicy::Open,
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+
+    let mut registry = MemoryRepo::default();
+    let root = registry
+        .collection("bounded-cold-write", restricted)
+        .unwrap();
+    let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
+    let atom = CapabilityAtom::new(
+        CapabilityAction::new(ACTION_WRITE),
+        CapabilityResource::from(root.handle()),
+    );
+
+    let first_bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(
+            atom,
+            CapabilityMode::Invoke,
+            Some(
+                CapabilityValidity::new(
+                    hifitime::Epoch::from_tai_seconds(-1.0),
+                    hifitime::Epoch::from_tai_seconds(1.0),
+                )
+                .unwrap(),
+            ),
+        ),
+        first_writer.verifying_key(),
+    )
+    .unwrap();
+    let (first_proof, first_claims) = first_bundle.into_parts();
+    let first_source = archive(31, 31);
+    let first_metadata = archive(32, 32);
+    let first_commit = CollectionCommit::sign(
+        &first_writer,
+        root.handle(),
+        data(&first_source),
+        first_metadata.get_handle(),
+    );
+
+    let concurrent_bundle = CapabilityProofBundle::issue_root(
+        &authority,
+        CapabilityClaim::root(atom, CapabilityMode::Invoke, None),
+        concurrent_writer.verifying_key(),
+    )
+    .unwrap();
+    let (concurrent_proof, concurrent_claims) = concurrent_bundle.into_parts();
+    let concurrent_source = archive(33, 33);
+    let concurrent_metadata = archive(34, 34);
+    let concurrent_commit = CollectionCommit::sign(
+        &concurrent_writer,
+        root.handle(),
+        data(&concurrent_source),
+        concurrent_metadata.get_handle(),
+    );
+
+    let mut inner = MemoryRepo::default();
+    inner.insert_proof(first_proof).unwrap();
+    inner
+        .insert(CollectionRecord::Commit(first_commit))
+        .unwrap();
+    for blob in concurrent_claims
+        .iter()
+        .chain([&concurrent_source, &concurrent_metadata])
+    {
+        inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
+    }
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&descriptor);
+    for claim in &first_claims {
+        store.offer(claim);
+    }
+    store.offer(&first_source);
+    store.offer(&first_metadata);
+    store.inject_record_on_acquire = Some(CollectionRecord::Commit(concurrent_commit));
+    store.inject_proof_on_acquire = Some(concurrent_proof);
+
+    let instant = hifitime::Epoch::from_tai_seconds(0.0);
+    let control = store.snapshot().unwrap();
+    // The public helper retains the caller's snapshot and one private clone of
+    // that control frontier while refreshed observations contribute only blob
+    // residency. This count assertion guards the operation's snapshot lifetime;
+    // the semantic assertions below guard the frontier itself.
+    store.expected_live_during_write = 2;
+    let (first_support, first_commits) =
+        block_on(store.acquire_admitted_with_commits_at(root, &control, instant)).unwrap();
+
+    let mut expected_acquisitions = vec![data(&descriptor)];
+    expected_acquisitions.extend(first_claims.iter().map(data));
+    expected_acquisitions.extend([data(&first_source), data(&first_metadata)]);
+    assert_eq!(store.acquired, expected_acquisitions);
+    assert_eq!(first_commits, vec![first_commit]);
+    assert_eq!(
+        first_support,
+        support(root, std::slice::from_ref(&first_source)),
+        "records and proofs arriving during acquisition stay outside the caller's control frontier",
+    );
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+
+    drop(control);
+    let fresh_control = store.snapshot().unwrap();
+    let (second_support, second_commits) =
+        block_on(store.acquire_admitted_with_commits_at(root, &fresh_control, instant)).unwrap();
+    assert_eq!(
+        second_support,
+        support(root, &[first_source, concurrent_source]),
+        "a fresh caller frontier observes the concurrently inserted proof and commit",
+    );
+    assert_eq!(second_commits.len(), 2);
+    assert!(second_commits.contains(&first_commit));
+    assert!(second_commits.contains(&concurrent_commit));
+    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
 }
 
 #[test]

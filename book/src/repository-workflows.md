@@ -347,7 +347,9 @@ let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
 
 let before = storage.snapshot()?;
 let instant = triblespace::core::clock::epoch_now();
-let support = before.collection_at(source, instant)?.support().clone();
+let support = storage
+    .acquire_admitted_support_at(source, &before, instant)
+    .await?;
 drop(before);
 
 // Each edge receives the same foundational Support. Work never flows upward.
@@ -360,10 +362,15 @@ let observed = after.collection_exact(accelerated, &support)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 ```
 
-- `snapshot.collection_at` is read-only, performs no collection algebra, and binds
-  the maximal resident target cover to the immutable snapshot which observed
-  it. Taking support from the foundational collection observation excludes
-  admitted COMMITs whose payloads are not resident at that boundary.
+- `acquire_admitted_support_at` freezes collection records and capability
+  proofs at the caller's control snapshot, then acquires only the missing
+  immutable descriptor, claim, data, and metadata bytes needed to decide that
+  frontier. Concurrent records and proofs remain deferred. Reusing the same
+  control snapshot across several calls therefore gives a batch one semantic
+  watermark without pretending that byte residency was already complete.
+- `snapshot.collection_at` remains the purely read-only alternative: it
+  performs no acquisition or collection algebra and binds only the maximal
+  resident target cover visible in that immutable snapshot.
   `collection_exact` requires a complete realization for explicit support.
 - `ensure` freezes the currently admitted foundational support, while
   `ensure_exact` accepts explicit support. Both publish only missing `DERIVE`

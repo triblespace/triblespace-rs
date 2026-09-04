@@ -1863,12 +1863,12 @@ where
     Ok(())
 }
 
-async fn admitted_support_with_acquisition<S, E>(
+async fn admitted_support_and_commits_with_acquisition<S, E>(
     store: &mut S,
     target: Collection<E>,
     frontier: &OperationFrontier<S::Snapshot>,
     instant: hifitime::Epoch,
-) -> Result<Support, CollectionRealizationError>
+) -> Result<(Support, Vec<CollectionCommit>), CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
@@ -1986,8 +1986,25 @@ where
     })?;
     let bounded = frontier.view(snapshot);
     foundation
-        .admitted_at(&bounded, instant)
-        .map_err(|error| CollectionRealizationError::storage("admit hydrated support", error))
+        .admitted_with_commits_at(&bounded, instant)
+        .map_err(|error| {
+            CollectionRealizationError::storage("admit hydrated support and provenance", error)
+        })
+}
+
+async fn admitted_support_with_acquisition<S, E>(
+    store: &mut S,
+    target: Collection<E>,
+    frontier: &OperationFrontier<S::Snapshot>,
+    instant: hifitime::Epoch,
+) -> Result<Support, CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+    E: CollectionEncoding,
+{
+    admitted_support_and_commits_with_acquisition(store, target, frontier, instant)
+        .await
+        .map(|(support, _)| support)
 }
 
 /// Immutable collection observations implemented by every complete store snapshot.
@@ -2120,6 +2137,63 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             &mapping,
             policy,
         ))
+    }
+
+    /// Acquire the immutable bytes needed to select one bounded admitted support.
+    ///
+    /// `control` supplies the exact collection-record and capability-proof
+    /// frontier. Later store snapshots contribute only blob residency: missing
+    /// descriptors, useful WRITE claims, and direct dependencies of authorized
+    /// COMMITs may be acquired by exact content handle without recording WANTs.
+    /// A COMMIT whose complete direct closure still cannot be acquired remains
+    /// semantically invisible in the returned support. Concurrent records and
+    /// proofs remain deferred.
+    ///
+    /// Reusing one `control` snapshot across several calls gives a
+    /// multi-collection operation one common semantic watermark while allowing
+    /// each collection's immutable closure to arrive before its [`Support`] is
+    /// frozen. `control` must have been produced by this same store lineage;
+    /// the trait boundary cannot express that relationship in Rust's type
+    /// system.
+    fn acquire_admitted_support_at<E>(
+        &mut self,
+        target: Collection<E>,
+        control: &Self::Snapshot,
+        instant: hifitime::Epoch,
+    ) -> impl Future<Output = Result<Support, CollectionRealizationError>> + Send + '_
+    where
+        E: CollectionEncoding,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+    {
+        let frontier = OperationFrontier::new(control.clone());
+        async move { admitted_support_with_acquisition(self, target, &frontier, instant).await }
+    }
+
+    /// Acquire one bounded admitted support together with its exact provenance.
+    ///
+    /// This is the provenance-preserving form of
+    /// [`Self::acquire_admitted_support_at`]. The returned COMMITs are selected
+    /// by the same frozen record/proof frontier and authorization decision as
+    /// the support; callers must not reconstruct them from a later snapshot.
+    /// As with the support-only form, `control` must come from this store
+    /// lineage, acquisition records no WANT, and concurrent records and proofs
+    /// remain deferred.
+    fn acquire_admitted_with_commits_at<E>(
+        &mut self,
+        target: Collection<E>,
+        control: &Self::Snapshot,
+        instant: hifitime::Epoch,
+    ) -> impl Future<Output = Result<(Support, Vec<CollectionCommit>), CollectionRealizationError>>
+           + Send
+           + '_
+    where
+        E: CollectionEncoding,
+        Self: Store + AsyncBlobStoreAcquire + Send,
+    {
+        let frontier = OperationFrontier::new(control.clone());
+        async move {
+            admitted_support_and_commits_with_acquisition(self, target, &frontier, instant).await
+        }
     }
 
     /// Acquire and enumerate one collection's frozen READ audience.
