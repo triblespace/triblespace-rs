@@ -791,12 +791,12 @@ mod tests {
                 UnarchiveError::BadCanonicalizationRedundancy
             ))
         );
-        let invalid = Blob::new(Bytes::from_source(vec![0; TRIBLE_LEN]));
+        let invalid = Blob::new(Bytes::from_source(vec![0u8; TRIBLE_LEN]));
         assert_eq!(
             derive_element(&invalid, metadata::supersedes.id()),
             Err(LatestError::InvalidSource(UnarchiveError::BadTrible))
         );
-        let ragged = Blob::new(Bytes::from_source(vec![0; HEADER_LEN - 1]));
+        let ragged = Blob::new(Bytes::from_source(vec![0u8; HEADER_LEN - 1]));
         assert_eq!(
             validate_element(&ragged),
             Err(LatestError::BadLength(HEADER_LEN - 1))
@@ -813,7 +813,7 @@ mod tests {
             validate_element(&encode(&[&a[..], &a[..]].concat(), &[])),
             Err(LatestError::NotStrictlyIncreasing)
         );
-        let overflow = Blob::new(Bytes::from_source(vec![255; HEADER_LEN]));
+        let overflow = Blob::new(Bytes::from_source(vec![255u8; HEADER_LEN]));
         assert_eq!(validate_element(&overflow), Err(LatestError::CountOverflow));
     }
 }
