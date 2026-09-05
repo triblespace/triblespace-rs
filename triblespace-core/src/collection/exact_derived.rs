@@ -525,28 +525,24 @@ where
     Ok((resolved.support, resolved.cover))
 }
 
-/// Attach one target collection using one caller-supplied authorization instant.
+/// Attach one target collection using its snapshot's frozen authorization time.
 ///
 /// The foundation's admitted support is the search boundary, but the result
 /// contains only the maximal resident target antichain and exactly the
 /// foundational support it represents. A static snapshot never promises a
 /// future derivation.
-pub(crate) fn attach_collection_at<R, E>(
+pub(crate) fn attach_collection<R, E>(
     snapshot: &R,
     target: Collection<E>,
-    instant: hifitime::Epoch,
 ) -> Result<(Support, Cover<E>), CollectionRealizationError>
 where
     R: StoreRead,
     E: CollectionEncoding,
 {
     let lineage = load_lineage(snapshot, target)?;
-    let admitted = lineage
-        .foundation
-        .admitted_at(snapshot, instant)
-        .map_err(|error| {
-            CollectionRealizationError::storage("admit foundational support", error)
-        })?;
+    let admitted = lineage.foundation.admitted(snapshot).map_err(|error| {
+        CollectionRealizationError::storage("admit foundational support", error)
+    })?;
     let resolved = resolve_target(snapshot, target, &lineage, &admitted)?;
     Ok((resolved.support, resolved.cover))
 }
@@ -891,6 +887,60 @@ where
             CollectionRealizationError::storage("acquire exact blob dependency", error)
         })
         .map(|bytes| bytes.is_some())
+}
+
+/// Make one explicit root support readable, without needing provenance records
+/// or publishing equations. Existing resident MERGEs may already cover it.
+pub(crate) async fn ensure_root_in_frontier<S>(
+    store: &mut S,
+    target: Collection<SimpleArchive>,
+    support: &Support,
+    frontier: &OperationFrontier<S::Snapshot>,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("observe root realization", error)
+        })?);
+        let result = (|| {
+            let lineage = load_lineage(&snapshot, target)?;
+            if lineage.foundation != target {
+                return Err(CollectionRealizationError::InvalidCover(
+                    "a derived SimpleArchive target requires an explicit mapping".into(),
+                ));
+            }
+            require_support(&lineage, support)?;
+            let resolved = resolve_target(&snapshot, target, &lineage, support)?;
+            if resolved.is_exact_for(support) {
+                Ok(())
+            } else {
+                Err(resolved.incomplete_error(support))
+            }
+        })();
+        drop(snapshot);
+        let missing = match result {
+            Ok(()) => return Ok(()),
+            Err(CollectionRealizationError::MissingDependency { member }) => vec![member],
+            Err(CollectionRealizationError::IncompleteCover {
+                unsupported_members,
+                ..
+            }) => unsupported_members,
+            Err(error) => return Err(error),
+        };
+        let mut acquired = false;
+        for member in missing {
+            acquired |= acquire_missing(store, &mut attempted, member).await?;
+        }
+        if !acquired {
+            let snapshot = frontier.view(store.snapshot().map_err(|error| {
+                CollectionRealizationError::storage("observe incomplete root realization", error)
+            })?);
+            return attach_collection_exact(&snapshot, target, support).map(|_| ());
+        }
+    }
 }
 
 pub(crate) async fn ensure_exact_in_frontier_with<S, M>(

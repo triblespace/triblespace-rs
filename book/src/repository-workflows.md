@@ -98,8 +98,7 @@ let commit = storage.commit(
     entity! { metadata::name: "first-model" },
 )?;
 let snapshot = storage.snapshot()?;
-let instant = triblespace::core::clock::epoch_now();
-let cover = models.admitted_at(&snapshot, instant)?;
+let cover = models.admitted(&snapshot)?;
 assert!(cover.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 storage.flush()?;
 ```
@@ -108,8 +107,8 @@ Local publication deliberately performs no authorization check: the local
 store is a grow-only record ledger, not an access-control boundary. Observation
 loads the independent policies from the descriptor. A policy root is admitted
 directly; every other author needs enough resident proof paths for exact
-`ACTION_WRITE` on this descriptor. Each operation observes the clock once and
-verifies every matching proof. Invalid, expired, or irrelevant
+`ACTION_WRITE` on this descriptor. The snapshot freezes the clock once, and
+each operation verifies every matching proof at that instant. Invalid, expired, or irrelevant
 candidate evidence grants nothing; inability to enumerate the proof store
 remains an error.
 
@@ -193,50 +192,55 @@ available explicit cover member.
 
 Local publication remains unconditional. A publisher which needs to predict
 whether an authority-aware observation will admit a signer can freeze a store
-snapshot, sample one instant, and call
-`collection.writer_is_admitted_at(&snapshot, signer, instant)`: it checks
+snapshot and call
+`collection.writer_is_admitted(&snapshot, signer)`: it checks
 the descriptor WRITE policy and resident exact authorization evidence without scanning
 collection commits or publishing anything.
 
 ## Known-prefix snapshots and covers
 
 `store.snapshot()` freezes one immutable observation containing blob bytes,
-collection records, and capability proofs from the same known prefix. The
+collection records, and capability proofs from the same known prefix, together
+with one authorization instant. The
 snapshot, rather than a source frontier or a later materialization, is the
 watermark. Ask it what representation is actually readable at that instant:
 
 ```rust,ignore
 let snapshot = store.snapshot()?;
-let instant = triblespace::core::clock::epoch_now();
-let observed = snapshot.collection_at(collection, instant)?;
+let observed = snapshot.collection(collection)?;
 let support = observed.support();
 let cover = observed.cover();
 let value: V = observed.view()?;
 ```
 
-`snapshot.collection_at(target, instant)` admits the foundational commits at
-one explicit authorization instant, selects the
+`snapshot.collection(target)` admits the foundational commits at
+the snapshot's frozen authorization instant, selects the
 maximal complete resident target antichain, and returns only the part of the
 foundational support represented by that antichain. Admitted but not yet
 derived data is absent: an immutable snapshot never promises work which will
 happen later. `snapshot.collection_exact(target, &support)` is the assertion
 form and fails unless that exact foundational support is completely realized.
-There is deliberately no hidden current-clock form: identical operations on
-one frozen store snapshot must have identical results even while wall time
-passes.
+Neither observation method reads the clock: identical operations on one frozen
+store snapshot have identical results even while wall time passes. A later
+authorization decision requires a new snapshot. `store.snapshot_at(instant)`
+is the single construction seam for deterministic tests; it selects the
+interpretation time of newly observed content, not a historical content revision.
+`changes_since` classifies content only, so a new instant alone reports no
+content change. Authorization caches separately account for the next proof
+validity boundary from `next_authorization_change(&snapshot)` and clock rollback.
 
 Both forms keep the chosen target cover inseparable from the store snapshot
 which established its residency. `view` invokes `TryFromCover<E>` solely
 through that frozen observation. For a `SimpleArchive`, `V = TribleSet`; for a
 `SuccinctArchiveBlob`, `V` may be an mmap-backed union retaining selected
-shards. `collection.read_at::<V, _>(&snapshot, instant)` remains a concise
-root-collection read when the intermediate support and physical cover are
+shards. `collection.read::<V, _>(&snapshot)` remains a concise
+resident collection read when the intermediate support and physical cover are
 irrelevant.
 
-Consumers which need the exact strictly verified COMMIT roots selected during
-admission use `collection.admitted_with_commits_at(&snapshot, instant)`; later
-attestations over the same payload remain broader provenance rather than
-retroactive roots.
+`cover.commits(&snapshot)` returns strictly verified provenance over the
+selected payloads. These attestations are not necessarily authorized membership
+claims: another signer can attest an already admitted payload without changing
+its support or becoming an authority root.
 
 This is a coherent **known-prefix** observation, not a global latest
 transaction. A concurrent immutable insert may appear in this call or a later
@@ -336,12 +340,9 @@ let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
     accelerated_policy,
 )?;
 
-let before = storage.snapshot()?;
-let instant = triblespace::core::clock::epoch_now();
-let support = storage
-    .acquire_admitted_support_at(source, &before, instant)
-    .await?;
-drop(before);
+let ready = storage.ensure(source).await?;
+let support = source.admitted(&ready)?;
+drop(ready);
 
 // Each edge receives the same foundational Support. Work never flows upward.
 storage
@@ -353,19 +354,18 @@ let observed = after.collection_exact(accelerated, &support)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 ```
 
-- `acquire_admitted_support_at` freezes collection records and capability
-  proofs at the caller's control snapshot, then acquires only the missing
-  immutable descriptor, data, and metadata bytes needed to decide that
-  frontier. Concurrent records and proofs remain deferred. Reusing the same
-  control snapshot across several calls therefore gives a batch one semantic
-  watermark without pretending that byte residency was already complete.
-- `snapshot.collection_at` remains the purely read-only alternative: it
+- `ensure(source)` freezes collection records, capability proofs, and the
+  authorization instant before acquiring exact missing descriptor, data, and
+  metadata bytes needed for that root frontier. Concurrent records and proofs
+  do not extend its work. The returned snapshot is a fresh observation; select
+  support from it once and pass that same support across the following edges.
+- `snapshot.collection` remains the purely read-only alternative: it
   performs no acquisition or collection algebra and binds only the maximal
   resident target cover visible in that immutable snapshot.
   `collection_exact` requires a complete realization for explicit support.
 - `ensure` freezes the currently admitted foundational support, while
-  `ensure_exact` accepts explicit support. Both publish only missing `DERIVE`
-  work and return a fresh store snapshot.
+  `ensure_exact` accepts explicit support. For derived targets they publish
+  only missing `DERIVE` work; both return a fresh store snapshot.
 - `maintain` and `maintain_exact` additionally carry colliding target members
   by serialized-size tier. They also return a fresh store snapshot.
 

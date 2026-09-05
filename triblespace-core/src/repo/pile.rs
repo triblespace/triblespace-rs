@@ -2574,6 +2574,7 @@ fn padding_for_blob(blob_size: usize) -> usize {
 /// cloning and [`StoreSnapshot::changes_since`](super::StoreSnapshot::changes_since)
 /// constant-time in the number of semantic components.
 pub struct PileSnapshot {
+    instant: hifitime::Epoch,
     mmap: Arc<MmapRaw>,
     covered_len: usize,
     opaque_records: usize,
@@ -2609,6 +2610,7 @@ pub struct WantCutoverStatus {
 
 impl PileSnapshot {
     fn new(
+        instant: hifitime::Epoch,
         mmap: Arc<MmapRaw>,
         covered_len: usize,
         opaque_records: usize,
@@ -2619,6 +2621,7 @@ impl PileSnapshot {
         wants: PATCH<WANT_REQUEST_BYTES_LEN, IdentitySchema>,
     ) -> Self {
         Self {
+            instant,
             mmap,
             covered_len,
             opaque_records,
@@ -2735,6 +2738,10 @@ impl BlobStoreGet for PileSnapshot {
 impl super::BlobChildren for PileSnapshot {}
 
 impl super::StoreSnapshot for PileSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.instant
+    }
+
     fn changes_since(&self, previous: &Self) -> super::StoreChanges {
         let mut changes = super::StoreChanges::NONE;
         // A semantic addition and another physical fallback occurrence are
@@ -2760,9 +2767,13 @@ impl super::SnapshotSource for Pile {
     type Snapshot = PileSnapshot;
     type SnapshotError = ReadError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.refresh()?;
         Ok(PileSnapshot::new(
+            instant,
             self.mmap.clone(),
             self.applied_length,
             self.opaque_records,
@@ -8993,7 +9004,13 @@ mod tests {
         let mut observer = Pile::open(&path).unwrap();
         let mut writer = Pile::open(&path).unwrap();
 
-        let empty = observer.snapshot().unwrap();
+        let instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let empty = observer.snapshot_at(instant).unwrap();
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let unchanged = observer.snapshot_at(later_instant).unwrap();
+        assert_eq!(empty.clone().instant(), instant);
+        assert_eq!(unchanged.instant(), later_instant);
+        assert_eq!(unchanged.changes_since(&empty), StoreChanges::NONE);
         writer
             .want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
                 [0xA1; 32],

@@ -9,10 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Add `CollectionStoreExt::acquire_read_audience_at` for active acquisition of
-  a missing collection descriptor and READ(C) audience evaluation over one
-  frozen self-contained proof set. Pure snapshot admission remains
-  resident-only and inert; the live operation emits no WANT.
+- Freeze one authorization instant in every `StoreSnapshot`, with
+  `SnapshotSource::snapshot_at` as the single explicit-time construction seam.
+  Collection observation and admission use that frozen instant; content-change
+  masks exclude time, and authorization caches track proof-validity boundaries
+  separately. Snapshot reads remain resident-only and inert; active acquisition
+  belongs to the store's asynchronous ensure and maintain operations.
+
+- Use the same `ensure` and `maintain` operations for root and derived
+  collections. Roots fetch their exact admitted dependencies without a
+  fictitious self-derivation or durable WANT; derived targets continue to
+  publish only their own one-hop images. Remove separate acquisition and
+  admission-plus-commit-list methods. `collection.read(&snapshot)` is exactly
+  the resident `snapshot.collection(collection)?.view()` path.
 
 - Make canonical `WantRequest::Blob(H)` the sole durable exact-content
   request. Repository implementations retain its exact identity, and Yard

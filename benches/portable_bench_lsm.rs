@@ -775,7 +775,7 @@ fn main() {
             }
             let snapshot = store.snapshot().expect("freeze source snapshot");
             let support: Support = source
-                .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
+                .admitted(&snapshot)
                 .expect("freeze exact source support");
             drop(snapshot);
 

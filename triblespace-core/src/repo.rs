@@ -103,16 +103,28 @@ impl StoreChanges {
 ///
 /// A snapshot is its own local revision token. It owns every read capability
 /// needed to interpret the prefix it observed, and compares directly with an
-/// earlier snapshot from the same store lineage. Snapshot reads are frozen,
-/// resident-only observations: they never fetch, wait, mutate storage, or
-/// record durable demand. The default is deliberately
-/// conservative for backends that cannot classify changes cheaply.
+/// earlier snapshot from the same store lineage. Its authorization instant is
+/// frozen with that observation and remains unchanged by cloning or reading.
+/// Snapshot reads are frozen, resident-only observations: they never fetch,
+/// wait, mutate storage, or record durable demand. The default change
+/// classification is deliberately conservative for backends that cannot
+/// classify changes cheaply.
 pub trait StoreSnapshot: Clone + Send + Sync + 'static {
+    /// The frozen instant used for every authorization decision in this observation.
+    ///
+    /// This is a stored value, never a fresh clock observation. A later instant
+    /// requires another snapshot, even if the stored content has not changed.
+    fn instant(&self) -> hifitime::Epoch;
+
     /// Conservatively classify changes since `previous`.
     ///
     /// False positives only repeat derived work. A false negative can strand
     /// derived state, so implementations must report every component which may
-    /// have changed. Snapshots are local observations, not portable versions.
+    /// have changed. This compares stored content only: a different
+    /// [`instant`](Self::instant) does not change any component. Consumers
+    /// caching authorization decisions must separately track validity
+    /// boundaries and clock rollback. Snapshots are local observations, not
+    /// portable versions.
     fn changes_since(&self, _previous: &Self) -> StoreChanges {
         StoreChanges::ALL
     }
@@ -130,8 +142,21 @@ pub trait SnapshotSource {
     /// Failure while refreshing and freezing an observation.
     type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Reobserve external changes and freeze the resulting prefix once.
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError>;
+    /// Sample the authorization clock once, then freeze the resulting prefix.
+    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.snapshot_at(crate::clock::epoch_now())
+    }
+
+    /// Reobserve external changes and freeze the prefix at one chosen
+    /// authorization instant.
+    ///
+    /// This chooses how to interpret the newly observed content, not a
+    /// historical content revision. Composite stores pass the same instant to
+    /// every constituent snapshot.
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError>;
 }
 
 /// Immutable snapshot type produced by `S`.
@@ -147,8 +172,11 @@ where
     type Snapshot = S::Snapshot;
     type SnapshotError = S::SnapshotError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        (**self).snapshot()
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        (**self).snapshot_at(instant)
     }
 }
 

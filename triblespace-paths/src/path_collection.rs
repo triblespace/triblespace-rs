@@ -54,8 +54,11 @@ impl SnapshotSource for CollectionOnly {
     type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.0.snapshot()
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.0.snapshot_at(instant)
     }
 }
 
@@ -181,12 +184,7 @@ fn support(
         );
         store.insert_proof(proof).unwrap();
     }
-    collection
-        .admitted_at(
-            &store.snapshot().unwrap(),
-            triblespace_core::clock::epoch_now(),
-        )
-        .unwrap()
+    collection.admitted(&store.snapshot().unwrap()).unwrap()
 }
 
 fn records(store: &mut CollectionOnly) -> Vec<CollectionRecord> {

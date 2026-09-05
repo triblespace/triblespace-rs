@@ -19,7 +19,8 @@ use triblespace_core::collection::{
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges,
+    StoreSnapshot,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -57,16 +58,12 @@ fn simplearchive_collection_round_trips_typed_views() {
         expected_member
     );
 
-    let snapshot = store.snapshot().unwrap();
-    let cover = collection
-        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover.collection(), collection);
     assert_eq!(cover.members().collect::<Vec<_>>(), vec![expected_member]);
 
-    let materialized: TribleSet = collection
-        .read_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let materialized: TribleSet = collection.read(&snapshot).unwrap();
     assert_eq!(materialized, expected);
 }
 
@@ -92,10 +89,8 @@ fn succinct_cover_materializes_as_a_typed_union_archive() {
     store
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
-    let snapshot = store.snapshot().unwrap();
-    let source_cover = source
-        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let source_cover = source.admitted(&snapshot).unwrap();
     let ensured = block_on(store.ensure(target)).unwrap();
     let collection = ensured.collection_exact(target, &source_cover).unwrap();
 
@@ -149,9 +144,8 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .commit(source, &authority, Fragment::from(expected.clone()))
         .unwrap();
 
-    let support = source
-        .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let support = source.admitted(&snapshot).unwrap();
     block_on(store.ensure_exact(raw, &support)).unwrap();
     let ensured = block_on(store.ensure_exact(accelerated, &support)).unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
@@ -168,7 +162,7 @@ fn exact_apis_accept_a_derived_source_encoding() {
 }
 
 #[test]
-fn collection_at_uses_the_supplied_authorization_instant() {
+fn collection_uses_its_snapshots_frozen_authorization_instant() {
     let authority = SigningKey::from_bytes(&[44; 32]);
     let writer = SigningKey::from_bytes(&[45; 32]);
     let policy = CollectionPolicy::new(
@@ -196,16 +190,12 @@ fn collection_at_uses_the_supplied_authorization_instant() {
         ))
         .unwrap();
 
-    let snapshot = store.snapshot().unwrap();
-    assert!(snapshot
-        .collection_at(collection, Epoch::from_tai_seconds(9.0))
-        .unwrap()
-        .support()
-        .is_empty());
+    let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
+    assert!(before.collection(collection).unwrap().support().is_empty());
 
-    let admitted = snapshot
-        .collection_at(collection, Epoch::from_tai_seconds(15.0))
-        .unwrap();
+    let valid = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
+    let frozen = valid.clone();
+    let admitted = valid.collection(collection).unwrap();
     assert_eq!(
         admitted.support().members().collect::<Vec<_>>(),
         vec![expected_member]
@@ -215,15 +205,23 @@ fn collection_at_uses_the_supplied_authorization_instant() {
         vec![expected_member]
     );
 
-    assert!(snapshot
-        .collection_at(collection, Epoch::from_tai_seconds(21.0))
-        .unwrap()
-        .support()
-        .is_empty());
+    let expired = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
+    assert!(expired.collection(collection).unwrap().support().is_empty());
+    assert_eq!(valid.changes_since(&before), StoreChanges::NONE);
+    assert_eq!(expired.changes_since(&valid), StoreChanges::NONE);
+    assert_eq!(frozen.instant(), Epoch::from_tai_seconds(15.0));
+    assert_eq!(
+        frozen.collection(collection).unwrap().support(),
+        admitted.support()
+    );
+    assert_eq!(
+        valid.collection(collection).unwrap().support(),
+        admitted.support()
+    );
 }
 
 #[test]
-fn collection_at_returns_the_maximal_resident_partial_realization() {
+fn collection_returns_the_maximal_resident_partial_realization() {
     let authority = SigningKey::from_bytes(&[46; 32]);
     let policy = CollectionPolicy::new(
         AdmissionPolicy::direct(authority.verifying_key()),
@@ -244,25 +242,20 @@ fn collection_at_returns_the_maximal_resident_partial_realization() {
     store
         .commit(source, &authority, Fragment::from(first.clone()))
         .unwrap();
-    let first_support = source
-        .admitted_at(&store.snapshot().unwrap(), Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let first_support = source.admitted(&snapshot).unwrap();
     block_on(store.ensure_exact(target, &first_support)).unwrap();
     store
         .commit(source, &authority, Fragment::from(second))
         .unwrap();
 
-    let snapshot = store.snapshot().unwrap();
-    let admitted_source = source
-        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let admitted_source = source.admitted(&snapshot).unwrap();
     assert_eq!(admitted_source.len(), 2);
     assert!(admitted_source.contains(first_member));
     assert!(admitted_source.contains(second_member));
 
-    let observed = snapshot
-        .collection_at(target, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let observed = snapshot.collection(target).unwrap();
     assert_eq!(observed.support(), &first_support);
     assert_eq!(observed.cover().len(), 1);
     assert_eq!(
@@ -294,7 +287,7 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
     );
     store.insert(CollectionRecord::Commit(commit)).unwrap();
 
-    let before = store.snapshot().unwrap();
+    let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert_eq!(
         before
             .records()
@@ -303,25 +296,19 @@ fn dangling_commit_is_raw_but_semantically_visible_only_in_a_later_snapshot() {
             .unwrap(),
         vec![CollectionRecord::Commit(commit)]
     );
-    assert!(collection
-        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
+    assert!(collection.admitted(&before).unwrap().is_empty());
 
     store.put::<SimpleArchive, _>(payload).unwrap();
-    let after = store.snapshot().unwrap();
+    let after = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert_eq!(
         collection
-            .admitted_at(&after, Epoch::from_tai_seconds(0.0))
+            .admitted(&after)
             .unwrap()
             .members()
             .collect::<Vec<_>>(),
         vec![payload_handle]
     );
-    assert!(collection
-        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
+    assert!(collection.admitted(&before).unwrap().is_empty());
 }
 
 #[test]
@@ -342,11 +329,8 @@ fn self_contained_capability_proof_activates_commit_without_blob_closure() {
         .commit(collection, &writer, Fragment::from(expected))
         .unwrap();
 
-    let before = store.snapshot().unwrap();
-    assert!(collection
-        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
+    let before = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    assert!(collection.admitted(&before).unwrap().is_empty());
 
     let proof = CapabilityProof::issue_root(
         &root,
@@ -357,7 +341,7 @@ fn self_contained_capability_proof_activates_commit_without_blob_closure() {
     );
     store.insert_proof(proof.clone()).unwrap();
 
-    let after = store.snapshot().unwrap();
+    let after = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert_eq!(
         after
             .proofs()
@@ -368,14 +352,11 @@ fn self_contained_capability_proof_activates_commit_without_blob_closure() {
     );
     assert_eq!(
         collection
-            .admitted_at(&after, Epoch::from_tai_seconds(0.0))
+            .admitted(&after)
             .unwrap()
             .members()
             .collect::<Vec<_>>(),
         vec![expected_member]
     );
-    assert!(collection
-        .admitted_at(&before, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
+    assert!(collection.admitted(&before).unwrap().is_empty());
 }

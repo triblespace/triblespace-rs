@@ -940,12 +940,15 @@ impl SnapshotSource for Yard {
     type Snapshot = YardSnapshot;
     type SnapshotError = ReadError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
         let mut generations = Vec::new();
         for generation in &mut self.generations {
             for segment in &mut generation.segments {
                 generations.push(YardGenerationSnapshot {
-                    snapshot: segment.pile_mut().snapshot()?,
+                    snapshot: segment.pile_mut().snapshot_at(instant)?,
                     live: segment.live.clone(),
                 });
             }
@@ -955,7 +958,11 @@ impl SnapshotSource for Yard {
             .lock()
             .expect("want mutex poisoned")
             .requests();
-        Ok(YardSnapshot { generations, wants })
+        Ok(YardSnapshot {
+            instant,
+            generations,
+            wants,
+        })
     }
 }
 
@@ -1001,6 +1008,7 @@ struct YardGenerationSnapshot {
 /// One immutable observation of a yard's segment union.
 #[derive(Debug, Clone)]
 pub struct YardSnapshot {
+    instant: hifitime::Epoch,
     generations: Vec<YardGenerationSnapshot>,
     wants: Vec<WantRequest>,
 }
@@ -1061,6 +1069,10 @@ impl YardSnapshot {
 }
 
 impl StoreSnapshot for YardSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.instant
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         if previous.generations.len() != self.generations.len() {
             return StoreChanges::ALL;
@@ -1582,7 +1594,16 @@ mod tests {
     #[test]
     fn yard_snapshot_lifts_physical_and_live_set_changes() {
         let (_dir, mut yard) = yard_with(1, YardConfig::default());
-        let empty = yard.snapshot().unwrap();
+        let instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let empty = yard.snapshot_at(instant).unwrap();
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let unchanged = yard.snapshot_at(later_instant).unwrap();
+        assert_eq!(empty.clone().instant(), instant);
+        assert_eq!(unchanged.instant(), later_instant);
+        for generation in &unchanged.generations {
+            assert_eq!(generation.snapshot.instant(), later_instant);
+        }
+        assert_eq!(unchanged.changes_since(&empty), StoreChanges::NONE);
 
         yard.want(WantRequest::blob(Inline::<Handle<UnknownBlob>>::new(
             [0x51; INLINE_LEN],

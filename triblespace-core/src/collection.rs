@@ -60,7 +60,7 @@ pub mod view;
 pub use ed25519_dalek::VerifyingKey;
 
 pub use api::*;
-pub use authorization_clock::next_authorization_change_at;
+pub use authorization_clock::next_authorization_change;
 pub use discovery::*;
 pub use encoding::*;
 pub use exact_derived::CollectionRealizationError;

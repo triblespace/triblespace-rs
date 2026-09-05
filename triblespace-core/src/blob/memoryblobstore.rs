@@ -56,12 +56,14 @@ impl Debug for MemoryBlobStore {
 /// `pattern!` / `and!` / `or!`.
 ///
 pub struct MemoryBlobStoreSnapshot {
+    instant: hifitime::Epoch,
     blobs: BlobIndex,
 }
 
 impl Clone for MemoryBlobStoreSnapshot {
     fn clone(&self) -> Self {
         MemoryBlobStoreSnapshot {
+            instant: self.instant,
             blobs: self.blobs.clone(),
         }
     }
@@ -69,15 +71,15 @@ impl Clone for MemoryBlobStoreSnapshot {
 
 impl PartialEq for MemoryBlobStoreSnapshot {
     fn eq(&self, other: &Self) -> bool {
-        self.blobs == other.blobs
+        self.instant == other.instant && self.blobs == other.blobs
     }
 }
 
 impl Eq for MemoryBlobStoreSnapshot {}
 
 impl MemoryBlobStoreSnapshot {
-    fn new(blobs: BlobIndex) -> Self {
-        MemoryBlobStoreSnapshot { blobs }
+    fn new(blobs: BlobIndex, instant: hifitime::Epoch) -> Self {
+        MemoryBlobStoreSnapshot { instant, blobs }
     }
 
     /// Number of blobs in this snapshot.
@@ -364,8 +366,12 @@ impl BlobStorePut for MemoryBlobStore {
 }
 
 impl StoreSnapshot for MemoryBlobStoreSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.instant
+    }
+
     fn changes_since(&self, previous: &Self) -> crate::repo::StoreChanges {
-        if self == previous {
+        if self.blobs == previous.blobs {
             crate::repo::StoreChanges::NONE
         } else {
             crate::repo::StoreChanges::BLOBS
@@ -377,8 +383,11 @@ impl SnapshotSource for MemoryBlobStore {
     type Snapshot = MemoryBlobStoreSnapshot;
     type SnapshotError = Infallible;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        Ok(MemoryBlobStoreSnapshot::new(self.blobs.clone()))
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        Ok(MemoryBlobStoreSnapshot::new(self.blobs.clone(), instant))
     }
 }
 
@@ -456,8 +465,14 @@ mod tests {
     #[test]
     fn snapshot_change_classification_uses_patch_identity() {
         let mut store = MemoryBlobStore::new();
-        let before = store.snapshot().unwrap();
-        let unchanged = store.snapshot().unwrap();
+        let initial_instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let before = store.snapshot_at(initial_instant).unwrap();
+        let unchanged = store.snapshot_at(later_instant).unwrap();
+        assert_eq!(before.instant(), initial_instant);
+        assert_eq!(before.clone().instant(), initial_instant);
+        assert_eq!(unchanged.instant(), later_instant);
+        assert_ne!(before, unchanged);
         assert_eq!(
             unchanged.changes_since(&before),
             crate::repo::StoreChanges::NONE

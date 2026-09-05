@@ -23,7 +23,7 @@ use triblespace_core::collection::{
     collection_read_audience_by_policy_at, descriptor,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
-use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead};
+use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead, StoreSnapshot};
 use triblespace_core::trible::TribleSet;
 
 use crate::collection_delta::{
@@ -449,7 +449,7 @@ where
 ///
 /// The descriptor's canonical READ roots shape the result. Each returned
 /// self-contained proof has a valid signature path and exact READ atom.
-/// Selection and deletion minimization sample one current instant; the
+/// Selection and deletion minimization use the snapshot's frozen instant; the
 /// receiver independently applies its own current instant during admission.
 /// Invalid, irrelevant, and duplicate ambient proofs are inert. The caller
 /// chooses `max_proofs`; a larger independent-root witness fails rather than
@@ -464,30 +464,9 @@ pub fn collection_read_bootstrap_proofs<R>(
     CollectionReadBootstrapError<R::ProofsError, R::GetError<Infallible>>,
 >
 where
-    R: BlobStoreGet + CapabilityProofRead,
+    R: BlobStoreGet + CapabilityProofRead + StoreSnapshot,
 {
-    collection_read_bootstrap_proofs_at(
-        snapshot,
-        collection,
-        subject,
-        max_proofs,
-        crate::clock::epoch_now(),
-    )
-}
-
-pub(crate) fn collection_read_bootstrap_proofs_at<R>(
-    snapshot: &R,
-    collection: CollectionHandle,
-    subject: VerifyingKey,
-    max_proofs: usize,
-    instant: hifitime::Epoch,
-) -> Result<
-    Vec<CapabilityProof>,
-    CollectionReadBootstrapError<R::ProofsError, R::GetError<Infallible>>,
->
-where
-    R: BlobStoreGet + CapabilityProofRead,
-{
+    let instant = snapshot.instant();
     let evidence =
         collection_authorization_evidence(snapshot, collection).map_err(|error| match error {
             CollectionAuthorizationEvidenceDiscoveryError::Descriptor(source) => {
@@ -728,15 +707,12 @@ mod tests {
             )))
             .unwrap();
 
-        let before_snapshot = store.snapshot().unwrap();
+        let instant = Epoch::from_tai_seconds(0.0);
+        let before_snapshot = store.snapshot_at(instant).unwrap();
         let before = collection_repair_overlay(&before_snapshot, collection.handle()).unwrap();
         assert!(
             !collection
-                .writer_is_admitted_at(
-                    &before_snapshot,
-                    writer.verifying_key(),
-                    Epoch::from_tai_seconds(0.0),
-                )
+                .writer_is_admitted(&before_snapshot, writer.verifying_key())
                 .unwrap()
         );
         let atom = write_atom(collection.handle());
@@ -744,15 +720,11 @@ mod tests {
             &mut store,
             root_proof(&root, &writer, atom, CapabilityMode::Invoke, None),
         );
-        let after_snapshot = store.snapshot().unwrap();
+        let after_snapshot = store.snapshot_at(instant).unwrap();
         let after = collection_repair_overlay(&after_snapshot, collection.handle()).unwrap();
         assert!(
             collection
-                .writer_is_admitted_at(
-                    &after_snapshot,
-                    writer.verifying_key(),
-                    Epoch::from_tai_seconds(0.0),
-                )
+                .writer_is_admitted(&after_snapshot, writer.verifying_key())
                 .unwrap()
         );
 

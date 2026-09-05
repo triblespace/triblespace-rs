@@ -61,9 +61,17 @@ pub struct MemoryRepoSnapshot {
 }
 
 impl StoreSnapshot for MemoryRepoSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.blobs.instant()
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let mut changes = StoreChanges::NONE;
-        if previous.blobs != self.blobs {
+        if self
+            .blobs
+            .changes_since(&previous.blobs)
+            .contains(StoreChanges::BLOBS)
+        {
             changes = changes.union(StoreChanges::BLOBS);
         }
         if previous.collection_records != self.collection_records {
@@ -83,9 +91,12 @@ impl SnapshotSource for MemoryRepo {
     type Snapshot = MemoryRepoSnapshot;
     type SnapshotError = Infallible;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
         Ok(MemoryRepoSnapshot {
-            blobs: self.blobs.snapshot()?,
+            blobs: self.blobs.snapshot_at(instant)?,
             collection_records: self.collection_records.clone(),
             capability_proofs: self.capability_proofs.clone(),
             wants: self.wants.clone(),
@@ -710,6 +721,65 @@ mod tests {
             assert!(reader.get::<Blob<UnknownBlob>, _>(retained).is_ok());
         }
         assert!(reader.get::<Blob<UnknownBlob>, _>(orphan).is_err());
+    }
+
+    #[test]
+    fn proof_expiry_requires_a_new_snapshot_without_changing_stored_content() {
+        use crate::capability::CapabilityValidity;
+        use crate::collection::{AdmissionPolicy, CollectionStoreExt, ACTION_WRITE};
+
+        let root = SigningKey::from_bytes(&[91; 32]);
+        let writer = SigningKey::from_bytes(&[92; 32]);
+        let mut repo = MemoryRepo::default();
+        let collection = repo
+            .collection(
+                "snapshot-clock",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::direct(root.verifying_key()),
+                ),
+            )
+            .unwrap();
+        repo.insert_proof(CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::from(collection.handle()),
+            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            Some(
+                CapabilityValidity::new(
+                    hifitime::Epoch::from_tai_seconds(10.0),
+                    hifitime::Epoch::from_tai_seconds(20.0),
+                )
+                .unwrap(),
+            ),
+            writer.verifying_key(),
+        ))
+        .unwrap();
+
+        let early = repo
+            .snapshot_at(hifitime::Epoch::from_tai_seconds(9.0))
+            .unwrap();
+        let instant = hifitime::Epoch::from_tai_seconds(15.0);
+        let admitted = repo.snapshot_at(instant).unwrap();
+        assert!(!collection
+            .writer_is_admitted(&early, writer.verifying_key())
+            .unwrap());
+        assert!(collection
+            .writer_is_admitted(&admitted, writer.verifying_key())
+            .unwrap());
+
+        let expired = repo
+            .snapshot_at(hifitime::Epoch::from_tai_seconds(21.0))
+            .unwrap();
+        assert!(!collection
+            .writer_is_admitted(&expired, writer.verifying_key())
+            .unwrap());
+        let retained = admitted.clone();
+        assert_eq!(retained.instant(), instant);
+        assert!(collection
+            .writer_is_admitted(&retained, writer.verifying_key())
+            .unwrap());
+        assert_eq!(admitted.changes_since(&early), StoreChanges::NONE);
+        assert_eq!(expired.changes_since(&admitted), StoreChanges::NONE);
     }
 
     #[test]

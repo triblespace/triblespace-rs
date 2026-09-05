@@ -108,9 +108,7 @@ fn compiled_expression_roundtrips_through_native_collection_and_query_constraint
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let support = source
-        .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
-        .unwrap();
+    let support = source.admitted(&snapshot).unwrap();
     let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     let index: Arc<PathIndex> = snapshot
         .collection_exact(target, &support)

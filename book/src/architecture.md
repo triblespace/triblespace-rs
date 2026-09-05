@@ -176,8 +176,9 @@ its own store.
 Reads are exact about what they observed, not magical about global time:
 
 - `store.snapshot()` freezes blob bytes, collection records, capability proofs,
-  and backend state from one coherent known prefix;
-- `collection.admitted_at(&snapshot, instant)` applies the descriptor WRITE policy and
+  and backend state from one coherent known prefix, plus one authorization
+  instant;
+- `collection.admitted(&snapshot)` applies the descriptor WRITE policy and
   resident capability evidence to obtain one semantic `Cover<E>` without
   fetching member data;
 - `cover.available(&snapshot)` projects complete resident realizations back
@@ -185,8 +186,12 @@ Reads are exact about what they observed, not magical about global time:
 - `cover.materialize::<V, _>(&snapshot)` privately selects a resident
   support-equivalent physical decomposition and reconstructs the logical value
   through that same immutable observation.
-  `collection.read_at(&snapshot, instant)` is the concise form of admission and
-  materialization at the same caller-supplied instant.
+  `collection.read(&snapshot)` concisely observes and materializes the maximal
+  resident collection view at that same frozen instant.
+
+Snapshot clones retain their instant. A later snapshot may change authorization
+without changing stored content, so content-change masks intentionally exclude
+time; caches track proof-validity boundaries separately.
 
 Cover identity is the collection descriptor plus distinct payload handles.
 Signer, signature, and metadata attestations currently known to the store

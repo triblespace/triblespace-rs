@@ -105,8 +105,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     storage.commit(library, &key, import)?;
 
     let snapshot = storage.snapshot()?;
-    let instant = triblespace::core::clock::epoch_now();
-    let admitted = library.admitted_at(&snapshot, instant)?;
+    let admitted = library.admitted(&snapshot)?;
     let facts = admitted.materialize::<TribleSet, _>(&snapshot)?;
     let title = "Dune";
     for (first, last, quote) in find!(
@@ -136,8 +135,9 @@ identity. Here both are one-root policies. Whether a recipient may extend its
 authority is carried by the mode signed into that recipient's proof prefix,
 not by a second collection-policy threshold.
 Other strictly verified signers become visible only when
-`library.admitted_at(&snapshot, instant)` observes sufficient root support for exact
-`ACTION_WRITE` on this descriptor handle in the same immutable store snapshot.
+`library.admitted(&snapshot)` observes sufficient root support for exact
+`ACTION_WRITE` on this descriptor handle at the same immutable store snapshot's
+frozen authorization instant.
 Identical retries deduplicate by intrinsic record identity, distinct commits
 coexist, and `Cover::materialize` reconstructs every admitted author's union
 through the same snapshot. Call

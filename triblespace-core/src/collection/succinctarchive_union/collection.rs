@@ -688,12 +688,7 @@ mod tests {
         block_on(store.ensure_exact(raw_collection, &first_support)).unwrap();
         let snapshot =
             block_on(store.ensure_exact(accelerated_collection, &first_support)).unwrap();
-        let observed = snapshot
-            .collection_at(
-                accelerated_collection,
-                hifitime::Epoch::from_tai_seconds(0.0),
-            )
-            .unwrap();
+        let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support(), &first_support);
         assert!(snapshot
             .collection_exact(accelerated_collection, &full_support)
@@ -701,12 +696,7 @@ mod tests {
 
         block_on(store.ensure_exact(raw_collection, &full_support)).unwrap();
         let snapshot = block_on(store.ensure_exact(accelerated_collection, &full_support)).unwrap();
-        let observed = snapshot
-            .collection_at(
-                accelerated_collection,
-                hifitime::Epoch::from_tai_seconds(0.0),
-            )
-            .unwrap();
+        let observed = snapshot.collection(accelerated_collection).unwrap();
         assert_eq!(observed.support(), &full_support);
         let view: UnionArchive<OrderedUniverse> = observed.view().unwrap();
         assert_eq!(view.iter().count(), 2);

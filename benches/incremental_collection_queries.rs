@@ -91,9 +91,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
         .commit(collection, &signing_key, author)
         .expect("publish seed author");
     let snapshot = store.snapshot().expect("freeze seed snapshot");
-    let seed_cover = collection
-        .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
-        .expect("freeze seed cover");
+    let seed_cover = collection.admitted(&snapshot).expect("freeze seed cover");
     assert_eq!(seed_cover.len(), 1);
 
     let mut covers = Vec::with_capacity(commits);
@@ -123,11 +121,7 @@ fn build_fixture(commits: usize, books_per_commit: usize) -> Fixture {
             .commit(collection, &signing_key, fragment)
             .expect("publish book commit");
         let snapshot = store.snapshot().expect("freeze collection snapshot");
-        covers.push(
-            collection
-                .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
-                .expect("freeze exact cover"),
-        );
+        covers.push(collection.admitted(&snapshot).expect("freeze exact cover"));
         expected_batches.push(expected);
     }
 

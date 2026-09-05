@@ -1507,9 +1507,7 @@ mod tests {
             )
             .unwrap();
         let source_snapshot = source_store.snapshot().unwrap();
-        let support = source
-            .admitted_at(&source_snapshot, triblespace_core::clock::epoch_now())
-            .unwrap();
+        let support = source.admitted(&source_snapshot).unwrap();
         drop(source_snapshot);
         let source_snapshot = block_on(source_store.maintain_exact(target, &support)).unwrap();
         let collection = source_snapshot.collection_exact(target, &support).unwrap();

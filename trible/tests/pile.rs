@@ -626,14 +626,10 @@ fn collection_grant_read_is_replay_idempotent_and_admits_the_endpoint() {
     assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
 
     let mut pile = Pile::open(&pile_path).unwrap();
-    let snapshot = pile.snapshot().unwrap();
+    let snapshot = pile.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
     assert!(opened
-        .reader_is_admitted_at(
-            &snapshot,
-            reader.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-        )
+        .reader_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
     let proofs = snapshot
         .proofs()
@@ -702,14 +698,10 @@ fn collection_grant_write_is_replay_idempotent_and_admits_the_author() {
     assert_eq!(std::fs::metadata(&pile_path).unwrap().len(), first_len);
 
     let mut pile = Pile::open(&pile_path).unwrap();
-    let snapshot = pile.snapshot().unwrap();
+    let snapshot = pile.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let opened = Collection::<SimpleArchive>::open(&snapshot, collection.handle()).unwrap();
     assert!(opened
-        .writer_is_admitted_at(
-            &snapshot,
-            writer.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-        )
+        .writer_is_admitted(&snapshot, writer.verifying_key())
         .unwrap());
     let proofs = snapshot
         .proofs()

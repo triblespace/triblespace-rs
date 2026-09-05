@@ -59,6 +59,10 @@ where
     B: StoreSnapshot,
     R: StoreSnapshot,
 {
+    fn instant(&self) -> hifitime::Epoch {
+        self.records.instant()
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let blob_changes = self.blobs.changes_since(&previous.blobs);
         let record_changes = self.records.changes_since(&previous.records);
@@ -204,16 +208,22 @@ where
     type Snapshot = HybridSnapshot<B::Snapshot, R::Snapshot>;
     type SnapshotError = HybridSnapshotError<B::SnapshotError, R::SnapshotError>;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
         // Publication stores dependencies before the records which name them.
         // Reading in the opposite order makes the non-atomic split safe: a
         // record observed here cannot name a dependency published only after
         // the later blob observation.
         let records = self
             .records
-            .snapshot()
+            .snapshot_at(instant)
             .map_err(HybridSnapshotError::Records)?;
-        let blobs = self.blobs.snapshot().map_err(HybridSnapshotError::Blobs)?;
+        let blobs = self
+            .blobs
+            .snapshot_at(instant)
+            .map_err(HybridSnapshotError::Blobs)?;
         Ok(HybridSnapshot { blobs, records })
     }
 }
@@ -420,6 +430,29 @@ mod tests {
     }
 
     #[test]
+    fn snapshots_freeze_one_instant_across_both_halves() {
+        let mut hybrid = HybridStore::new(MemoryRepo::default(), MemoryRepo::default());
+        let instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let before = hybrid.snapshot_at(instant).unwrap();
+        assert_eq!(before.instant(), instant);
+        assert_eq!(before.blobs.instant(), instant);
+        assert_eq!(before.records.instant(), instant);
+
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let after = hybrid.snapshot_at(later_instant).unwrap();
+        assert_eq!(before.clone().instant(), instant);
+        assert_eq!(after.instant(), later_instant);
+        assert_eq!(after.blobs.instant(), later_instant);
+        assert_eq!(after.records.instant(), later_instant);
+        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+
+        let current = hybrid.snapshot().unwrap();
+        assert_eq!(current.blobs.instant(), current.instant());
+        assert_eq!(current.records.instant(), current.instant());
+        assert_eq!(current.changes_since(&after), StoreChanges::NONE);
+    }
+
+    #[test]
     fn collection_records_delegate_only_to_the_record_side() {
         let facts = descriptor::named_for_tests("hybrid", id(2)).into_facts();
         // Only the identity matters here; nothing resolves this descriptor.
@@ -470,10 +503,10 @@ mod tests {
         let commit = hybrid
             .commit(target, &signing_key, Fragment::empty())
             .unwrap();
-        let snapshot = hybrid.snapshot().unwrap();
-        let facts: TribleSet = target
-            .read_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
+        let snapshot = hybrid
+            .snapshot_at(hifitime::Epoch::from_tai_seconds(0.0))
             .unwrap();
+        let facts: TribleSet = target.read(&snapshot).unwrap();
         assert_eq!(facts.len(), 0);
         assert_eq!(commit.collection(), target.handle());
         assert!(hybrid.blobs.blobs.len() >= 2);

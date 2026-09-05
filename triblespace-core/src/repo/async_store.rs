@@ -251,9 +251,20 @@ pub trait AsyncSnapshotSource {
     /// Failure while refreshing and freezing an observation.
     type SnapshotError: Error + Debug + Send + Sync + 'static;
 
-    /// Reobserve external changes and freeze the resulting prefix once.
+    /// Sample the authorization clock once, then freeze the resulting prefix.
     fn snapshot(
         &mut self,
+    ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
+        self.snapshot_at(crate::clock::epoch_now())
+    }
+
+    /// Freeze newly observed content at one chosen authorization instant.
+    ///
+    /// As with [`SnapshotSource::snapshot_at`], this chooses authorization
+    /// time, not a historical content revision.
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send;
 }
 
@@ -357,6 +368,10 @@ impl<S> StoreSnapshot for SyncAsAsync<S>
 where
     S: StoreSnapshot,
 {
+    fn instant(&self) -> hifitime::Epoch {
+        self.0.instant()
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.0.changes_since(&previous.0)
     }
@@ -437,10 +452,11 @@ where
     type Snapshot = SyncAsAsync<S::Snapshot>;
     type SnapshotError = S::SnapshotError;
 
-    fn snapshot(
+    fn snapshot_at(
         &mut self,
+        instant: hifitime::Epoch,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
-        async move { self.0.snapshot().map(SyncAsAsync) }
+        async move { self.0.snapshot_at(instant).map(SyncAsAsync) }
     }
 }
 
@@ -555,6 +571,10 @@ impl<A> StoreSnapshot for Blocking<A>
 where
     A: StoreSnapshot,
 {
+    fn instant(&self) -> hifitime::Epoch {
+        self.inner.instant()
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -596,8 +616,11 @@ where
     type Snapshot = Blocking<A::Snapshot>;
     type SnapshotError = A::SnapshotError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        let snapshot = self.rt.block_on(self.inner.snapshot())?;
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let snapshot = self.rt.block_on(self.inner.snapshot_at(instant))?;
         Ok(Blocking {
             inner: snapshot,
             rt: self.rt.clone(),
@@ -769,6 +792,21 @@ mod tests {
     }
 
     #[test]
+    fn async_adapter_preserves_snapshot_time_without_content_changes() {
+        let mut inner = MemoryBlobStore::new();
+        let instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let mut store = SyncAsAsync::new(&mut inner);
+        let before = block_on(store.snapshot_at(instant)).unwrap();
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let after = block_on(store.snapshot_at(later_instant)).unwrap();
+        assert_eq!(before.clone().instant(), instant);
+        assert_eq!(before.0.instant(), instant);
+        assert_eq!(after.instant(), later_instant);
+        assert_eq!(after.0.instant(), later_instant);
+        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
+    }
+
+    #[test]
     fn sync_store_reads_and_writes_through_async_facade() {
         let mut store = SyncAsAsync::new(MemoryBlobStore::new());
         let b = blob(1);
@@ -817,6 +855,21 @@ mod tests {
         let mut expected = vec![first, second];
         expected.sort_unstable_by_key(CollectionRecord::fingerprint);
         assert_eq!(actual, expected);
+    }
+
+    #[cfg(feature = "object-store")]
+    #[test]
+    fn blocking_adapter_preserves_snapshot_time_without_content_changes() {
+        let mut store = Blocking::new(SyncAsAsync::new(MemoryRepo::default())).unwrap();
+        let instant = hifitime::Epoch::from_tai_seconds(10.0);
+        let before = SnapshotSource::snapshot_at(&mut store, instant).unwrap();
+        let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let after = SnapshotSource::snapshot_at(&mut store, later_instant).unwrap();
+        assert_eq!(before.clone().instant(), instant);
+        assert_eq!(before.inner.instant(), instant);
+        assert_eq!(after.instant(), later_instant);
+        assert_eq!(after.inner.instant(), later_instant);
+        assert_eq!(after.changes_since(&before), StoreChanges::NONE);
     }
 
     #[cfg(feature = "object-store")]

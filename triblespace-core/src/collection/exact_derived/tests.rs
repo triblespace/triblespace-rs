@@ -18,10 +18,9 @@ use crate::capability::{
     CapabilityResource, CapabilityValidity,
 };
 use crate::collection::{
-    collection_read_audience_at, AdmissionPolicy, CollectionCommit, CollectionMerge,
-    CollectionPolicy, CollectionRead, CollectionReadAudience, CollectionRecordFingerprint,
-    CollectionRecordSelector, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
-    ACTION_READ, ACTION_WRITE,
+    collection_read_audience, AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy,
+    CollectionRead, CollectionReadAudience, CollectionRecordFingerprint, CollectionRecordSelector,
+    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_READ, ACTION_WRITE,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -431,6 +430,10 @@ impl Drop for GuardSnapshot {
 }
 
 impl StoreSnapshot for GuardSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.inner.instant()
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         self.inner.changes_since(&previous.inner)
     }
@@ -665,8 +668,11 @@ impl SnapshotSource for GuardStore {
     type Snapshot = GuardSnapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        let inner = self.inner.snapshot()?;
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        let inner = self.inner.snapshot_at(instant)?;
         self.live.fetch_add(1, Ordering::SeqCst);
         Ok(GuardSnapshot {
             inner,
@@ -769,8 +775,7 @@ fn ordinary_attachment_reports_only_support_realized_in_its_snapshot() {
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &left_support).unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let (observed, cover) =
-        attach_collection_at(&snapshot, first, hifitime::Epoch::from_tai_seconds(0.0)).unwrap();
+    let (observed, cover) = attach_collection(&snapshot, first).unwrap();
     assert_eq!(observed, left_support);
     assert_eq!(cover.len(), 1);
 }
@@ -783,9 +788,7 @@ fn duplicate_commit_fibers_collapse_to_one_support_member() {
     publish_root(&mut store, root, &source, 2);
 
     let snapshot = store.snapshot().unwrap();
-    let admitted = root
-        .admitted_at(&snapshot, hifitime::Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let admitted = root.admitted(&snapshot).unwrap();
     assert_eq!(admitted.len(), 1);
     assert_eq!(admitted.members().next(), Some(source.get_handle()));
     assert_eq!(admitted.commits(&snapshot).unwrap().len(), 2);
@@ -907,9 +910,7 @@ fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
 
     assert_eq!(store.acquired, vec![data(&source)]);
     assert_eq!(snapshot.wants().unwrap().count(), 0);
-    let observed = snapshot
-        .collection_at(first, hifitime::Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let observed = snapshot.collection(first).unwrap();
     assert_eq!(
         observed.support().data_members().collect::<Vec<_>>(),
         vec![data(&source)]
@@ -918,7 +919,7 @@ fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
 }
 
 #[test]
-fn caller_bounded_support_acquisition_hydrates_commit_closure_and_defers_concurrency() {
+fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority() {
     let authority = SigningKey::from_bytes(&[83; 32]);
     let first_writer = SigningKey::from_bytes(&[84; 32]);
     let concurrent_writer = SigningKey::from_bytes(&[85; 32]);
@@ -926,7 +927,6 @@ fn caller_bounded_support_acquisition_hydrates_commit_closure_and_defers_concurr
         AdmissionPolicy::Open,
         AdmissionPolicy::direct(authority.verifying_key()),
     );
-
     let mut registry = MemoryRepo::default();
     let root = registry
         .collection("bounded-cold-write", restricted)
@@ -934,97 +934,131 @@ fn caller_bounded_support_acquisition_hydrates_commit_closure_and_defers_concurr
     let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
     let resource = CapabilityResource::from(root.handle());
     let write = Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke);
-    let first_proof = CapabilityProof::issue_root(
-        &authority,
-        resource,
-        write,
-        Some(
-            CapabilityValidity::new(
-                hifitime::Epoch::from_tai_seconds(-1.0),
-                hifitime::Epoch::from_tai_seconds(1.0),
-            )
-            .unwrap(),
-        ),
-        first_writer.verifying_key(),
-    );
+    let proof = |writer: &SigningKey| {
+        CapabilityProof::issue_root(&authority, resource, write, None, writer.verifying_key())
+    };
     let first_source = archive(31, 31);
     let first_metadata = archive(32, 32);
-    let first_commit = CollectionCommit::sign(
-        &first_writer,
-        root.handle(),
-        data(&first_source),
-        first_metadata.get_handle(),
-    );
-
-    let concurrent_proof = CapabilityProof::issue_root(
-        &authority,
-        resource,
-        write,
-        None,
-        concurrent_writer.verifying_key(),
-    );
     let concurrent_source = archive(33, 33);
     let concurrent_metadata = archive(34, 34);
-    let concurrent_commit = CollectionCommit::sign(
-        &concurrent_writer,
-        root.handle(),
-        data(&concurrent_source),
-        concurrent_metadata.get_handle(),
-    );
-
     let mut inner = MemoryRepo::default();
-    inner.insert_proof(first_proof).unwrap();
-    inner
-        .insert(CollectionRecord::Commit(first_commit))
-        .unwrap();
-    for blob in [&concurrent_source, &concurrent_metadata] {
-        inner.put::<SimpleArchive, _>(blob.clone()).unwrap();
+    inner.insert_proof(proof(&first_writer)).unwrap();
+    for (writer, source, metadata) in [
+        (&first_writer, &first_source, &first_metadata),
+        (&concurrent_writer, &concurrent_source, &concurrent_metadata),
+    ] {
+        inner
+            .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                writer,
+                root.handle(),
+                data(source),
+                metadata.get_handle(),
+            )))
+            .unwrap();
     }
-
     let mut store = GuardStore::new(inner);
-    store.offer(&descriptor);
-    store.offer(&first_source);
-    store.offer(&first_metadata);
-    store.inject_record_on_acquire = Some(CollectionRecord::Commit(concurrent_commit));
-    store.inject_proof_on_acquire = Some(concurrent_proof);
+    for blob in [
+        &descriptor,
+        &first_source,
+        &first_metadata,
+        &concurrent_source,
+        &concurrent_metadata,
+    ] {
+        store.offer(blob);
+    }
+    store.inject_proof_on_acquire = Some(proof(&concurrent_writer));
 
-    let instant = hifitime::Epoch::from_tai_seconds(0.0);
-    let control = store.snapshot().unwrap();
-    // The public helper retains the caller's snapshot and one private clone of
-    // that control frontier while refreshed observations contribute only blob
-    // residency. This count assertion guards the operation's snapshot lifetime;
-    // the semantic assertions below guard the frontier itself.
-    store.expected_live_during_write = 2;
-    let (first_support, first_commits) =
-        block_on(store.acquire_admitted_with_commits_at(root, &control, instant)).unwrap();
-
-    let expected_acquisitions = vec![
-        data(&descriptor),
-        data(&first_source),
-        data(&first_metadata),
-    ];
-    assert_eq!(store.acquired, expected_acquisitions);
-    assert_eq!(first_commits, vec![first_commit]);
+    let first_snapshot = block_on(store.ensure(root)).unwrap();
     assert_eq!(
-        first_support,
-        support(root, std::slice::from_ref(&first_source)),
-        "records and proofs arriving during acquisition stay outside the caller's control frontier",
+        store.acquired,
+        vec![
+            data(&descriptor),
+            data(&first_source),
+            data(&first_metadata)
+        ]
     );
-    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
-
-    drop(control);
-    let fresh_control = store.snapshot().unwrap();
-    let (second_support, second_commits) =
-        block_on(store.acquire_admitted_with_commits_at(root, &fresh_control, instant)).unwrap();
     assert_eq!(
-        second_support,
-        support(root, &[first_source, concurrent_source]),
-        "a fresh caller frontier observes the concurrently inserted proof and commit",
+        first_snapshot.collection(root).unwrap().support(),
+        &support(root, std::slice::from_ref(&first_source)),
+        "a grant arriving during descriptor acquisition must not initiate more acquisition",
     );
-    assert_eq!(second_commits.len(), 2);
-    assert!(second_commits.contains(&first_commit));
-    assert!(second_commits.contains(&concurrent_commit));
-    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+    assert_eq!(first_snapshot.wants().unwrap().count(), 0);
+    assert!(
+        store.events.is_empty(),
+        "root ensure must not author equations"
+    );
+    drop(first_snapshot);
+
+    let second_snapshot = block_on(store.ensure(root)).unwrap();
+    assert_eq!(
+        second_snapshot.collection(root).unwrap().support(),
+        &support(root, &[first_source, concurrent_source.clone()]),
+    );
+    assert_eq!(
+        &store.acquired[3..],
+        &[data(&concurrent_source), data(&concurrent_metadata)],
+    );
+    assert_eq!(second_snapshot.wants().unwrap().count(), 0);
+}
+
+#[test]
+fn root_ensure_exact_fetches_selected_payload_without_commits() {
+    let (inner, root, _, _) = collections();
+    let source = archive(35, 35);
+    let requested = support(root, std::slice::from_ref(&source));
+    let mut store = GuardStore::new(inner);
+    store.offer(&source);
+
+    let snapshot = block_on(store.ensure_exact(root, &requested)).unwrap();
+    let selected = snapshot.collection_exact(root, &requested).unwrap();
+    assert_eq!(selected.view::<TribleSet>().unwrap().len(), 1);
+    assert_eq!(store.acquired, vec![data(&source)]);
+    assert!(snapshot.records().unwrap().next().is_none());
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    assert!(store.events.is_empty());
+}
+
+#[test]
+fn root_maintenance_only_merges_and_warm_ensure_is_write_free() {
+    let (mut inner, root, _, _) = collections();
+    let left = archive(36, 36);
+    let right = archive(37, 37);
+    let requested = support(root, &[left.clone(), right.clone()]);
+    inner.put::<SimpleArchive, _>(left).unwrap();
+    inner.put::<SimpleArchive, _>(right).unwrap();
+    let mut store = GuardStore::new(inner);
+
+    let maintained = block_on(store.maintain_exact(root, &requested)).unwrap();
+    assert_eq!(
+        maintained
+            .collection_exact(root, &requested)
+            .unwrap()
+            .cover()
+            .len(),
+        1
+    );
+    assert!(store
+        .events
+        .iter()
+        .any(|event| matches!(event, WriteEvent::Insert(CollectionRecord::Merge(_)))));
+    assert!(store.events.iter().all(|event| !matches!(
+        event,
+        WriteEvent::Insert(CollectionRecord::Derive(_) | CollectionRecord::Commit(_))
+    )));
+    drop(maintained);
+    store.events.clear();
+    let ensured = block_on(store.ensure_exact(root, &requested)).unwrap();
+    assert_eq!(
+        ensured
+            .collection_exact(root, &requested)
+            .unwrap()
+            .view::<TribleSet>()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert!(store.events.is_empty());
+    assert!(store.acquired.is_empty());
 }
 
 #[test]
@@ -1060,10 +1094,8 @@ fn active_read_audience_acquires_a_cold_descriptor() {
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
 
-    let audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
+    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert_eq!(store.acquired, vec![data(&descriptor)]);
     let mut expected_audience = vec![authority.verifying_key(), reader.verifying_key()];
@@ -1118,10 +1150,8 @@ fn active_read_audience_ignores_irrelevant_or_forged_proofs() {
 
     let mut store = GuardStore::new(inner);
 
-    let audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
+    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
     assert_eq!(
@@ -1166,10 +1196,8 @@ fn active_read_audience_walks_a_valid_delegated_proof_path() {
 
     let mut store = GuardStore::new(inner);
 
-    let audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
+    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
     let mut expected_audience = vec![
@@ -1220,10 +1248,8 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
 
     let mut store = GuardStore::new(inner);
 
-    let audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
+    let snapshot = block_on(store.ensure(collection)).unwrap();
+    let audience = collection_read_audience(&snapshot, collection.handle()).unwrap();
 
     assert!(store.acquired.is_empty());
     assert_eq!(
@@ -1234,10 +1260,10 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
 }
 
 #[test]
-fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
+fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
     let authority = SigningKey::from_bytes(&[67; 32]);
     let first_reader = SigningKey::from_bytes(&[68; 32]);
-    let concurrent_reader = SigningKey::from_bytes(&[69; 32]);
+    let later_reader = SigningKey::from_bytes(&[69; 32]);
     let mut registry = MemoryRepo::default();
     let collection = registry
         .collection(
@@ -1255,70 +1281,64 @@ fn active_read_audience_defers_concurrent_proofs_until_the_next_call() {
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
     let read = Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke);
-    let first_proof = CapabilityProof::issue_root(
-        &authority,
-        resource,
-        read,
-        None,
-        first_reader.verifying_key(),
-    );
     let mut inner = MemoryRepo::default();
-    inner.insert_proof(first_proof).unwrap();
-
-    let concurrent_proof = CapabilityProof::issue_root(
-        &authority,
-        resource,
-        read,
-        Some(
-            CapabilityValidity::new(
-                hifitime::Epoch::from_tai_seconds(-1.0),
-                hifitime::Epoch::from_tai_seconds(1.0),
-            )
-            .unwrap(),
-        ),
-        concurrent_reader.verifying_key(),
-    );
-
+    inner
+        .insert_proof(CapabilityProof::issue_root(
+            &authority,
+            resource,
+            read,
+            None,
+            first_reader.verifying_key(),
+        ))
+        .unwrap();
     let mut store = GuardStore::new(inner);
     store.offer(&descriptor);
-    store.inject_proof_on_acquire = Some(concurrent_proof);
 
-    let first_audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
-    let mut first_expected = vec![authority.verifying_key(), first_reader.verifying_key()];
-    first_expected.sort_unstable_by_key(VerifyingKey::to_bytes);
+    let before = block_on(store.ensure(collection)).unwrap();
+    let first_audience = collection_read_audience(&before, collection.handle()).unwrap();
+    let mut expected = vec![authority.verifying_key(), first_reader.verifying_key()];
+    expected.sort_unstable_by_key(VerifyingKey::to_bytes);
     assert_eq!(
         first_audience,
-        CollectionReadAudience::Restricted(first_expected)
+        CollectionReadAudience::Restricted(expected.clone())
     );
     assert_eq!(store.acquired, vec![data(&descriptor)]);
 
-    let second_audience = block_on(
-        store.acquire_read_audience_at(collection.handle(), hifitime::Epoch::from_tai_seconds(0.0)),
-    )
-    .unwrap();
-    let mut second_expected = vec![
-        authority.verifying_key(),
-        first_reader.verifying_key(),
-        concurrent_reader.verifying_key(),
-    ];
-    second_expected.sort_unstable_by_key(VerifyingKey::to_bytes);
+    store
+        .inner
+        .insert_proof(CapabilityProof::issue_root(
+            &authority,
+            resource,
+            read,
+            Some(
+                CapabilityValidity::new(
+                    hifitime::Epoch::from_tai_seconds(-1.0),
+                    hifitime::Epoch::from_tai_seconds(1.0),
+                )
+                .unwrap(),
+            ),
+            later_reader.verifying_key(),
+        ))
+        .unwrap();
     assert_eq!(
-        second_audience,
-        CollectionReadAudience::Restricted(second_expected)
+        collection_read_audience(&before, collection.handle()).unwrap(),
+        first_audience
     );
+    let later = store
+        .snapshot_at(hifitime::Epoch::from_tai_seconds(0.0))
+        .unwrap();
+    expected.push(later_reader.verifying_key());
+    expected.sort_unstable_by_key(VerifyingKey::to_bytes);
     assert_eq!(
-        collection_read_audience_at(
-            &store.inner.snapshot().unwrap(),
-            collection.handle(),
-            hifitime::Epoch::from_tai_seconds(0.0),
-        )
-        .unwrap(),
-        second_audience,
+        collection_read_audience(&later, collection.handle()).unwrap(),
+        CollectionReadAudience::Restricted(expected)
     );
-    assert_eq!(store.inner.snapshot().unwrap().wants().unwrap().count(), 0);
+    assert_eq!(later.wants().unwrap().count(), 0);
+    assert_eq!(
+        store.acquired,
+        vec![data(&descriptor)],
+        "snapshot reads never acquire blobs"
+    );
 }
 
 #[test]
@@ -1470,7 +1490,7 @@ fn missing_mapping_dependency_publishes_nothing() {
         result,
         Err(CollectionRealizationError::MissingDependency { .. })
     ));
-    assert!(before == store.snapshot().unwrap());
+    assert!(store.snapshot().unwrap().changes_since(&before).is_empty());
 }
 
 #[test]
@@ -1526,7 +1546,7 @@ fn warm_exact_ensure_is_a_zero_write_zero_algebra_observation() {
     let before = store.snapshot().unwrap();
     ensure_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
     let after = store.snapshot().unwrap();
-    assert!(before == after);
+    assert!(after.changes_since(&before).is_empty());
     assert_eq!(FIRST_MAP_CALLS.get(), 0);
 }
 
@@ -1606,7 +1626,11 @@ fn optional_target_dependency_keeps_the_finer_cover() {
     drop(snapshot);
     let first_result = store.snapshot().unwrap();
     maintain_exact_resident::<_, FirstEncoding>(&mut store, first, &support).unwrap();
-    assert!(first_result == store.snapshot().unwrap());
+    assert!(store
+        .snapshot()
+        .unwrap()
+        .changes_since(&first_result)
+        .is_empty());
     assert!(!records(&mut store).iter().any(|record| matches!(
         record,
         CollectionRecord::Merge(merge) if merge.collection() == root.handle()
@@ -1654,5 +1678,5 @@ fn target_maintenance_is_deterministic_and_repeatedly_idempotent() {
 
     maintain_exact_resident::<_, SecondEncoding>(&mut store, second, &support).unwrap();
     let second_result = store.snapshot().unwrap();
-    assert!(first_result == second_result);
+    assert!(second_result.changes_since(&first_result).is_empty());
 }

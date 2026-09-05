@@ -76,8 +76,7 @@ fn observe(
     mut consume: impl FnMut(&str) -> Result<(), Box<dyn Error>>,
 ) -> Result<Vec<String>, Box<dyn Error>> {
     let snapshot = store.snapshot()?;
-    let current_support =
-        collection.admitted_at(&snapshot, triblespace::core::clock::epoch_now())?;
+    let current_support = collection.admitted(&snapshot)?;
     let changed_support = match checkpoint.as_ref() {
         Some(previous) if previous.support() == &current_support => return Ok(Vec::new()),
         Some(previous) => current_support.additions_since(previous.support()).ok(),

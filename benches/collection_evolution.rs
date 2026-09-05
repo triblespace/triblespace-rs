@@ -672,7 +672,7 @@ fn run_iteration(
             .snapshot()
             .expect("freeze accounting source snapshot");
         let cover = source
-            .admitted_at(&source_snapshot, triblespace_core::clock::epoch_now())
+            .admitted(&source_snapshot)
             .expect("freeze accounting source cover");
         assert_eq!(cover.len(), checkpoint);
         let source_shape = store_shape(&mut source_accounting, collections);

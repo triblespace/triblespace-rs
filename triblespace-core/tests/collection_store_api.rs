@@ -13,7 +13,7 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::descriptor;
 use triblespace_core::collection::{
-    collection_read_audience_at, grant_collection_read, grant_collection_write, AdmissionPolicy,
+    collection_read_audience, grant_collection_read, grant_collection_write, AdmissionPolicy,
     Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
     CollectionReadAudience, CollectionReadGrantError, CollectionRecord, CollectionStore,
     CollectionStoreExt, CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit,
@@ -80,8 +80,8 @@ impl SnapshotSource for CountingRepo {
     type Snapshot = <MemoryRepo as SnapshotSource>::Snapshot;
     type SnapshotError = <MemoryRepo as SnapshotSource>::SnapshotError;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.inner.snapshot()
+    fn snapshot_at(&mut self, instant: Epoch) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.inner.snapshot_at(instant)
     }
 }
 
@@ -270,7 +270,7 @@ fn read_grant_is_root_checked_and_replay_deterministic() {
     assert_eq!(replay, first);
     assert_eq!(store.events, vec![StoreEvent::Proof(first.id().raw)]);
 
-    let snapshot = store.snapshot().unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let proofs = snapshot
         .proofs()
         .unwrap()
@@ -278,11 +278,7 @@ fn read_grant_is_root_checked_and_replay_deterministic() {
         .unwrap();
     assert_eq!(proofs, vec![first]);
     assert!(collection
-        .reader_is_admitted_at(
-            &snapshot,
-            reader.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-        )
+        .reader_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
 }
 
@@ -301,11 +297,8 @@ fn write_grant_is_root_checked_and_activates_recipient_commits() {
         )
         .unwrap();
     let commit = store.commit(collection, &writer, fragment(36)).unwrap();
-    let snapshot = store.snapshot().unwrap();
-    assert!(collection
-        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap()
-        .is_empty());
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    assert!(collection.admitted(&snapshot).unwrap().is_empty());
     drop(snapshot);
     store.events.clear();
 
@@ -330,17 +323,11 @@ fn write_grant_is_root_checked_and_activates_recipient_commits() {
     assert_eq!(proof.validities().collect::<Vec<_>>(), vec![None]);
     assert_eq!(proof.leaf_key(), writer.verifying_key());
 
-    let snapshot = store.snapshot().unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert!(collection
-        .writer_is_admitted_at(
-            &snapshot,
-            writer.verifying_key(),
-            Epoch::from_tai_seconds(0.0),
-        )
+        .writer_is_admitted(&snapshot, writer.verifying_key())
         .unwrap());
-    let admitted = collection
-        .admitted_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let admitted = collection.admitted(&snapshot).unwrap();
     assert_eq!(admitted.len(), 1);
     assert!(admitted.contains(Handle::<SimpleArchive>::from_hash(commit.data())));
 }
@@ -547,30 +534,28 @@ fn read_and_write_policies_are_independent() {
             ),
         )
         .unwrap();
-    store.commit(collection, &root, fragment(1)).unwrap();
-    store.commit(collection, &stranger, fragment(2)).unwrap();
+    let authorized = store.commit(collection, &root, fragment(1)).unwrap();
+    let unauthorized = store.commit(collection, &stranger, fragment(2)).unwrap();
+    let attestation = store.commit(collection, &stranger, fragment(1)).unwrap();
 
-    let snapshot = store.snapshot().unwrap();
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert!(collection
-        .reader_is_admitted_at(
-            &snapshot,
-            stranger.verifying_key(),
-            Epoch::from_tai_seconds(0.0)
-        )
+        .reader_is_admitted(&snapshot, stranger.verifying_key())
         .unwrap());
     assert!(!collection
-        .writer_is_admitted_at(
-            &snapshot,
-            stranger.verifying_key(),
-            Epoch::from_tai_seconds(0.0)
-        )
+        .writer_is_admitted(&snapshot, stranger.verifying_key())
         .unwrap());
-    let (cover, commits) = collection
-        .admitted_with_commits_at(&snapshot, Epoch::from_tai_seconds(0.0))
-        .unwrap();
+    let cover = collection.admitted(&snapshot).unwrap();
     assert_eq!(cover.len(), 1);
-    assert_eq!(commits.len(), 1);
-    assert_eq!(commits[0].public_key().raw, root.verifying_key().to_bytes());
+    assert!(cover.contains(Handle::<SimpleArchive>::from_hash(authorized.data())));
+
+    // Provenance is every valid signature over the selected payload, not the
+    // set of authorized membership claims that admitted that payload.
+    let commits = cover.commits(&snapshot).unwrap();
+    assert_eq!(commits.len(), 2);
+    assert!(commits.contains(&authorized));
+    assert!(commits.contains(&attestation));
+    assert!(!commits.contains(&unauthorized));
 }
 
 #[test]
@@ -607,13 +592,12 @@ fn invoke_only_root_proof_admits_recipient_but_blocks_redelegation() {
     assert_eq!(error, CapabilityIssueError::ParentCannotDelegate);
     store.insert_proof(parent_proof).unwrap();
 
-    let snapshot = store.snapshot().unwrap();
-    let instant = Epoch::from_tai_seconds(0.0);
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert!(collection
-        .writer_is_admitted_at(&snapshot, intermediary.verifying_key(), instant)
+        .writer_is_admitted(&snapshot, intermediary.verifying_key())
         .unwrap());
     assert!(!collection
-        .writer_is_admitted_at(&snapshot, leaf.verifying_key(), instant)
+        .writer_is_admitted(&snapshot, leaf.verifying_key())
         .unwrap());
 }
 
@@ -642,13 +626,12 @@ fn read_grants_use_the_distinct_read_action() {
         ))
         .unwrap();
 
-    let snapshot = store.snapshot().unwrap();
-    let instant = Epoch::from_tai_seconds(0.0);
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     assert!(collection
-        .reader_is_admitted_at(&snapshot, reader.verifying_key(), instant)
+        .reader_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
     assert!(!collection
-        .writer_is_admitted_at(&snapshot, reader.verifying_key(), instant)
+        .writer_is_admitted(&snapshot, reader.verifying_key())
         .unwrap());
 }
 
@@ -685,12 +668,10 @@ fn read_audience_includes_valid_proof_prefixes() {
         .unwrap();
     store.insert_proof(child_proof).unwrap();
 
-    let CollectionReadAudience::Restricted(readers) = collection_read_audience_at(
-        &store.snapshot().unwrap(),
-        collection.handle(),
-        Epoch::from_tai_seconds(0.0),
-    )
-    .unwrap() else {
+    let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
+    let CollectionReadAudience::Restricted(readers) =
+        collection_read_audience(&snapshot, collection.handle()).unwrap()
+    else {
         panic!("delegable READ policy must have a finite audience");
     };
     assert!(readers.contains(&root.verifying_key()));
@@ -731,7 +712,7 @@ fn collection_quorum_needs_support_from_distinct_roots() {
         ))
         .unwrap();
     assert!(!collection
-        .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
+        .writer_is_admitted(&store.snapshot_at(instant).unwrap(), writer.verifying_key())
         .unwrap());
 
     store
@@ -744,6 +725,6 @@ fn collection_quorum_needs_support_from_distinct_roots() {
         ))
         .unwrap();
     assert!(collection
-        .writer_is_admitted_at(&store.snapshot().unwrap(), writer.verifying_key(), instant)
+        .writer_is_admitted(&store.snapshot_at(instant).unwrap(), writer.verifying_key())
         .unwrap());
 }

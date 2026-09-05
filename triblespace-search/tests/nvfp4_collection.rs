@@ -63,9 +63,7 @@ fn simplearchive_mapping_lazy_view_and_exact_queries_compose() {
         .unwrap();
 
     let snapshot = store.snapshot().unwrap();
-    let support = source
-        .admitted_at(&snapshot, triblespace_core::clock::epoch_now())
-        .unwrap();
+    let support = source.admitted(&snapshot).unwrap();
     drop(snapshot);
     let snapshot = block_on(store.maintain_exact(target, &support)).unwrap();
     let collection = snapshot.collection_exact(target, &support).unwrap();

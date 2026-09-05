@@ -994,7 +994,7 @@ fn collection_materialize_benchmark(c: &mut Criterion) {
             b.iter(|| {
                 let snapshot = storage.snapshot().expect("freeze store snapshot");
                 collection
-                    .read_at::<TribleSet, _>(&snapshot, triblespace::core::clock::epoch_now())
+                    .read::<TribleSet, _>(&snapshot)
                     .expect("materialize collection")
             });
         });

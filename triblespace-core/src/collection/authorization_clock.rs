@@ -5,20 +5,23 @@
 
 use hifitime::{Duration, Epoch};
 
-use crate::repo::CapabilityProofRead;
+use crate::repo::{CapabilityProofRead, StoreSnapshot};
 
 use super::api::CollectionEvidenceDiscoveryError;
 
 /// Earliest future instant at which any stored capability proof can change
 /// authorization.
-pub fn next_authorization_change_at<S>(
+///
+/// The boundary is strictly after this snapshot's frozen interpretation time.
+/// Content change masks intentionally exclude time, so cached admission must
+/// account for this boundary when it observes a later snapshot.
+pub fn next_authorization_change<S>(
     snapshot: &S,
-    instant: Epoch,
 ) -> Result<Option<Epoch>, CollectionEvidenceDiscoveryError<S::ProofsError>>
 where
-    S: CapabilityProofRead,
+    S: CapabilityProofRead + StoreSnapshot,
 {
-    let instant_ns = instant.to_tai_duration().total_nanoseconds();
+    let instant_ns = snapshot.instant().to_tai_duration().total_nanoseconds();
     let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
@@ -54,7 +57,7 @@ mod tests {
     };
     use crate::collection::{CollectionHandle, ACTION_READ};
     use crate::repo::memoryrepo::MemoryRepo;
-    use crate::repo::{CapabilityProofStore, SnapshotSource};
+    use crate::repo::{CapabilityProofStore, SnapshotSource, StoreChanges};
 
     use super::*;
 
@@ -77,25 +80,22 @@ mod tests {
         );
         let mut store = MemoryRepo::default();
         store.insert_proof(proof).unwrap();
-        let snapshot = store.snapshot().unwrap();
+        let before = store.snapshot_at(Epoch::from_tai_seconds(9.0)).unwrap();
+        let valid = store.snapshot_at(Epoch::from_tai_seconds(10.0)).unwrap();
+        let expiry = Epoch::from_tai_duration(Duration::from_total_nanoseconds(20_000_000_001));
+        let expired = store.snapshot_at(expiry).unwrap();
 
         assert_eq!(
-            next_authorization_change_at(&snapshot, Epoch::from_tai_seconds(9.0)).unwrap(),
+            next_authorization_change(&before).unwrap(),
             Some(Epoch::from_tai_seconds(10.0))
         );
+        assert_eq!(next_authorization_change(&valid).unwrap(), Some(expiry));
+        assert_eq!(next_authorization_change(&expired).unwrap(), None);
+        assert_eq!(valid.changes_since(&before), StoreChanges::NONE);
+        assert_eq!(expired.changes_since(&valid), StoreChanges::NONE);
         assert_eq!(
-            next_authorization_change_at(&snapshot, Epoch::from_tai_seconds(10.0)).unwrap(),
-            Some(Epoch::from_tai_duration(Duration::from_total_nanoseconds(
-                20_000_000_001,
-            )))
-        );
-        assert_eq!(
-            next_authorization_change_at(
-                &snapshot,
-                Epoch::from_tai_duration(Duration::from_total_nanoseconds(20_000_000_001)),
-            )
-            .unwrap(),
-            None
+            next_authorization_change(&before.clone()).unwrap(),
+            Some(Epoch::from_tai_seconds(10.0))
         );
     }
 

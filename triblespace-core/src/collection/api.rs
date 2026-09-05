@@ -28,14 +28,13 @@ use crate::capability::{
     CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityRequest,
     CapabilityResource,
 };
-use crate::clock;
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
-use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead};
+use crate::repo::{CapabilityProofStore, SnapshotSource, Store, StoreRead, StoreSnapshot};
 use crate::trible::{Fragment, TribleSet};
 
 use super::discovery::{
@@ -782,6 +781,8 @@ pub enum CollectionMaterializationError<
     ViewError,
     EvidenceError = Infallible,
 > {
+    /// The snapshot could not resolve a collection realization.
+    Realization(CollectionRealizationError),
     /// Resident admission evidence could not be observed.
     Evidence(EvidenceError),
     /// Native collection-record discovery did not complete.
@@ -905,6 +906,7 @@ where
 {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Realization(source) => source.fmt(f),
             Self::Evidence(source) => source.fmt(f),
             Self::Discovery(source) => source.fmt(f),
             Self::DescriptorGet { collection, source } => write!(
@@ -961,6 +963,7 @@ where
 {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
+            Self::Realization(source) => Some(source),
             Self::Evidence(source) => Some(source),
             Self::Discovery(source) => Some(source),
             Self::DescriptorGet { source, .. } => Some(source),
@@ -1080,7 +1083,7 @@ pub(crate) fn admission_evidence_from_proofs(
     }
 }
 
-fn admission_evidence_at(
+fn admission_evidence(
     policy: &AdmissionPolicy,
     action: crate::id::Id,
     required: CapabilityMode,
@@ -1096,7 +1099,7 @@ fn admission_evidence_at(
     )
 }
 
-fn discover_admission_evidence_at<S>(
+fn discover_admission_evidence<S>(
     snapshot: &S,
     policy: &AdmissionPolicy,
     action: crate::id::Id,
@@ -1108,39 +1111,32 @@ where
 {
     let needs_proofs = matches!(policy, AdmissionPolicy::Quorum(_));
     if !needs_proofs {
-        return Ok(admission_evidence_at(
-            policy,
-            action,
-            required,
-            collection,
-            [],
-        ));
+        return Ok(admission_evidence(policy, action, required, collection, []));
     }
     let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
-    Ok(admission_evidence_at(
+    Ok(admission_evidence(
         policy, action, required, collection, proofs,
     ))
 }
 
-fn discover_admitted_cover_at<S, L>(
+fn discover_admitted_cover<S, L>(
     snapshot: &S,
     collection: Collection<L>,
-    instant: hifitime::Epoch,
 ) -> Result<
     (Fragment, DiscoveredCollectionRecords, Cover<L>),
     CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
 >
 where
-    S: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
+    S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
     L: CollectionEncoding,
 {
     let loaded = load_collection_descriptor(snapshot, collection.handle())
         .map_err(CollectionCoverError::Descriptor)?;
-    let evidence = discover_admission_evidence_at(
+    let evidence = discover_admission_evidence(
         snapshot,
         loaded.policy.write(),
         ACTION_WRITE,
@@ -1153,7 +1149,7 @@ where
         discover_collection_records_authorized(snapshot, collection.handle(), |subject| {
             *authorized.entry(subject.raw).or_insert_with(|| {
                 VerifyingKey::from_bytes(&subject.raw)
-                    .map(|subject| evidence.authorizes(subject, instant))
+                    .map(|subject| evidence.authorizes(subject, snapshot.instant()))
                     .unwrap_or(false)
             })
         })
@@ -1282,15 +1278,14 @@ where
 /// before its member encoding is known. This boundary therefore validates the
 /// generic descriptor and its READ policy without manufacturing a typed
 /// [`Collection`]. It neither enumerates nor persists ambient proof state.
-pub fn collection_reader_is_admitted_by_at<S>(
+pub fn collection_reader_is_admitted_by<S>(
     snapshot: &S,
     collection: CollectionHandle,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
-    instant: hifitime::Epoch,
 ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
 where
-    S: BlobStoreGet,
+    S: StoreSnapshot + BlobStoreGet,
 {
     let loaded = load_collection_descriptor(snapshot, collection)?;
     Ok(collection_reader_is_admitted_by_policy_at(
@@ -1298,7 +1293,7 @@ where
         &loaded.policy,
         subject,
         proofs,
-        instant,
+        snapshot.instant(),
     ))
 }
 
@@ -1352,17 +1347,16 @@ pub fn collection_read_audience_by_policy_at(
 ///
 /// A failed proof-store observation is reported rather than confused with an
 /// empty audience. Invalid or unrelated proofs simply grant nothing.
-pub fn collection_read_audience_at<S>(
+pub fn collection_read_audience<S>(
     snapshot: &S,
     collection: CollectionHandle,
-    instant: hifitime::Epoch,
 ) -> Result<CollectionReadAudience, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
 where
-    S: BlobStoreGet + CapabilityProofRead,
+    S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
 {
     let loaded = load_collection_descriptor(snapshot, collection)
         .map_err(CollectionAdmissionError::Descriptor)?;
-    let evidence = discover_admission_evidence_at(
+    let evidence = discover_admission_evidence(
         snapshot,
         loaded.policy.read(),
         ACTION_READ,
@@ -1370,7 +1364,7 @@ where
         collection,
     )
     .map_err(CollectionAdmissionError::Evidence)?;
-    Ok(evidence.authorized_subjects(instant))
+    Ok(evidence.authorized_subjects(snapshot.instant()))
 }
 
 /// Decide WRITE admission against one already validated collection policy and
@@ -1442,23 +1436,22 @@ impl<L: CollectionEncoding> Collection<L> {
         load_collection_descriptor(snapshot, self.handle()).map(|descriptor| descriptor.policy)
     }
 
-    /// Decide whether `subject` is admitted as a writer at `instant`.
+    /// Decide whether `subject` is admitted as a writer in this snapshot.
     ///
     /// Open policy admits every subject. A quorum admits the subject only when
     /// independently rooted exact-action proofs carry support from enough
     /// distinct configured roots.
-    pub fn writer_is_admitted_at<S>(
+    pub fn writer_is_admitted<S>(
         self,
         snapshot: &S,
         subject: VerifyingKey,
-        instant: hifitime::Epoch,
     ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
     where
-        S: BlobStoreGet + CapabilityProofRead,
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())
             .map_err(CollectionAdmissionError::Descriptor)?;
-        let evidence = discover_admission_evidence_at(
+        let evidence = discover_admission_evidence(
             snapshot,
             loaded.policy.write(),
             ACTION_WRITE,
@@ -1466,26 +1459,25 @@ impl<L: CollectionEncoding> Collection<L> {
             self.handle(),
         )
         .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(evidence.authorizes(subject, instant))
+        Ok(evidence.authorizes(subject, snapshot.instant()))
     }
 
-    /// Decide whether `subject` is admitted as a reader at `instant`.
+    /// Decide whether `subject` is admitted as a reader in this snapshot.
     ///
     /// This is the disclosure boundary corresponding to the descriptor's READ
     /// ceiling. Local materialization remains caller-controlled because a
     /// local store cannot infer which external principal will receive bytes.
-    pub fn reader_is_admitted_at<S>(
+    pub fn reader_is_admitted<S>(
         self,
         snapshot: &S,
         subject: VerifyingKey,
-        instant: hifitime::Epoch,
     ) -> Result<bool, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
     where
-        S: BlobStoreGet + CapabilityProofRead,
+        S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())
             .map_err(CollectionAdmissionError::Descriptor)?;
-        let evidence = discover_admission_evidence_at(
+        let evidence = discover_admission_evidence(
             snapshot,
             loaded.policy.read(),
             ACTION_READ,
@@ -1493,89 +1485,67 @@ impl<L: CollectionEncoding> Collection<L> {
             self.handle(),
         )
         .map_err(CollectionAdmissionError::Evidence)?;
-        Ok(evidence.authorizes(subject, instant))
+        Ok(evidence.authorizes(subject, snapshot.instant()))
     }
 
     /// Decide READ admission from one explicitly supplied portable proof set.
     ///
-    /// This is the network-facing counterpart of [`Self::reader_is_admitted_at`].
+    /// This is the network-facing counterpart of [`Self::reader_is_admitted`].
     /// It loads only the immutable collection descriptor from `snapshot`; it
     /// neither enumerates nor persists ambient proof-store state. An open READ
     /// policy therefore succeeds with an empty proof slice, while a quorum is
     /// evaluated over the independently rooted supplied paths.
-    pub fn reader_is_admitted_by_at<S>(
+    pub fn reader_is_admitted_by<S>(
         self,
         snapshot: &S,
         subject: VerifyingKey,
         proofs: &[CapabilityProof],
-        instant: hifitime::Epoch,
     ) -> Result<bool, CollectionDescriptorError<S::GetError<Infallible>>>
     where
-        S: BlobStoreGet,
+        S: StoreSnapshot + BlobStoreGet,
     {
-        collection_reader_is_admitted_by_at(snapshot, self.handle(), subject, proofs, instant)
+        collection_reader_is_admitted_by(snapshot, self.handle(), subject, proofs)
     }
 
-    /// Discover the exact payload cover admitted at `instant`.
+    /// Discover the exact payload cover admitted in this snapshot.
     ///
     /// The result is the semantic COMMIT frontier. It deliberately does not
     /// expose a replaceable physical decomposition. Use [`Cover::available`]
     /// to inspect resident semantic support or [`Cover::materialize`] to
     /// construct a logical value through this same snapshot.
-    pub fn admitted_at<S>(
+    pub fn admitted<S>(
         self,
         snapshot: &S,
-        instant: hifitime::Epoch,
     ) -> Result<
         Cover<L>,
         CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
     >
     where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
+        S: StoreSnapshot + BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
     {
-        discover_admitted_cover_at(snapshot, self, instant).map(|(_, _, cover)| cover)
+        discover_admitted_cover(snapshot, self).map(|(_, _, cover)| cover)
     }
 
-    /// Discover an admitted cover and the exact COMMIT roots selected by the
-    /// same authorization decision.
-    pub fn admitted_with_commits_at<S>(
+    /// Read one logical value through this snapshot's realized collection.
+    ///
+    /// This is exactly `snapshot.collection(self)?.view()`: it neither fetches
+    /// missing blobs nor claims support beyond the snapshot's resident cover.
+    pub fn read<V, S>(
         self,
         snapshot: &S,
-        instant: hifitime::Epoch,
-    ) -> Result<
-        (Cover<L>, Vec<CollectionCommit>),
-        CollectionCoverError<S::RecordsError, S::ProofsError, S::GetError<Infallible>>,
-    >
-    where
-        S: BlobStoreGet + BlobStoreList + CapabilityProofRead + CollectionRead,
-    {
-        let (_, discovered, cover) = discover_admitted_cover_at(snapshot, self, instant)?;
-        Ok((cover, discovered.commits().to_vec()))
-    }
-
-    /// Read one logical value admitted at `instant` through one immutable
-    /// store observation.
-    pub fn read_at<V, S>(
-        self,
-        snapshot: &S,
-        instant: hifitime::Epoch,
     ) -> Result<
         V,
         CollectionReadError<S::RecordsError, S::ProofsError, S::GetError<Infallible>, V::Error>,
     >
     where
-        S: BlobStoreGet + BlobStoreList + BlobStoreMeta + CapabilityProofRead + CollectionRead,
+        S: StoreRead,
         V: TryFromCover<L>,
     {
-        let (descriptor, discovered, admitted) =
-            discover_admitted_cover_at(snapshot, self, instant)
-                .map_err(CollectionMaterializationError::from)?;
-        materialize_cover_from_observation::<S, L, V, _>(
-            snapshot,
-            &descriptor,
-            discovered,
-            admitted,
-        )
+        snapshot
+            .collection(self)
+            .map_err(CollectionMaterializationError::Realization)?
+            .view()
+            .map_err(CollectionMaterializationError::from)
     }
 }
 
@@ -1659,12 +1629,11 @@ impl<L: CollectionEncoding> Cover<L> {
     }
 }
 
-async fn admitted_support_and_commits_with_acquisition<S, E>(
+async fn admitted_support_with_acquisition<S, E>(
     store: &mut S,
     target: Collection<E>,
     frontier: &OperationFrontier<S::Snapshot>,
-    instant: hifitime::Epoch,
-) -> Result<(Support, Vec<CollectionCommit>), CollectionRealizationError>
+) -> Result<Support, CollectionRealizationError>
 where
     S: Store + AsyncBlobStoreAcquire,
     E: CollectionEncoding,
@@ -1700,7 +1669,7 @@ where
                 "reload foundation descriptor for active admission: {error}"
             ))
         })?;
-    let evidence = discover_admission_evidence_at(
+    let evidence = discover_admission_evidence(
         &bounded,
         descriptor.policy.write(),
         ACTION_WRITE,
@@ -1721,7 +1690,7 @@ where
             CollectionRecord::Commit(commit)
                 if commit.verify_strict().is_ok()
                     && VerifyingKey::from_bytes(&commit.public_key().raw)
-                        .map(|writer| evidence.authorizes(writer, instant))
+                        .map(|writer| evidence.authorizes(writer, bounded.instant()))
                         .unwrap_or(false) =>
             {
                 Some(commit.blob_references())
@@ -1754,25 +1723,8 @@ where
     })?;
     let bounded = frontier.view(snapshot);
     foundation
-        .admitted_with_commits_at(&bounded, instant)
-        .map_err(|error| {
-            CollectionRealizationError::storage("admit hydrated support and provenance", error)
-        })
-}
-
-async fn admitted_support_with_acquisition<S, E>(
-    store: &mut S,
-    target: Collection<E>,
-    frontier: &OperationFrontier<S::Snapshot>,
-    instant: hifitime::Epoch,
-) -> Result<Support, CollectionRealizationError>
-where
-    S: Store + AsyncBlobStoreAcquire,
-    E: CollectionEncoding,
-{
-    admitted_support_and_commits_with_acquisition(store, target, frontier, instant)
-        .await
-        .map(|(support, _)| support)
+        .admitted(&bounded)
+        .map_err(|error| CollectionRealizationError::storage("admit hydrated support", error))
 }
 
 /// Immutable collection observations implemented by every complete store snapshot.
@@ -1781,30 +1733,28 @@ where
 /// therefore owns this exact store observation together with invariant
 /// foundational [`Support`] and the physical target cover selected inside it.
 pub trait CollectionSnapshotExt: StoreRead + Sized {
-    /// Observe what one collection contains at one authorization instant.
+    /// Observe what one collection contains in this immutable snapshot.
     ///
-    /// The supplied instant is explicit because a frozen storage observation
-    /// must not acquire a hidden wall-clock dependency. It is used for every
-    /// capability decision while selecting admitted foundational support.
+    /// The snapshot's frozen instant is used for every capability decision
+    /// while selecting admitted foundational support.
     /// Physical target realization is selected entirely from this immutable
     /// store snapshot and may represent only a proper subset of the admitted
     /// support.
-    fn collection_at<E>(
+    fn collection<E>(
         &self,
         target: Collection<E>,
-        instant: hifitime::Epoch,
     ) -> Result<CollectionSnapshot<Self, E>, CollectionRealizationError>
     where
         E: CollectionEncoding,
         Handle<E>: InlineEncoding,
     {
-        let (support, cover) = super::exact_derived::attach_collection_at(self, target, instant)?;
+        let (support, cover) = super::exact_derived::attach_collection(self, target)?;
         Ok(CollectionSnapshot::new(self.clone(), support, cover))
     }
 
     /// Observe the complete target realization for one explicit support.
     ///
-    /// Unlike [`Self::collection_at`], this is an assertion boundary: it fails
+    /// Unlike [`Self::collection`], this is an assertion boundary: it fails
     /// if the exact requested support is not fully realized in this snapshot.
     fn collection_exact<E>(
         &self,
@@ -1822,6 +1772,126 @@ pub trait CollectionSnapshotExt: StoreRead + Sized {
 }
 
 impl<R> CollectionSnapshotExt for R where R: StoreRead {}
+
+/// An encoding whose collection can be made resident and maintained by storage.
+///
+/// Root `SimpleArchive` collections acquire their signed support. Encodings
+/// with a canonical [`CollectionDerivation`] additionally compute missing
+/// images. This operational capability is separate from the pure encoding and
+/// mapping laws; no fictitious self-derivation is needed for a root collection.
+/// Use the four [`CollectionStoreExt`] methods at call sites. Explicit foreign
+/// mappings remain available through their `*_with` counterparts.
+pub trait CollectionRealization: CollectionEncoding {
+    /// Ensure all admitted support, or one explicitly selected support.
+    fn ensure<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> impl Future<Output = Result<S::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        S: Store + AsyncBlobStoreAcquire + Send;
+
+    /// Ensure support and carry the target to its deterministic LSM fixed point.
+    fn maintain<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> impl Future<Output = Result<S::Snapshot, CollectionRealizationError>> + Send + '_
+    where
+        S: Store + AsyncBlobStoreAcquire + Send;
+}
+
+impl<T: CollectionDerivation> CollectionRealization for T {
+    async fn ensure<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> Result<S::Snapshot, CollectionRealizationError>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        match support {
+            Some(support) => {
+                store
+                    .ensure_exact_with::<CanonicalDerivation<T>>(target, &support)
+                    .await
+            }
+            None => store.ensure_with::<CanonicalDerivation<T>>(target).await,
+        }
+    }
+
+    async fn maintain<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> Result<S::Snapshot, CollectionRealizationError>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        match support {
+            Some(support) => {
+                store
+                    .maintain_exact_with::<CanonicalDerivation<T>>(target, &support)
+                    .await
+            }
+            None => store.maintain_with::<CanonicalDerivation<T>>(target).await,
+        }
+    }
+}
+
+impl CollectionRealization for SimpleArchive {
+    async fn ensure<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> Result<S::Snapshot, CollectionRealizationError>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        realize_root(store, target, support, false).await
+    }
+
+    async fn maintain<S>(
+        store: &mut S,
+        target: Collection<Self>,
+        support: Option<Support>,
+    ) -> Result<S::Snapshot, CollectionRealizationError>
+    where
+        S: Store + AsyncBlobStoreAcquire + Send,
+    {
+        realize_root(store, target, support, true).await
+    }
+}
+
+async fn realize_root<S>(
+    store: &mut S,
+    target: Collection<SimpleArchive>,
+    support: Option<Support>,
+    compact: bool,
+) -> Result<S::Snapshot, CollectionRealizationError>
+where
+    S: Store + AsyncBlobStoreAcquire,
+{
+    let before = store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("freeze root collection frontier", error)
+    })?;
+    let mut frontier = OperationFrontier::new(before);
+    // The empty cover acquires the descriptor and checks that it really is a
+    // root, before any admitted payload can trigger acquisition.
+    super::exact_derived::ensure_root_in_frontier(store, target, &target.cover([]), &frontier)
+        .await?;
+    let support = match support {
+        Some(support) => support,
+        None => admitted_support_with_acquisition(store, target, &frontier).await?,
+    };
+    super::exact_derived::ensure_root_in_frontier(store, target, &support, &frontier).await?;
+    if compact {
+        super::exact_target_compaction::maintain_target(store, target, &support, &mut frontier)?;
+    }
+    store.snapshot().map_err(|error| {
+        CollectionRealizationError::storage("freeze realized root snapshot", error)
+    })
+}
 
 /// Ergonomic collection operations implemented directly by the backing store.
 ///
@@ -1907,129 +1977,14 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         ))
     }
 
-    /// Acquire the immutable bytes needed to select one bounded admitted support.
-    ///
-    /// `control` supplies the exact collection-record and capability-proof
-    /// frontier. Later store snapshots contribute only blob residency: missing
-    /// descriptors and direct dependencies of authorized
-    /// COMMITs may be acquired by exact content handle without recording WANTs.
-    /// A COMMIT whose complete direct closure still cannot be acquired remains
-    /// semantically invisible in the returned support. Concurrent records and
-    /// proofs remain deferred.
-    ///
-    /// Reusing one `control` snapshot across several calls gives a
-    /// multi-collection operation one common semantic watermark while allowing
-    /// each collection's immutable closure to arrive before its [`Support`] is
-    /// frozen. `control` must have been produced by this same store lineage;
-    /// the trait boundary cannot express that relationship in Rust's type
-    /// system.
-    fn acquire_admitted_support_at<E>(
-        &mut self,
-        target: Collection<E>,
-        control: &Self::Snapshot,
-        instant: hifitime::Epoch,
-    ) -> impl Future<Output = Result<Support, CollectionRealizationError>> + Send + '_
-    where
-        E: CollectionEncoding,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-    {
-        let frontier = OperationFrontier::new(control.clone());
-        async move { admitted_support_with_acquisition(self, target, &frontier, instant).await }
-    }
-
-    /// Acquire one bounded admitted support together with its exact provenance.
-    ///
-    /// This is the provenance-preserving form of
-    /// [`Self::acquire_admitted_support_at`]. The returned COMMITs are selected
-    /// by the same frozen record/proof frontier and authorization decision as
-    /// the support; callers must not reconstruct them from a later snapshot.
-    /// As with the support-only form, `control` must come from this store
-    /// lineage, acquisition records no WANT, and concurrent records and proofs
-    /// remain deferred.
-    fn acquire_admitted_with_commits_at<E>(
-        &mut self,
-        target: Collection<E>,
-        control: &Self::Snapshot,
-        instant: hifitime::Epoch,
-    ) -> impl Future<Output = Result<(Support, Vec<CollectionCommit>), CollectionRealizationError>>
-           + Send
-           + '_
-    where
-        E: CollectionEncoding,
-        Self: Store + AsyncBlobStoreAcquire + Send,
-    {
-        let frontier = OperationFrontier::new(control.clone());
-        async move {
-            admitted_support_and_commits_with_acquisition(self, target, &frontier, instant).await
-        }
-    }
-
-    /// Acquire and enumerate one collection's frozen READ audience.
-    ///
-    /// The collection identity and capability-proof frontier are frozen at
-    /// entry. Its missing content-addressed descriptor is acquired by exact
-    /// handle without recording a WANT. Capability proofs are self-contained,
-    /// so audience evaluation can use the original proof frontier immediately;
-    /// concurrent proof arrival is deliberately deferred to the next call.
-    fn acquire_read_audience_at(
-        &mut self,
-        collection: CollectionHandle,
-        instant: hifitime::Epoch,
-    ) -> impl Future<Output = Result<CollectionReadAudience, CollectionRealizationError>> + Send + '_
-    where
-        Self: Store + AsyncBlobStoreAcquire + Send,
-    {
-        async move {
-            let control = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze READ audience frontier", error)
-            })?;
-            let frontier = OperationFrontier::new(control);
-
-            let mut attempted = BTreeSet::new();
-            loop {
-                let snapshot = self.snapshot().map_err(|error| {
-                    CollectionRealizationError::storage("open bounded READ policy snapshot", error)
-                })?;
-                let bounded = frontier.view(snapshot);
-                let resident = bounded.contains_blob(collection).map_err(|error| {
-                    CollectionRealizationError::storage(
-                        "inspect READ collection descriptor residency",
-                        error,
-                    )
-                })?;
-                if resident {
-                    load_collection_descriptor(&bounded, collection).map_err(|error| {
-                        CollectionRealizationError::Resolution(format!(
-                            "load collection descriptor for active READ audience: {error}"
-                        ))
-                    })?;
-                    break;
-                }
-
-                drop(bounded);
-                let member = Handle::<SimpleArchive>::to_hash(collection);
-                if !super::exact_derived::acquire_missing(self, &mut attempted, member).await? {
-                    return Err(CollectionRealizationError::MissingDependency { member });
-                }
-            }
-
-            let snapshot = self.snapshot().map_err(|error| {
-                CollectionRealizationError::storage("freeze hydrated READ audience snapshot", error)
-            })?;
-            let bounded = frontier.view(snapshot);
-            collection_read_audience_at(&bounded, collection, instant).map_err(|error| {
-                CollectionRealizationError::storage("enumerate hydrated READ audience", error)
-            })
-        }
-    }
-
-    /// Ensure the currently admitted support in one derived collection.
+    /// Ensure the currently admitted support in one collection.
     ///
     /// The initial record/proof frontier and authorization instant are frozen
     /// once. Exact-H acquisition may make those same records semantically
     /// visible in later blob snapshots; concurrent records never extend this
-    /// operation, and no acquisition emits a durable WANT. Only missing
-    /// cross-lattice `DERIVE` work is published. The returned store snapshot
+    /// operation, and no acquisition emits a durable WANT. A root acquires its
+    /// signed support; a derived collection publishes only missing
+    /// cross-lattice `DERIVE` work. The returned store snapshot
     /// observes everything published by this work and by any concurrent
     /// writer before that final observation.
     fn ensure<T>(
@@ -2037,11 +1992,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         target: Collection<T>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
     where
-        T: CollectionDerivation,
+        T: CollectionRealization,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        self.ensure_with::<CanonicalDerivation<T>>(target)
+        T::ensure(self, target, None)
     }
 
     /// Ensure the admitted support through one explicit mapping type.
@@ -2055,13 +2010,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Handle<M::Target>: InlineEncoding,
     {
         async move {
-            let instant = clock::epoch_now();
             let before = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze pre-ensure frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            let support =
-                admitted_support_with_acquisition(self, target, &frontier, instant).await?;
+            let support = admitted_support_with_acquisition(self, target, &frontier).await?;
             super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
@@ -2075,23 +2028,24 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Ensure one explicit foundational support in a derived collection.
+    /// Ensure one explicit foundational support in a collection.
     ///
     /// The target descriptor carries its immediate source, mapping parameters,
-    /// and policy. Existing equations may be reused, but this operation only
-    /// publishes missing `DERIVE` work. Any exact missing dependency may be
-    /// acquired by the live store before the operation gives up.
+    /// and policy. A root acquires the selected payloads. A derived collection
+    /// reuses existing equations and publishes only missing `DERIVE` work.
+    /// Any exact missing dependency may be acquired by the live store before
+    /// the operation gives up.
     fn ensure_exact<T>(
         &mut self,
         target: Collection<T>,
         support: &Support,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
     where
-        T: CollectionDerivation,
+        T: CollectionRealization,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        self.ensure_exact_with::<CanonicalDerivation<T>>(target, support)
+        T::ensure(self, target, Some(support.clone()))
     }
 
     /// Ensure one explicit support through one explicit mapping type.
@@ -2125,7 +2079,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     }
 
     /// Ensure and maintain the currently admitted foundational support in one
-    /// derived collection.
+    /// collection.
     ///
     /// The admitted support is frozen once before work begins. Maintenance has
     /// no caller-visible budget or tuning knob: the encoding's deterministic
@@ -2137,11 +2091,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         target: Collection<T>,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
     where
-        T: CollectionDerivation,
+        T: CollectionRealization,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        self.maintain_with::<CanonicalDerivation<T>>(target)
+        T::maintain(self, target, None)
     }
 
     /// Ensure and maintain the admitted support through an explicit mapping.
@@ -2155,13 +2109,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Handle<M::Target>: InlineEncoding,
     {
         async move {
-            let instant = clock::epoch_now();
             let before = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze pre-maintenance frontier", error)
             })?;
             let mut frontier = OperationFrontier::new(before);
-            let support =
-                admitted_support_with_acquisition(self, target, &frontier, instant).await?;
+            let support = admitted_support_with_acquisition(self, target, &frontier).await?;
             super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
@@ -2183,11 +2135,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         support: &Support,
     ) -> impl Future<Output = Result<Self::Snapshot, CollectionRealizationError>> + Send + '_
     where
-        T: CollectionDerivation,
+        T: CollectionRealization,
         Self: Store + AsyncBlobStoreAcquire + Send,
         Handle<T>: InlineEncoding,
     {
-        self.maintain_exact_with::<CanonicalDerivation<T>>(target, support)
+        T::maintain(self, target, Some(support.clone()))
     }
 
     /// Ensure and maintain one support through an explicit mapping type.

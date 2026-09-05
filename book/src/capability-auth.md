@@ -154,7 +154,8 @@ unbounded `Invoke` proof, and insert that one proof record. Open policies need
 no proof. Under a threshold policy, each participating root issues its own
 proof. More elaborate delegation uses the capability API directly.
 
-`collection_read_audience_at` evaluates every currently stored proof and
+`collection_read_audience(&snapshot, collection)` evaluates every stored proof
+at the snapshot's frozen instant and
 returns the finite restricted audience in canonical key order, including valid
 intermediate delegates. It returns `Open` for an open READ policy because no
 finite key list describes that audience.

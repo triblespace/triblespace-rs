@@ -76,6 +76,7 @@ impl fmt::Debug for ObjectStoreRemote {
 impl fmt::Debug for ObjectStoreSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ObjectStoreSnapshot")
+            .field("instant", &self.instant)
             .field("prefix", &self.prefix)
             .field("blob_count", &self.blobs.len())
             .field("collection_record_count", &self.collection_records.len())
@@ -92,6 +93,7 @@ impl fmt::Debug for ObjectStoreSnapshot {
 /// inserted after the observation cannot leak into it through a later GET.
 #[derive(Clone)]
 pub struct ObjectStoreSnapshot {
+    instant: hifitime::Epoch,
     store: Arc<dyn ObjectStore>,
     prefix: Path,
     blobs: Arc<BTreeMap<RawInline, ObservedBlob>>,
@@ -105,6 +107,10 @@ struct ObservedBlob {
 }
 
 impl StoreSnapshot for ObjectStoreSnapshot {
+    fn instant(&self) -> hifitime::Epoch {
+        self.instant
+    }
+
     fn changes_since(&self, previous: &Self) -> StoreChanges {
         let mut changes = StoreChanges::NONE;
         if self.blobs != previous.blobs {
@@ -184,8 +190,9 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
     type Snapshot = ObjectStoreSnapshot;
     type SnapshotError = ObjectStoreSnapshotError;
 
-    fn snapshot(
+    fn snapshot_at(
         &mut self,
+        instant: hifitime::Epoch,
     ) -> impl Future<Output = Result<Self::Snapshot, Self::SnapshotError>> + Send {
         async move {
             // Observe semantic records before blobs. Under the normal
@@ -223,6 +230,7 @@ impl AsyncSnapshotSource for ObjectStoreRemote {
             }
 
             Ok(ObjectStoreSnapshot {
+                instant,
                 store: self.store.clone(),
                 prefix: self.prefix.clone(),
                 blobs: Arc::new(blobs),
@@ -828,7 +836,17 @@ mod tests {
     fn blob_get_is_gated_by_frozen_snapshot_membership() {
         block_on(async {
             let mut store = remote();
-            let before = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
+            let instant = hifitime::Epoch::from_tai_seconds(10.0);
+            let before = AsyncSnapshotSource::snapshot_at(&mut store, instant)
+                .await
+                .unwrap();
+            let later_instant = hifitime::Epoch::from_tai_seconds(20.0);
+            let unchanged = AsyncSnapshotSource::snapshot_at(&mut store, later_instant)
+                .await
+                .unwrap();
+            assert_eq!(before.clone().instant(), instant);
+            assert_eq!(unchanged.instant(), later_instant);
+            assert_eq!(unchanged.changes_since(&before), StoreChanges::NONE);
             let bytes = Bytes::from_source(b"arrived after snapshot".to_vec());
             let handle = AsyncBlobStorePut::put::<RawBytes, _>(&mut store, bytes.clone())
                 .await

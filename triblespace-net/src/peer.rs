@@ -15,9 +15,7 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use iroh_base::EndpointId;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
-use triblespace_core::collection::{
-    CollectionHandle, CollectionStore, next_authorization_change_at,
-};
+use triblespace_core::collection::{CollectionHandle, CollectionStore, next_authorization_change};
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::InlineEncoding;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -283,7 +281,14 @@ where
 
     /// Drain pending network evidence and publish one coherent store snapshot.
     pub fn try_refresh(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
-        let result = self.refresh_checked();
+        self.try_refresh_at(crate::clock::epoch_now())
+    }
+
+    fn try_refresh_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+        let result = self.refresh_checked(instant);
         if result.is_err() {
             self.sender.clear_snapshot();
             self.last_store_snapshot = None;
@@ -294,7 +299,10 @@ where
         result
     }
 
-    fn refresh_checked(&mut self) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
+    fn refresh_checked(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
         let mut incoming = Vec::new();
         for _ in 0..MAX_ADMISSION_BRIDGE_BATCHES {
             let Some(event) = self.receiver.try_recv() else {
@@ -371,7 +379,7 @@ where
             }
         }
         if !self.pending_network_flush {
-            let snapshot = match store.snapshot() {
+            let snapshot = match store.snapshot_at(instant) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
                     tracing::warn!(
@@ -391,7 +399,7 @@ where
                         snapshot.changes_since(previous)
                     })
             };
-            let now = crate::clock::epoch_now();
+            let now = snapshot.instant();
             let authorization_inputs_changed = changes.contains(StoreChanges::BLOBS)
                 || changes.contains(StoreChanges::COLLECTION_RECORDS)
                 || changes.contains(StoreChanges::CAPABILITY_PROOFS);
@@ -413,7 +421,7 @@ where
                 if !authorization_inputs_changed && !authorization_changed {
                     self.last_authorization_change
                 } else {
-                    next_authorization_change_at(&snapshot, now)
+                    next_authorization_change(&snapshot)
                         .map_err(anyhow::Error::new)
                         .map_err(PeerSnapshotError::Overlay)?
                 };
@@ -430,7 +438,6 @@ where
                 changes,
                 authorization_changed,
                 next_authorization_change,
-                now,
             )
             .map_err(PeerSnapshotError::Overlay)?;
             let serves_collections = self.qos.direction.serves();
@@ -635,10 +642,13 @@ where
     type Snapshot = S::Snapshot;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
-    fn snapshot(&mut self) -> Result<Self::Snapshot, Self::SnapshotError> {
-        self.try_refresh()?;
+    fn snapshot_at(
+        &mut self,
+        instant: hifitime::Epoch,
+    ) -> Result<Self::Snapshot, Self::SnapshotError> {
+        self.try_refresh_at(instant)?;
         let mut store = self.store.lock().expect("store mutex");
-        store.snapshot().map_err(PeerSnapshotError::Store)
+        store.snapshot_at(instant).map_err(PeerSnapshotError::Store)
     }
 }
 
@@ -666,6 +676,37 @@ mod tests {
         }
 
         assert_live_collection_store::<Peer<MemoryRepo>>();
+    }
+
+    #[test]
+    fn snapshot_at_preserves_the_chosen_instant_through_peer_refresh() {
+        let key = SigningKey::from_bytes(&[89; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(id);
+        let observer = sender.clone();
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let instant = hifitime::Epoch::from_tai_seconds(15.0);
+
+        let snapshot = peer.snapshot_at(instant).unwrap();
+
+        assert_eq!(snapshot.instant(), instant);
+        assert_eq!(
+            peer.last_store_snapshot.as_ref().unwrap().instant(),
+            instant
+        );
+        assert_eq!(snapshot.clone().instant(), instant);
+
+        let serving = observer.current_snapshot().unwrap();
+        let later_instant = hifitime::Epoch::from_tai_seconds(16.0);
+        let later = peer.snapshot_at(later_instant).unwrap();
+        assert_eq!(later.instant(), later_instant);
+        assert_eq!(later.changes_since(&snapshot), StoreChanges::NONE);
+        assert!(Arc::ptr_eq(&serving, &observer.current_snapshot().unwrap()));
     }
 
     #[tokio::test]

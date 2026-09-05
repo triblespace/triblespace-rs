@@ -32,7 +32,7 @@ use crate::bearer::{BearerLocatorIndex, blob_locator, locator_index, update_loca
 use crate::channel::{NetCommand, NetEvent, NetEventBatch, SnapshotNotice};
 use crate::collection_activation::{
     CollectionReadBootstrapError, CollectionRepairOverlay, CollectionRepairOverlayError,
-    collection_read_bootstrap_proofs_at, collection_repair_overlay,
+    collection_read_bootstrap_proofs, collection_repair_overlay,
 };
 use crate::collection_session::{pull_collection, serve_collection_repair};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
@@ -138,11 +138,11 @@ impl StoreSnapshot {
         changes: StoreChanges,
         authorization_changed: bool,
         next_authorization_change: Option<hifitime::Epoch>,
-        instant: hifitime::Epoch,
     ) -> anyhow::Result<Self>
     where
         R: StoreRead + Clone,
     {
+        let instant = snapshot.instant();
         let mut collections = CollectionSnapshotIndex::new();
         let bearer_locators = match (previous_store, previous) {
             (Some(previous_store), Some(previous)) if changes.contains(StoreChanges::BLOBS) => {
@@ -159,8 +159,7 @@ impl StoreSnapshot {
             Arc::new(CloneableBlobSnapshotReader(Mutex::new(snapshot.clone())));
         let repair_inputs_changed = changes.contains(StoreChanges::BLOBS)
             || changes.contains(StoreChanges::COLLECTION_RECORDS)
-            || changes.contains(StoreChanges::CAPABILITY_PROOFS)
-            || authorization_changed;
+            || changes.contains(StoreChanges::CAPABILITY_PROOFS);
         for raw in active.iter_ordered() {
             let collection = CollectionHandle::new(*raw);
             if snapshot
@@ -170,7 +169,10 @@ impl StoreSnapshot {
                 warn!(collection = %hex::encode(&collection.raw[..4]), "active collection descriptor unavailable; isolating pending collection");
                 continue;
             }
-            let prior = previous.and_then(|prior| prior.collection(collection));
+            // Expiry invalidates the serving lease, not its immutable record
+            // and proof PATCHes. Reuse those internally without bypassing the
+            // time gate on any externally served collection lookup.
+            let prior = previous.and_then(|prior| prior.collections.get(&collection.raw).cloned());
             let repair_result = if !repair_inputs_changed {
                 prior
                     .as_ref()
@@ -201,12 +203,11 @@ impl StoreSnapshot {
             {
                 prior.as_ref().unwrap().read_bootstrap.clone()
             } else {
-                match collection_read_bootstrap_proofs_at(
+                match collection_read_bootstrap_proofs(
                     &snapshot,
                     collection,
                     local,
                     MAX_COLLECTION_READ_BOOTSTRAP_PROOFS,
-                    instant,
                 ) {
                     Ok(evidence) => evidence.into(),
                     Err(CollectionReadBootstrapError::TooMany { count, limit }) => {
@@ -1942,6 +1943,130 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn authorization_expiry_reuses_raw_repair_and_refreshes_snapshot_bootstrap() {
+        use std::sync::Arc;
+
+        use hifitime::Epoch;
+        use triblespace_core::capability::{
+            Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+            CapabilityValidity,
+        };
+        use triblespace_core::collection::{
+            ACTION_READ, AdmissionPolicy, CollectionPolicy, CollectionStoreExt,
+            next_authorization_change,
+        };
+        use triblespace_core::repo::memoryrepo::MemoryRepo;
+        use triblespace_core::repo::{
+            CapabilityProofStore, SnapshotSource, StoreChanges, StoreSnapshot as _,
+        };
+
+        let root = SigningKey::from_bytes(&[97; 32]);
+        let reader = SigningKey::from_bytes(&[98; 32]).verifying_key();
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "snapshot-bootstrap-expiry",
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(root.verifying_key()),
+                    AdmissionPolicy::Open,
+                ),
+            )
+            .unwrap();
+        let proof = CapabilityProof::issue_root(
+            &root,
+            CapabilityResource::from(collection.handle()),
+            Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+            Some(
+                CapabilityValidity::new(
+                    Epoch::from_tai_seconds(10.0),
+                    Epoch::from_tai_seconds(20.0),
+                )
+                .unwrap(),
+            ),
+            reader,
+        );
+        store.insert_proof(proof.clone()).unwrap();
+        let mut active = super::ActiveCollections::new();
+        active.insert(&super::PatchEntry::new(&collection.handle().raw));
+
+        let before = store.snapshot_at(Epoch::from_tai_seconds(15.0)).unwrap();
+        let serving_before = super::StoreSnapshot::from_store_changes(
+            before.clone(),
+            &active,
+            reader,
+            None,
+            None,
+            StoreChanges::ALL,
+            false,
+            next_authorization_change(&before).unwrap(),
+        )
+        .unwrap();
+        let before_collection = serving_before
+            .collections
+            .get(&collection.handle().raw)
+            .unwrap();
+        assert_eq!(serving_before.observed_at, before.instant());
+        assert_eq!(before_collection.read_bootstrap.as_ref(), &[proof.clone()]);
+
+        let after = store.snapshot_at(Epoch::from_tai_seconds(21.0)).unwrap();
+        let changes = after.changes_since(&before);
+        assert_eq!(changes, StoreChanges::NONE);
+        let serving_after = super::StoreSnapshot::from_store_changes(
+            after.clone(),
+            &active,
+            reader,
+            Some(&before),
+            Some(&serving_before),
+            changes,
+            true,
+            next_authorization_change(&after).unwrap(),
+        )
+        .unwrap();
+        let after_collection = serving_after
+            .collections
+            .get(&collection.handle().raw)
+            .unwrap();
+        assert_eq!(serving_after.observed_at, after.instant());
+        assert!(after_collection.read_bootstrap.is_empty());
+        assert!(Arc::ptr_eq(
+            &before_collection.repair,
+            &after_collection.repair,
+        ));
+        assert_eq!(before_collection.wake_root(), after_collection.wake_root());
+
+        let rollback = store.snapshot_at(before.instant()).unwrap();
+        let serving_rollback = super::StoreSnapshot::from_store_changes(
+            rollback.clone(),
+            &active,
+            reader,
+            Some(&after),
+            Some(&serving_after),
+            rollback.changes_since(&after),
+            true,
+            next_authorization_change(&rollback).unwrap(),
+        )
+        .unwrap();
+        let rollback_collection = serving_rollback
+            .collections
+            .get(&collection.handle().raw)
+            .unwrap();
+        assert_eq!(
+            rollback_collection.read_bootstrap.as_ref(),
+            &[proof.clone()]
+        );
+        assert!(Arc::ptr_eq(
+            &after_collection.repair,
+            &rollback_collection.repair,
+        ));
+        assert_eq!(
+            super::collection_read_bootstrap_proofs(&before, collection.handle(), reader, 1)
+                .unwrap(),
+            [proof],
+            "rereading the earlier snapshot retains its authorization instant",
+        );
     }
 
     #[test]
