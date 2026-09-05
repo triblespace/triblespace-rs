@@ -1977,14 +1977,17 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         ))
     }
 
-    /// Ensure the currently admitted support in one collection.
+    /// Ensure the currently available input of one collection.
     ///
     /// The initial record/proof frontier and authorization instant are frozen
     /// once. Exact-H acquisition may make those same records semantically
     /// visible in later blob snapshots; concurrent records never extend this
     /// operation, and no acquisition emits a durable WANT. A root acquires its
-    /// signed support; a derived collection publishes only missing
-    /// cross-lattice `DERIVE` work. The returned store snapshot
+    /// signed support; a derived collection selects only the admitted support
+    /// already realized by its immediate source and publishes missing
+    /// cross-lattice `DERIVE` work for that support. Missing source artifacts
+    /// remain invisible rather than becoming downstream obligations.
+    /// The returned store snapshot
     /// observes everything published by this work and by any concurrent
     /// writer before that final observation.
     fn ensure<T>(
@@ -1999,7 +2002,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         T::ensure(self, target, None)
     }
 
-    /// Ensure the admitted support through one explicit mapping type.
+    /// Ensure resident, admitted immediate-source support through one mapping.
     fn ensure_with<M>(
         &mut self,
         target: Collection<M::Target>,
@@ -2013,8 +2016,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let before = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze pre-ensure frontier", error)
             })?;
+            let support = super::exact_derived::source_support::<_, M>(&before, target)?;
             let mut frontier = OperationFrontier::new(before);
-            let support = admitted_support_with_acquisition(self, target, &frontier).await?;
             super::exact_derived::ensure_exact_in_frontier_with::<Self, M>(
                 self,
                 target,
@@ -2078,10 +2081,11 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         }
     }
 
-    /// Ensure and maintain the currently admitted foundational support in one
-    /// collection.
+    /// Ensure and maintain the currently available input of one collection.
     ///
-    /// The admitted support is frozen once before work begins. Maintenance has
+    /// A derived target selects the admitted support already realized by its
+    /// immediate source; a root acquires its own admitted support. The chosen
+    /// support is frozen once before work begins. Maintenance has
     /// no caller-visible budget or tuning knob: the encoding's deterministic
     /// size-tier rule runs to its stable LSM fixed point, publishing each
     /// useful carry independently on the way. The live store may acquire exact
@@ -2098,7 +2102,7 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         T::maintain(self, target, None)
     }
 
-    /// Ensure and maintain the admitted support through an explicit mapping.
+    /// Maintain resident, admitted immediate-source support through one mapping.
     fn maintain_with<M>(
         &mut self,
         target: Collection<M::Target>,
@@ -2112,8 +2116,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
             let before = self.snapshot().map_err(|error| {
                 CollectionRealizationError::storage("freeze pre-maintenance frontier", error)
             })?;
+            let support = super::exact_derived::source_support::<_, M>(&before, target)?;
             let mut frontier = OperationFrontier::new(before);
-            let support = admitted_support_with_acquisition(self, target, &frontier).await?;
             super::exact_derived::maintain_exact_in_frontier_with::<Self, M>(
                 self,
                 target,

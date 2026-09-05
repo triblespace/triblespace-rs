@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Ordinary derived `ensure` and `maintain` select the admitted support already
+  realized by their immediate source. A new foundational commit, an unbuilt
+  intermediate member, or a dangling source equation no longer makes a
+  downstream maintenance call fail or construct upstream work. Explicit
+  `*_exact` requests retain their strict support requirement.
 - Add `Peer::lazy` over the existing store adapter. Resident reads, snapshots,
   writes, and durability boundaries start no host and build no serving inventory;
   a missing exact-handle acquisition or explicit activation starts networking

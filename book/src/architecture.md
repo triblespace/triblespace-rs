@@ -217,17 +217,20 @@ f(a ⊔ b) = f(a) ⊔ f(b)
 That law makes equations on either side of the mapping reusable evidence.
 Construction and representation maintenance are separate operations. The
 foundational support is always `Support = Cover<SimpleArchive>`: the admitted
-committed payloads at the root of the descriptor lineage. That support remains
-unchanged across every mapping hop. A multi-hop derivation therefore invokes
-each mapping explicitly with the same support rather than passing an
-intermediate physical cover downstream.
+committed payloads at the root of the descriptor lineage. Mapping and merging
+never change those denotational coordinates. Ordinary multi-hop maintenance
+invokes each mapping in order over whatever its immediate source already
+realizes. Explicit support is needed only when the caller requires matching
+representations of a chosen support; it is never an intermediate physical cover.
 
 `ensure` and `ensure_exact` are live asynchronous store operations. For a root
 `SimpleArchive` collection, they acquire missing blobs for admitted or explicit
-foundational support without publishing equations. For a derived target, they
-reuse resident target nodes and stored equations, acquire any exact missing
-blob dependencies the store can supply, and publish only missing `DERIVE` work
-for their one immediate mapping. Neither operation creates a `MERGE`, computes
+foundational support without publishing equations. For a derived target,
+ordinary `ensure` selects the admitted support already realized by resident
+immediate-source members; `ensure_exact` instead requires the explicit support.
+Both reuse resident target nodes and stored equations, acquire exact missing
+dependencies for selected work, and publish only missing `DERIVE` work for
+their one immediate mapping. Neither operation creates a `MERGE`, computes
 an upstream blob, or emits a durable `WANT`. `maintain` and `maintain_exact` first
 perform that same realization work and then repeatedly join target members in the
 deterministic dyadic serialized-size tiers. A target join whose exact immutable
@@ -259,8 +262,9 @@ join computes the same union, but its result names the exact raw Succinct union
 as an immutable child. It may consume that raw union when the blob is already
 resident; it never creates the upstream raw blob or its `MERGE` record. If the
 child is absent, target maintenance leaves the exact finer accelerated cover
-in place. A caller which wants both lattices compact invokes their mapping hops
-explicitly, in order, with the same foundational support. A cover-aware view
+in place. A caller which wants both lattices compact invokes ordinary maintenance
+on their mapping hops explicitly, in order. Exact requests can instead pin the
+same foundational support across both hops. A cover-aware view
 follows each embedded handle through its store snapshot, validates the exact
 raw/index pair, and only then builds the transient query runtime. A root whose
 raw child is absent is not a usable query value.

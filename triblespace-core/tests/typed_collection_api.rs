@@ -1,6 +1,7 @@
 use ed25519_dalek::SigningKey;
 use futures::executor::block_on;
 use hifitime::Epoch;
+use std::collections::BTreeSet;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
@@ -13,14 +14,15 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionPolicy, CollectionRead, CollectionRecord,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionPolicy, CollectionRead,
+    CollectionRealizationError, CollectionRecord, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StoreChanges,
-    StoreSnapshot,
+    BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
+    StoreChanges, StoreSnapshot, WantRead,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -146,6 +148,29 @@ fn exact_apis_accept_a_derived_source_encoding() {
 
     let snapshot = store.snapshot_at(Epoch::from_tai_seconds(0.0)).unwrap();
     let support = source.admitted(&snapshot).unwrap();
+    // Explicit support is a strict obligation, even when no immediate-source
+    // member realizes it yet. Neither exact operation may construct raw input.
+    for compact in [false, true] {
+        let result = if compact {
+            block_on(store.maintain_exact(accelerated, &support))
+        } else {
+            block_on(store.ensure_exact(accelerated, &support))
+        };
+        match result {
+            Err(CollectionRealizationError::IncompleteCover {
+                unsupported_members,
+                ..
+            }) => assert_eq!(
+                unsupported_members,
+                support
+                    .members()
+                    .map(Handle::<SimpleArchive>::to_hash)
+                    .collect::<Vec<_>>()
+            ),
+            Err(error) => panic!("unexpected exact-source error: {error}"),
+            Ok(_) => panic!("exact Rank9 realization must not construct its missing raw input"),
+        }
+    }
     block_on(store.ensure_exact(raw, &support)).unwrap();
     let ensured = block_on(store.ensure_exact(accelerated, &support)).unwrap();
     let observed = ensured.collection_exact(accelerated, &support).unwrap();
@@ -159,6 +184,281 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap();
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
+}
+
+#[test]
+fn ordinary_derived_operations_use_only_resident_immediate_source_support() {
+    // Exercise ensure and maintain independently, with no pre-existing Rank9
+    // realization that could hide a request for unsupported foundation data.
+    for compact in [false, true] {
+        let authority = SigningKey::from_bytes(&[50; 32]);
+        let policy = CollectionPolicy::new(
+            AdmissionPolicy::direct(authority.verifying_key()),
+            AdmissionPolicy::direct(authority.verifying_key()),
+        );
+        let first = one_fact(21);
+        let second = one_fact(22);
+        let third = one_fact(23);
+        let third_blob: Blob<SimpleArchive> = third.clone().to_blob();
+        let raw_third = succinctarchive_union::derive_element(&third_blob)
+            .unwrap()
+            .get_handle();
+        let expected_initial: TribleSet = first.iter().chain(second.iter()).copied().collect();
+        let expected_final: TribleSet = expected_initial
+            .iter()
+            .chain(third.iter())
+            .copied()
+            .collect();
+        let mut store = MemoryRepo::default();
+        let source = store
+            .collection("typed-api-immediate-source", policy.clone())
+            .unwrap();
+        let raw = store
+            .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+            .unwrap();
+        let accelerated = store
+            .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
+            .unwrap();
+        for facts in [first, second] {
+            store
+                .commit(source, &authority, Fragment::from(facts))
+                .unwrap();
+        }
+        let warmed = block_on(store.maintain(raw)).unwrap();
+        let initial_support = source.admitted(&warmed).unwrap();
+        assert_eq!(initial_support.len(), 2);
+        assert_eq!(warmed.collection(raw).unwrap().support(), &initial_support);
+
+        store
+            .commit(source, &authority, Fragment::from(third))
+            .unwrap();
+        let before = store.snapshot().unwrap();
+        let full_support = source.admitted(&before).unwrap();
+        assert_eq!(full_support.len(), 3);
+        assert_eq!(before.collection(raw).unwrap().support(), &initial_support);
+        assert!(!before.contains_blob(raw_third).unwrap());
+        let records_before = before
+            .records()
+            .unwrap()
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap();
+
+        let after = if compact {
+            block_on(store.maintain(accelerated))
+        } else {
+            block_on(store.ensure(accelerated))
+        }
+        .expect("ordinary Rank9 work must stop at the resident raw-source frontier");
+        let observed = after.collection(accelerated).unwrap();
+        assert_eq!(observed.support(), &initial_support);
+        assert_eq!(
+            observed
+                .view::<UnionArchive<OrderedUniverse>>()
+                .unwrap()
+                .iter()
+                .collect::<TribleSet>(),
+            expected_initial
+        );
+        assert_eq!(after.collection(raw).unwrap().support(), &initial_support);
+        assert!(!after.contains_blob(raw_third).unwrap());
+        assert_eq!(after.wants().unwrap().count(), 0);
+        let records_after = after
+            .records()
+            .unwrap()
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(records_before.is_subset(&records_after));
+        for record in records_after.difference(&records_before) {
+            let collection = match record {
+                CollectionRecord::Derive(record) => record.collection(),
+                CollectionRecord::Merge(record) => record.collection(),
+                CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+            };
+            assert_eq!(
+                collection,
+                accelerated.handle(),
+                "upstream equation published"
+            );
+        }
+
+        let raw_after = block_on(store.maintain(raw)).unwrap();
+        assert_eq!(raw_after.collection(raw).unwrap().support(), &full_support);
+        let caught_up = block_on(store.maintain(accelerated)).unwrap();
+        let observed = caught_up.collection(accelerated).unwrap();
+        assert_eq!(observed.support(), &full_support);
+        assert_eq!(
+            observed
+                .view::<UnionArchive<OrderedUniverse>>()
+                .unwrap()
+                .iter()
+                .collect::<TribleSet>(),
+            expected_final
+        );
+        assert_eq!(warmed.collection(raw).unwrap().support(), &initial_support);
+    }
+}
+
+#[test]
+fn ordinary_derived_operations_ignore_pending_immediate_source_output() {
+    let authority = SigningKey::from_bytes(&[51; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let first = one_fact(24);
+    let later = one_fact(25);
+    let later_blob: Blob<SimpleArchive> = later.clone().to_blob();
+    let missing_raw = succinctarchive_union::derive_element(&later_blob)
+        .unwrap()
+        .get_handle();
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection("typed-api-pending-immediate-source", policy.clone())
+        .unwrap();
+    let raw = store
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let accelerated = store
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
+        .unwrap();
+    store
+        .commit(source, &authority, Fragment::from(first.clone()))
+        .unwrap();
+    let warmed = block_on(store.maintain(raw)).unwrap();
+    let initial_support = source.admitted(&warmed).unwrap();
+    let later_commit = store
+        .commit(source, &authority, Fragment::from(later))
+        .unwrap();
+    let pending = CollectionDerive::new(
+        raw.handle(),
+        later_commit.data(),
+        Handle::<SuccinctArchiveBlob>::to_hash(missing_raw),
+    );
+    store.insert(CollectionRecord::Derive(pending)).unwrap();
+    let before = store.snapshot().unwrap();
+    assert_eq!(source.admitted(&before).unwrap().len(), 2);
+    assert_eq!(before.collection(raw).unwrap().support(), &initial_support);
+    assert!(!before.contains_blob(missing_raw).unwrap());
+    let records_before = before
+        .records()
+        .unwrap()
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert!(records_before.contains(&CollectionRecord::Derive(pending)));
+
+    for compact in [false, true] {
+        let after = if compact {
+            block_on(store.maintain(accelerated))
+        } else {
+            block_on(store.ensure(accelerated))
+        }
+        .expect("a dangling raw output is not a required Rank9 input");
+        let observed = after.collection(accelerated).unwrap();
+        assert_eq!(observed.support(), &initial_support);
+        assert_eq!(
+            observed
+                .view::<UnionArchive<OrderedUniverse>>()
+                .unwrap()
+                .iter()
+                .collect::<TribleSet>(),
+            first
+        );
+        assert_eq!(after.collection(raw).unwrap().support(), &initial_support);
+        assert!(!after.contains_blob(missing_raw).unwrap());
+        let records_after = after
+            .records()
+            .unwrap()
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap();
+        assert!(records_before.is_subset(&records_after));
+        for record in records_after.difference(&records_before) {
+            let collection = match record {
+                CollectionRecord::Derive(record) => record.collection(),
+                CollectionRecord::Merge(record) => record.collection(),
+                CollectionRecord::Commit(_) => panic!("downstream work must not author roots"),
+            };
+            assert_eq!(
+                collection,
+                accelerated.handle(),
+                "pending source work was repaired"
+            );
+        }
+        assert_eq!(after.wants().unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn ordinary_derived_operations_exclude_resident_but_unauthorized_source_members() {
+    let authority = SigningKey::from_bytes(&[52; 32]);
+    let unauthorized = SigningKey::from_bytes(&[53; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let admitted = one_fact(26);
+    let denied = one_fact(27);
+    let denied_blob: Blob<SimpleArchive> = denied.clone().to_blob();
+    let denied_raw_blob = succinctarchive_union::derive_element(&denied_blob).unwrap();
+    let denied_raw = denied_raw_blob.get_handle();
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection("typed-api-unauthorized-immediate-source", policy.clone())
+        .unwrap();
+    let raw = store
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let accelerated = store
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
+        .unwrap();
+    store
+        .commit(source, &authority, Fragment::from(admitted.clone()))
+        .unwrap();
+    let warmed = block_on(store.maintain(raw)).unwrap();
+    let admitted_support = source.admitted(&warmed).unwrap();
+
+    // Reusable physical work does not confer WRITE authority on its root.
+    let denied_commit = store
+        .commit(source, &unauthorized, Fragment::from(denied))
+        .unwrap();
+    store
+        .put::<SuccinctArchiveBlob, _>(denied_raw_blob)
+        .unwrap();
+    store
+        .insert(CollectionRecord::Derive(CollectionDerive::new(
+            raw.handle(),
+            denied_commit.data(),
+            Handle::<SuccinctArchiveBlob>::to_hash(denied_raw),
+        )))
+        .unwrap();
+    let before = store.snapshot().unwrap();
+    assert!(before.contains_blob(denied_raw).unwrap());
+    assert_eq!(source.admitted(&before).unwrap(), admitted_support);
+    assert_eq!(before.collection(raw).unwrap().support(), &admitted_support);
+
+    for compact in [false, true] {
+        let after = if compact {
+            block_on(store.maintain(accelerated))
+        } else {
+            block_on(store.ensure(accelerated))
+        }
+        .unwrap();
+        let observed = after.collection(accelerated).unwrap();
+        assert_eq!(observed.support(), &admitted_support);
+        assert_eq!(
+            observed
+                .view::<UnionArchive<OrderedUniverse>>()
+                .unwrap()
+                .iter()
+                .collect::<TribleSet>(),
+            admitted
+        );
+        assert!(!after.records().unwrap().any(|record| matches!(
+            record.unwrap(),
+            CollectionRecord::Derive(record)
+                if record.collection() == accelerated.handle()
+                    && record.input() == Handle::<SuccinctArchiveBlob>::to_hash(denied_raw)
+        )));
+    }
 }
 
 #[test]

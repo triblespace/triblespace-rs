@@ -341,19 +341,26 @@ let accelerated = storage.derive::<Rank9AcceleratedSuccinctArchiveBlob>(
     accelerated_policy,
 )?;
 
-let ready = storage.ensure(source).await?;
-let support = source.admitted(&ready)?;
-drop(ready);
+storage.ensure(source).await?;
+storage.maintain(raw).await?;
+let after = storage.maintain(accelerated).await?;
 
-// Each edge receives the same foundational Support. Work never flows upward.
-storage
-    .maintain_exact(raw, &support)
-    .await?;
-let after = storage.maintain_exact(accelerated, &support).await?;
-
-let observed = after.collection_exact(accelerated, &support)?;
+let observed = after.collection(accelerated)?;
 let facts: UnionArchive<OrderedUniverse> = observed.view()?;
 ```
+
+Each ordinary mapping call selects only the admitted support already realized
+by its immediate source in the call's initial snapshot. If a new commit arrives
+after raw maintenance, accelerated maintenance processes the raw members which
+exist; it does not demand an unbuilt raw image of that new commit. A later pass
+advances the two lattices again. Source support is still expressed in the same
+foundational coordinates; only the selection of currently usable input changes.
+
+When a caller specifically needs matching representations for one selected
+support, use `maintain_exact(raw, &support)` and
+`maintain_exact(accelerated, &support)`, then
+`collection_exact(accelerated, &support)`. Those are explicit requirements,
+not necessary boilerplate for an ordinary multi-hop read.
 
 - `ensure(source)` freezes collection records, capability proofs, and the
   authorization instant before acquiring exact missing descriptor, data, and
@@ -364,9 +371,11 @@ let facts: UnionArchive<OrderedUniverse> = observed.view()?;
   performs no acquisition or collection algebra and binds only the maximal
   resident target cover visible in that immutable snapshot.
   `collection_exact` requires a complete realization for explicit support.
-- `ensure` freezes the currently admitted foundational support, while
-  `ensure_exact` accepts explicit support. For derived targets they publish
-  only missing `DERIVE` work; both return a fresh store snapshot.
+- For a derived target, `ensure` freezes the resident, admitted realization of
+  its immediate source, while `ensure_exact` accepts explicit foundational
+  support. Both publish only missing `DERIVE` work and return a fresh store
+  snapshot. Missing source members are invisible to ordinary selection, but
+  remain unsatisfied obligations when explicitly requested.
 - `maintain` and `maintain_exact` additionally carry colliding target members
   by serialized-size tier. They also return a fresh store snapshot.
 

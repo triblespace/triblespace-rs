@@ -268,6 +268,32 @@ where
     Ok(load_lineage(snapshot, target)?.foundation)
 }
 
+/// Select the admitted support actually realized by a mapping's immediate source.
+///
+/// An unbuilt or nonresident source member is not an obligation of ordinary
+/// downstream maintenance. Exact requests still specify their own support.
+pub(crate) fn source_support<R, M>(
+    snapshot: &R,
+    target: Collection<M::Target>,
+) -> Result<Support, CollectionRealizationError>
+where
+    R: StoreRead,
+    M: CollectionMapping,
+{
+    let lineage = load_lineage(snapshot, target)?;
+    let source = lineage
+        .source_by_target
+        .get(&target.handle())
+        .copied()
+        .ok_or_else(|| {
+            CollectionRealizationError::Resolution(
+                "maintenance requires a derived target descriptor".to_owned(),
+            )
+        })?;
+    let (support, _) = attach_collection(snapshot, Collection::<M::Source>::from_handle(source))?;
+    Ok(support)
+}
+
 fn require_support(lineage: &Lineage, support: &Support) -> Result<(), CollectionRealizationError> {
     if support.collection() == lineage.foundation {
         return Ok(());

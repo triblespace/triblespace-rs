@@ -878,7 +878,7 @@ fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
 }
 
 #[test]
-fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
+fn ordinary_derived_ensure_leaves_cold_source_records_for_explicit_root_acquisition() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);
     let metadata = inner
@@ -908,14 +908,25 @@ fn async_ensure_hydrates_only_the_bounded_admitted_commit_frontier() {
 
     let snapshot = block_on(store.ensure(first)).unwrap();
 
-    assert_eq!(store.acquired, vec![data(&source)]);
+    assert!(store.acquired.is_empty());
     assert_eq!(snapshot.wants().unwrap().count(), 0);
     let observed = snapshot.collection(first).unwrap();
-    assert_eq!(
-        observed.support().data_members().collect::<Vec<_>>(),
-        vec![data(&source)]
-    );
-    assert_eq!(observed.cover().len(), 1);
+    assert!(observed.support().is_empty());
+    assert!(observed.cover().is_empty());
+    drop(observed);
+    drop(snapshot);
+
+    // Acquisition belongs to the root. The subsequent downstream operation
+    // observes its own immediate-source snapshot, including the concurrently
+    // published member now that both inputs are resident and admitted.
+    drop(block_on(store.ensure(root)).unwrap());
+    assert_eq!(store.acquired, vec![data(&source)]);
+    assert!(store.inject_record_on_acquire.is_none());
+    let snapshot = block_on(store.ensure(first)).unwrap();
+    let observed = snapshot.collection(first).unwrap();
+    assert_eq!(observed.support(), &support(root, &[source, concurrent]));
+    assert_eq!(observed.cover().len(), 2);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
 }
 
 #[test]
