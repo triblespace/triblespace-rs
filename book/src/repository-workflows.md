@@ -259,10 +259,11 @@ is itself only an explicit durable demand record, never automatic cache-miss
 bookkeeping.
 
 The four live store operations are asynchronous even for local stores. They may
-fetch only exact missing handles in the operation's frozen raw frontier,
-publish derived work, and return a fresh snapshot; they never emit `WANT`.
-Local stores implement the same contract with immediately ready acquisition
-from their resident snapshot, while a networked store may await exact-H fetch.
+fetch exact missing blobs named by frozen records, explicit support, or immutable
+dependencies needed for the work, publish target collection equations, and
+return a fresh snapshot; they never emit `WANT`. Local stores implement the same
+contract with immediately ready acquisition from their resident snapshot, while
+a networked store may await exact-H fetch.
 
 Exact replay does not need a publishing key, re-run admission, or retain any
 signed commit or metadata. The typed cover names the exact descriptor and
