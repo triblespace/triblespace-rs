@@ -706,13 +706,14 @@ mod tests {
             descriptor::mapping_algorithm(first.facts()),
             Ok(Some(LATEST_STATES_MAPPING_V1))
         );
+        let observes: Inline<GenId> = metadata::supersedes.id().to_inline();
         assert_eq!(
             descriptor::mapping_argument(first.facts(), register_observes.id()),
-            Ok(Some(metadata::supersedes.id().to_inline().raw))
+            Ok(Some(observes.raw))
         );
         let predecessor = ufoid();
         let successor = ufoid();
-        let archive = edge(&successor, &predecessor).to_blob();
+        let archive: Blob<SimpleArchive> = edge(&successor, &predecessor).to_blob();
         let other_edge = derive_element(&archive, metadata::tag.id()).unwrap();
         assert_eq!(heads(&other_edge), BTreeSet::from([*successor]));
         assert!(sections(&other_edge).unwrap().1.is_empty());
@@ -766,7 +767,7 @@ mod tests {
     fn malformed_observation_values_are_skipped_without_hiding_the_subject() {
         let a = ufoid();
         let b = ufoid();
-        let archive = edge(&b, &a).to_blob();
+        let archive: Blob<SimpleArchive> = edge(&b, &a).to_blob();
         for invalid in [[0; 32], [1; 32]] {
             let mut bytes = archive.bytes.as_ref().to_vec();
             bytes[V_START..V_START + 32].copy_from_slice(&invalid);
@@ -781,7 +782,7 @@ mod tests {
     fn noncanonical_sources_and_lattice_elements_are_rejected() {
         let a = ufoid();
         let b = ufoid();
-        let archive = edge(&b, &a).to_blob();
+        let archive: Blob<SimpleArchive> = edge(&b, &a).to_blob();
         let row = archive.bytes.as_ref();
         let duplicate = Blob::new(Bytes::from_source([row, row].concat()));
         assert_eq!(
