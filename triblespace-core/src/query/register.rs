@@ -1023,14 +1023,14 @@ mod tests {
         );
     }
 
-    /// The join-homomorphism identity
-    /// `resolve(C1 ∪ C2) = resolve(C1) ⊔ resolve(C2)`, where `⊔` is the
-    /// antichain join — the maximal elements of the two answers taken
-    /// together, computed in the union frame.
+    /// Check that re-resolving both survivor sets against the full union frame
+    /// agrees with resolving the original candidates against that frame.
+    /// This oracle retains all source evidence; it does not establish that
+    /// bare survivor sets suffice as a maintained join representation.
     ///
     /// A macro rather than a function because the order borrows the frame
     /// it is built over, which a `Fn(&TribleSet) -> O` cannot express.
-    macro_rules! assert_join_homomorphism {
+    macro_rules! assert_union_frame_resolution {
         ($build:expr, $c1:expr, $c2:expr, $candidates:expr $(,)?) => {{
             let c1 = $c1;
             let c2 = $c2;
@@ -1048,9 +1048,7 @@ mod tests {
         }};
     }
 
-    /// The join in the codomain is the **antichain** join, not set union,
-    /// and this pins the difference — without it the homomorphism tests
-    /// above could pass under a wrong-but-coincidental join.
+    /// Plain union of survivor sets can differ from the full-frame oracle.
     ///
     /// With a fixed candidate set, new observation edges can remove survivors,
     /// so plain union of the two answers can overshoot. This test re-resolves
@@ -1058,7 +1056,7 @@ mod tests {
     /// standalone heads-only representation. When known subjects also grow,
     /// the head projection is neither monotone nor antitone under inclusion.
     #[test]
-    fn plain_union_is_not_the_join_in_the_codomain() {
+    fn plain_survivor_union_can_overshoot_the_full_frame_oracle() {
         let base = ufoid();
         let left = ufoid();
         let candidates = [*base, *left];
@@ -1080,15 +1078,15 @@ mod tests {
         assert_eq!(naive, [*base, *left].into_iter().collect::<BTreeSet<_>>());
         assert_ne!(naive, truth);
 
-        // ... while re-resolving in the union frame — the antichain join —
-        // agrees exactly.
+        // ... while re-resolving against every fact in the union frame
+        // agrees exactly with the full-frame oracle.
         let joined = resolve(&observation(&union), l1.iter().chain(l2.iter()).copied());
         assert_eq!(joined, truth);
         assert_eq!(truth, [*left].into_iter().collect::<BTreeSet<_>>());
     }
 
     #[test]
-    fn observation_order_is_a_join_homomorphism() {
+    fn observation_survivors_re_resolve_in_the_union_frame() {
         let base = ufoid();
         let left = ufoid();
         let right = ufoid();
@@ -1100,7 +1098,7 @@ mod tests {
         c2 += edge(&right, &base);
         c2 += edge(&merge, &right);
 
-        let joined = assert_join_homomorphism!(
+        let joined = assert_union_frame_resolution!(
             |facts| observation(facts),
             c1,
             c2,
@@ -1111,7 +1109,7 @@ mod tests {
     }
 
     #[test]
-    fn last_write_wins_is_a_join_homomorphism() {
+    fn last_write_wins_survivors_re_resolve_in_the_union_frame() {
         let goal = ufoid();
         let a = ufoid();
         let b = ufoid();
@@ -1125,7 +1123,7 @@ mod tests {
         c2 += note(&goal, &b, 2);
         c2 += note(&goal, &d, 4);
 
-        let joined = assert_join_homomorphism!(
+        let joined = assert_union_frame_resolution!(
             |facts| stated(facts).tiebreak_by_id(),
             c1,
             c2,
@@ -1134,10 +1132,10 @@ mod tests {
         assert_eq!(joined, [*d].into_iter().collect::<BTreeSet<_>>());
     }
 
-    /// `min` is the join of the opposite order, so first-write-wins is as
-    /// lawful a derivation as last-write-wins. Checked, not assumed.
+    /// The first-write-wins survivor sets agree with the full union-frame
+    /// oracle when re-resolved there under the reversed stated order.
     #[test]
-    fn first_write_wins_is_a_join_homomorphism() {
+    fn first_write_wins_survivors_re_resolve_in_the_union_frame() {
         let goal = ufoid();
         let a = ufoid();
         let b = ufoid();
@@ -1151,7 +1149,7 @@ mod tests {
         c2 += note(&goal, &b, 20);
         c2 += note(&goal, &d, 40);
 
-        let joined = assert_join_homomorphism!(
+        let joined = assert_union_frame_resolution!(
             |facts| stated(facts).tiebreak_by_id().first(),
             c1,
             c2,
@@ -1160,11 +1158,10 @@ mod tests {
         assert_eq!(joined, [*a].into_iter().collect::<BTreeSet<_>>());
     }
 
-    /// The partial stated order — no tie-break — is a join homomorphism
-    /// too. This is the multi-value register over a stated clock, and it
-    /// is the one whose answer is genuinely a set.
+    /// The partial stated order retains tied winners when survivor sets are
+    /// re-resolved against the complete union-frame evidence.
     #[test]
-    fn multi_value_stated_order_is_a_join_homomorphism() {
+    fn multi_value_stated_survivors_re_resolve_in_the_union_frame() {
         let goal = ufoid();
         let a = ufoid();
         let b = ufoid();
@@ -1178,7 +1175,8 @@ mod tests {
         c2 += note(&goal, &b, 5);
         c2 += note(&goal, &d, 2);
 
-        let joined = assert_join_homomorphism!(|facts| stated(facts), c1, c2, [*a, *b, *c, *d]);
+        let joined =
+            assert_union_frame_resolution!(|facts| stated(facts), c1, c2, [*a, *b, *c, *d]);
         assert_eq!(joined, [*a, *b, *c].into_iter().collect::<BTreeSet<_>>());
     }
 

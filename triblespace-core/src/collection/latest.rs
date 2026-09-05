@@ -505,7 +505,7 @@ mod tests {
         assert!(heads(&empty()).is_empty());
         let unknown = ufoid();
         assert!(!index.contains(*unknown));
-        assert!(!exists!(state: Id, and!(state.is((&unknown).to_inline()), index.has(state))));
+        assert!(!exists!((state: Id), and!(state.is((&unknown).to_inline()), index.has(state))));
     }
 
     #[test]
@@ -684,7 +684,7 @@ mod tests {
         for candidate in [*old, *live, *other, *unknown] {
             // The constant is the tighter proposer; latest confirms it.
             let accepted =
-                exists!(state: Id, and!(state.is(candidate.to_inline()), index.has(state)));
+                exists!((state: Id), and!(state.is(candidate.to_inline()), index.has(state)));
             assert_eq!(accepted, standalone.contains(&candidate));
         }
     }

@@ -230,7 +230,7 @@ mod tests {
     }
 
     #[test]
-    fn latest_is_a_join_homomorphism_over_commit_sets() {
+    fn re_resolving_frame_survivors_agrees_with_the_full_union_oracle() {
         // Two branches off a shared base, each in its own commit set.
         let base = ufoid();
         let left = ufoid();
@@ -250,8 +250,8 @@ mod tests {
         let attribute = metadata::supersedes.id();
         let l1 = latest(&c1, attribute, candidates);
         let l2 = latest(&c2, attribute, candidates);
-        // The antichain join: the maximal elements of the two answers taken
-        // together, computed in the union frame.
+        // Re-read all ordering evidence from the union frame. This is an
+        // oracle check, not a join on a heads-only representation.
         let joined = latest(&union, attribute, l1.iter().chain(l2.iter()).copied());
         assert_eq!(latest(&union, attribute, candidates), joined);
     }

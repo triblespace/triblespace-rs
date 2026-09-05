@@ -798,7 +798,7 @@ mod tests {
         assert_eq!(joined, standalone);
         for candidate in [*old, *winner, *other_winner, *incomplete, *unknown] {
             let accepted =
-                exists!(state: Id, and!(state.is(candidate.to_inline()), index.has(state)));
+                exists!((state: Id), and!(state.is(candidate.to_inline()), index.has(state)));
             assert_eq!(accepted, standalone.contains(&candidate));
         }
         let empty = LwwIndex::default();
