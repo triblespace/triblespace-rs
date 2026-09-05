@@ -212,6 +212,25 @@ may disappear without changing semantic data or local retention.
 
 ## Routing is process state
 
+`Peer::new(store, key, config)` starts a production host immediately, as a
+long-running repair daemon needs. `Peer::lazy(store, key, config)` keeps the same
+store API but defers its host until the first absent-handle acquisition, explicit
+network fetch, or collection activation. Resident reads, snapshots, local writes,
+flush, and close start no thread or endpoint and build no serving/bearer index.
+Its snapshots are still exactly the backing store's resident snapshot type.
+Acquisition returns local observation errors rather than treating them as misses,
+and a host startup failure leaves resident operations usable. Startup is attempted
+once per peer; opening a new peer is an explicit retry. Activation logs startup
+failures without activating the collection, while acquisition returns the error.
+
+A foreground H-only reader need not activate any collection. It can use a distinct
+ephemeral transport key, bootstrap endpoint routes, and a zero provider-publication
+budget without borrowing its authorship signer's or a running daemon's endpoint
+identity. Network acquisition requires an enabled Tokio runtime at the calling
+async boundary; local-only operations need no runtime. `flush` makes local writes
+durable, and explicit `close` withdraws host snapshots before closing the backend.
+Neither operation starts networking or authors WANT.
+
 Initial endpoint identities come from `PeerConfig` or the CLI. Configured relay
 URLs only provide iroh transport paths; they are not collection participants or
 KDF(C) rendezvous identities. A verified wake origin and DHT referrals may

@@ -681,6 +681,10 @@ impl HostWiring {
     pub(crate) async fn send_admission(&self, batch: NetEventBatch) {
         self.evt_tx.send(batch).await.unwrap();
     }
+
+    pub(crate) fn install_test_capability(&self, capability: Arc<dyn NetCapability>) {
+        assert!(self.cap_tx.send(Some(capability)).is_ok());
+    }
 }
 
 pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
@@ -713,9 +717,22 @@ pub fn spawn(
     key: SigningKey,
     config: PeerConfig,
 ) -> anyhow::Result<(NetSender, NetReceiver, CollectionWakePlane)> {
-    let secret = iroh_secret(&key);
-    let id: EndpointId = secret.public().into();
+    let id: EndpointId = iroh_secret(&key).public().into();
     let (sender, receiver, wiring) = wire(id);
+    let wake_plane = start(key, config, wiring)?;
+    Ok((sender, receiver, wake_plane))
+}
+
+/// Start a production host over previously allocated, inert wiring.
+///
+/// Separating this boundary from [`wire`] lets a local store defer the thread,
+/// runtime, endpoint, and discovery services until a live acquisition needs them.
+pub(crate) fn start(
+    key: SigningKey,
+    config: PeerConfig,
+    wiring: HostWiring,
+) -> anyhow::Result<CollectionWakePlane> {
+    let secret = iroh_secret(&key);
     let (startup_tx, startup_rx) = mpsc::sync_channel(1);
     thread::Builder::new()
         .name("triblespace-net".to_owned())
@@ -741,10 +758,9 @@ pub fn spawn(
                 }
             });
         })?;
-    let wake_plane = startup_rx
+    startup_rx
         .recv()
-        .map_err(|_| anyhow::anyhow!("network host stopped during startup"))??;
-    Ok((sender, receiver, wake_plane))
+        .map_err(|_| anyhow::anyhow!("network host stopped during startup"))?
 }
 
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);

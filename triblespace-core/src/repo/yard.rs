@@ -1060,7 +1060,7 @@ impl YardSnapshot {
             }
             match generation.snapshot.get::<T, S>(handle) {
                 Ok(value) => return Some(Ok(value)),
-                Err(GetBlobError::BlobNotFound) => continue,
+                Err(GetBlobError::BlobNotFound(_)) => continue,
                 Err(err) => return Some(Err(YardGetError::Pile(err))),
             }
         }
@@ -2389,7 +2389,7 @@ mod tests {
         );
         assert!(matches!(
             fresh_reader.get::<Bytes, RawBytes>(evicted),
-            Err(GetBlobError::BlobNotFound)
+            Err(GetBlobError::BlobNotFound(_))
         ));
         drop(fresh_reader);
         fresh_pile.close().unwrap();

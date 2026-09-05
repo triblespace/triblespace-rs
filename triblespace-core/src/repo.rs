@@ -25,6 +25,30 @@ pub use proof::{CapabilityProofRead, CapabilityProofStore};
 /// Generational collection of piles for lazy-retention blob storage.
 pub mod yard;
 
+/// Exact content absent from an immutable blob snapshot.
+///
+/// A live caller may acquire this handle and retry against a later snapshot;
+/// the failing snapshot itself never fetches or records demand. Keep the
+/// bearer capability available to code rather than printing it in diagnostics.
+#[derive(Clone, Copy)]
+pub struct MissingBlob {
+    pub handle: Inline<Handle<UnknownBlob>>,
+}
+
+impl std::fmt::Display for MissingBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("blob is not resident in this snapshot")
+    }
+}
+
+impl std::error::Error for MissingBlob {}
+
+impl std::fmt::Debug for MissingBlob {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(self, f)
+    }
+}
+
 /// Trait for storage backends that require explicit close/cleanup.
 ///
 /// Not all storage backends need to implement this; implementations that have

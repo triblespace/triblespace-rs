@@ -2,17 +2,19 @@
 
 use std::time::{Duration, Instant};
 
+use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh::Endpoint;
 use iroh::endpoint::presets;
 use iroh::test_utils::test_transport::TestNetwork;
 use iroh_base::{EndpointAddr, SecretKey};
+use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRead,
     CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
 };
-use triblespace_core::repo::SnapshotSource;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
+use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::ReconcileQos;
 use triblespace_net::peer::Peer;
@@ -139,4 +141,61 @@ async fn signed_collection_wake_repairs_before_periodic_fallback() {
     );
 
     drop((server.into_store(), reader.into_store()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() {
+    let network = TestNetwork::new();
+    let directory_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xA2))).await;
+    let directory_addr = directory_endpoint.addr();
+    let server_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xB2))).await;
+    let reader_endpoint =
+        test_endpoint(&network, triblespace_net::identity::iroh_secret(&key(0xC2))).await;
+
+    let mut server_store = MemoryRepo::default();
+    let payload = Bytes::from_source(b"selected foreground attachment".to_vec());
+    let selected = server_store.put::<UnknownBlob, _>(payload.clone()).unwrap();
+    let unrelated = server_store
+        .put::<UnknownBlob, _>(Bytes::from_source(b"unselected attachment".to_vec()))
+        .unwrap();
+    let mut directory = bring_up(directory_endpoint, MemoryRepo::default(), Vec::new()).await;
+    let mut server = bring_up(server_endpoint, server_store, vec![directory_addr.clone()]).await;
+    // This process knows only the directory, not the provider. None of these
+    // peers activates a collection: H acquisition is independent of repair.
+    let mut reader = bring_up(reader_endpoint, MemoryRepo::default(), vec![directory_addr]).await;
+    let before = reader.snapshot().unwrap();
+    directory.refresh();
+    server.refresh();
+    reader.refresh();
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    let acquired = reader
+        .acquire(selected)
+        .await
+        .unwrap()
+        .expect("DHT-located payload");
+    assert_eq!(acquired.as_ref(), payload.as_ref());
+    let after = reader.snapshot().unwrap();
+    assert!(!before.contains_blob(selected).unwrap());
+    assert!(after.contains_blob(selected).unwrap());
+    assert!(!after.contains_blob(unrelated).unwrap());
+    assert!(after.wants().unwrap().next().is_none());
+    assert!(after.records().unwrap().next().is_none());
+    assert!(
+        !directory
+            .snapshot()
+            .unwrap()
+            .contains_blob(selected)
+            .unwrap()
+    );
+
+    // A subsequent acquisition is local even after the provider is gone.
+    drop(server.into_store());
+    let cached = reader.acquire(selected).await.unwrap().unwrap();
+    assert_eq!(cached.as_ref(), payload.as_ref());
+    let bytes: Bytes = after.get(selected).unwrap();
+    assert_eq!(bytes.as_ref(), payload.as_ref());
+    drop((directory.into_store(), reader.into_store()));
 }

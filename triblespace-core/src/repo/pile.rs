@@ -2678,7 +2678,9 @@ impl PileSnapshot {
         strategy: ValidationStrategy,
     ) -> Result<IndexedBlobRecord, GetBlobError<E>> {
         let Some(mut candidate) = first_blob_occurrence(&self.blobs, &hash.raw) else {
-            return Err(GetBlobError::BlobNotFound);
+            return Err(GetBlobError::BlobNotFound(super::MissingBlob {
+                handle: Inline::new(hash.raw),
+            }));
         };
 
         let mut first_invalid = None;
@@ -3066,7 +3068,7 @@ impl From<std::io::Error> for CapabilityProofInsertError {
 #[derive(Debug)]
 pub enum GetBlobError<E: Error> {
     /// No blob with the given handle exists in the pile.
-    BlobNotFound,
+    BlobNotFound(super::MissingBlob),
     /// The blob's hash does not match its stored digest.
     ValidationError(Bytes),
     /// The blob was found and valid but deserialization failed.
@@ -3076,14 +3078,22 @@ pub enum GetBlobError<E: Error> {
 impl<E: Error> std::fmt::Display for GetBlobError<E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            GetBlobError::BlobNotFound => write!(f, "Blob not found"),
+            GetBlobError::BlobNotFound(error) => error.fmt(f),
             GetBlobError::ConversionError(err) => write!(f, "Conversion error: {err}"),
             GetBlobError::ValidationError(_) => write!(f, "Validation error"),
         }
     }
 }
 
-impl<E: Error> std::error::Error for GetBlobError<E> {}
+impl<E: Error + 'static> std::error::Error for GetBlobError<E> {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::BlobNotFound(error) => Some(error),
+            Self::ConversionError(error) => Some(error),
+            Self::ValidationError(_) => None,
+        }
+    }
+}
 
 /// Error returned by [`Pile::flush`] and [`Pile::close`].
 #[derive(Debug)]
@@ -4462,7 +4472,7 @@ impl crate::repo::BlobStoreMeta for PileSnapshot {
                 timestamp: record.timestamp,
                 length: record.bytes.len() as u64,
             })),
-            Err(GetBlobError::BlobNotFound | GetBlobError::ValidationError(_)) => Ok(None),
+            Err(GetBlobError::BlobNotFound(_) | GetBlobError::ValidationError(_)) => Ok(None),
             Err(GetBlobError::ConversionError(error)) => match error {},
         }
     }
@@ -7466,7 +7476,7 @@ mod tests {
         assert!(matches!(
             error,
             PileRewriteError::Transfer(crate::repo::TransferError::Load(
-                GetBlobError::BlobNotFound
+                GetBlobError::BlobNotFound(_)
             ))
         ));
 

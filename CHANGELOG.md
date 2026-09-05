@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add `Peer::lazy` over the existing store adapter. Resident reads, snapshots,
+  writes, and durability boundaries start no host and build no serving inventory;
+  a missing exact-handle acquisition or explicit activation starts networking
+  once. Snapshot reads remain resident-only and acquisition never creates WANT.
+  Forward explicit flush and close, withdrawing host snapshots before closing
+  the backing store.
+- Preserve the exact absent handle in `repo::MissingBlob` through Pile read
+  error sources, so live callers can acquire demanded content without making
+  frozen snapshots networked or prefetching entire attachment graphs.
+
 - Add `CollectionStoreExt::acquire_read_audience_at` as the live counterpart
   to inert snapshot audience discovery. It freezes the proof/control frontier,
   acquires only the exact collection descriptor, evaluates self-contained
