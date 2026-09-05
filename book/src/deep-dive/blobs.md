@@ -84,12 +84,30 @@ source commits.
 
 ## Conservative references
 
-The generic retention walker scans blob bytes in aligned 32-byte chunks and
-checks whether a chunk names a resident blob. This may retain an accidental
-extra object, but it does not omit a real inline handle. Signed collection
-commits recursively retain their resident descriptor, data, metadata, and
-attachment closure. Unsigned merge and derivation equations do not create
-strong ownership roots.
+Every retained current native record other than a `BLOB` strongly retains each
+resident blob it references directly, together with that blob's resident child
+closure. This includes unsigned `MERGE` and `DERIVE` equations: their
+descriptors, inputs, and results are roots just as a `COMMIT`'s descriptor,
+data, and metadata are. Preserved WANT records likewise own their referenced
+blobs; self-contained authorization proofs have no payload blob references.
+Retention does not depend on signature validity, admission, or whether a
+materialized equation is useful. An absent reference neither triggers a fetch
+nor prevents resident sibling references from being retained. A `BLOB` record
+does not root itself merely by existing.
+
+The default child walker examines complete 32-byte chunks at offsets
+`0, 32, 64, ...` from the start of each blob and follows candidates which can
+be read from the resident store snapshot. Canonical `SimpleArchive` value slots
+lie on these boundaries. Accidental matches can retain extra objects, but the
+scanner does not decode schemas or discover handles at arbitrary byte offsets.
+Formats which rely on this walk must expose their child handles on its chunk
+boundaries.
+
+Pile and Yard also retain the resident record-kind descriptions of retained
+frames; the `BLOB` kind description becomes a root when an independent root
+selects a blob for retention. See [Garbage Collection and
+Forgetting](../garbage-collection.md) for explicit policy roots and backend
+rewrite boundaries.
 
 This division keeps tribles compact, blobs verifiable, and publication
 self-contained while letting physical storage and cache policy evolve

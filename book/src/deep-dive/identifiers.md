@@ -129,6 +129,11 @@ bit-for-bit identical. This property gives us:
   deliberately, intrinsic identifiers rely on cryptographic strength rather than
   purely statistical rarity.
 
+These are guarantees of cryptographic content addresses, such as blob handles.
+They are not validity rules for the 128-bit entity ids produced by `entity!`:
+those remain opaque subject names, and their derivation serves idempotence,
+not authentication. An entity can acquire annotations without changing its id.
+
 ### Extrinsic identifiers
 
 Extrinsic identifiers (names, URLs, DOIs, UUIDs, UFOIDs, FUCIDs) are assigned by
@@ -277,13 +282,24 @@ against a re-derivation to check it. Both are hash joins wearing an `Id`, and
 both mean the entity they name was never written down. Write the entity, query
 it by its facts, and let the id go back to being a convenience.
 
-Re-deriving an id in order to *validate* it is a migration tool. In steady-state
-code it is a sign that the id has become load-bearing.
+Derivation is a producer-side naming convention, not a reader-side validity
+check. Re-deriving an id does not validate the surrounding facts, and readers
+must not reject a subject because its id differs from a locally recomputed
+value.
 
-This canonical-row protocol deliberately defines a new intrinsic-identity
-epoch relative to the historical hash of concatenated `attribute || value`
-pairs. Existing persisted intrinsic ids must be migrated or re-ingested when
-adopting this epoch; the implementation must never silently mix both schemes.
+The canonical-row algorithm produces different new ids from the historical
+hash of concatenated `attribute || value` pairs. This changes cross-version
+idempotence: constructing the same core under different algorithms may produce
+two entities. Existing subjects and references to them remain valid opaque
+ids. Old, new, and randomly minted entity ids can coexist without re-ID or
+re-ingestion; queries find the stored entities by their facts, not by
+predicting their ids.
+
+Other persistence boundaries still matter. A change to an attribute identity
+or a value/blob encoding may independently require additive migration or
+readers which understand both forms. Preserve those contracts explicitly; a
+changed entity-id derivation algorithm alone does not require rewriting source
+identities.
 
 ## Embeddings as Semantic Intrinsic Identifiers
 
