@@ -415,7 +415,7 @@ where
             source: RecordDecodeError::from(source),
         }
     })?;
-    descriptor::validate(&facts)
+    descriptor::policy(&facts)
         .map_err(|source| CollectionDescriptorError::Invalid { collection, source })
 }
 

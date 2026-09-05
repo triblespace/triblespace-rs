@@ -605,7 +605,6 @@ pub fn validate_merge(
 }
 
 fn validate_descriptor(descriptor: &Fragment) -> Result<(), SimpleArchiveUnionValidationError> {
-    descriptor_facts::validate(descriptor.facts())?;
     let expected_representation = <SimpleArchive as MetaDescribe>::id();
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {

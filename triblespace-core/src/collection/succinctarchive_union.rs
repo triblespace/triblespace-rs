@@ -762,7 +762,6 @@ fn validate_descriptor_parts(
     expected_representation: Id,
     expected_mapping: Option<Id>,
 ) -> Result<(), SuccinctArchiveUnionValidationError> {
-    descriptor_facts::validate(descriptor.facts())?;
     let representation = descriptor_facts::representation(descriptor.facts())?;
     if representation != expected_representation {
         return Err(SuccinctArchiveUnionValidationError::WrongRepresentation {

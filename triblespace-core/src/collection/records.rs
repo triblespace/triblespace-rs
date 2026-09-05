@@ -264,13 +264,8 @@ pub enum RecordDecodeError {
     MissingField(&'static str),
     /// A single-valued field occurred more than once.
     RepeatedField(&'static str),
-    /// A descriptor field occurred on an entity other than the tagged
-    /// descriptor entity.
-    FieldOnWrongEntity(&'static str),
     /// A typed descriptor field had a noncanonical inline representation.
     InvalidId(&'static str),
-    /// A retired descriptor field would be ambiguous under the current model.
-    ObsoleteField(&'static str),
     /// A dense record had no kind byte or the wrong payload length.
     InvalidLength { expected: usize, actual: usize },
     /// A tagged dense record used an unknown variant byte.
@@ -287,13 +282,7 @@ impl fmt::Display for RecordDecodeError {
             Self::RepeatedField(field) => {
                 write!(f, "collection record contains repeated {field}")
             }
-            Self::FieldOnWrongEntity(field) => {
-                write!(f, "collection record contains {field} on another entity")
-            }
             Self::InvalidId(field) => write!(f, "collection record contains invalid {field}"),
-            Self::ObsoleteField(field) => {
-                write!(f, "collection record contains obsolete {field}")
-            }
             Self::InvalidLength { expected, actual } => write!(
                 f,
                 "collection record has {actual} bytes; expected exactly {expected}"

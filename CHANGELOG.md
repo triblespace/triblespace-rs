@@ -28,6 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Fresh encoding/mapping ids were minted with installed `trible genid` on
   2026-09-05: `35304D6FF3421A1F9C0DCF4F8C45D392` and
   `2D3DFB807700200A43FD841406B46D77`. Source identities and old bytes are unchanged.
+- Remove whole-document collection descriptor validation: retired attributes,
+  extra names, and annotations on derived descriptors no longer reject usable
+  collection facts. Typed registration recognizes its requested encoding by
+  an existential query, and policy decoding queries only linked entities and
+  recognized typed values. Canonical constructors skip redundant generic
+  validation. Existing singular-policy and lineage consumers remain singular;
+  this does not define how multiple authorization interpretations combine.
 - Ordinary derived `ensure` and `maintain` select the admitted support already
   realized by their immediate source. A new foundational commit, an unbuilt
   intermediate member, or a dangling source equation no longer makes a

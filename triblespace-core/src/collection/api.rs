@@ -102,8 +102,8 @@ where
     }
 }
 
-/// Failure while reading and structurally validating a collection descriptor
-/// by its content identity.
+/// Failure while reading a collection descriptor and its local policy by
+/// content identity.
 #[derive(Debug)]
 pub enum CollectionDescriptorError<GetError> {
     /// The descriptor blob could not be fetched.
@@ -113,7 +113,7 @@ pub enum CollectionDescriptorError<GetError> {
         /// Backend fetch failure.
         source: GetError,
     },
-    /// The bytes were not a canonical, generically well-formed descriptor.
+    /// The archive could not be decoded or its singular policy could not be read.
     Invalid {
         /// Requested collection identity.
         collection: CollectionHandle,
@@ -344,8 +344,6 @@ where
 pub enum CollectionRegistrationError<PutError> {
     /// The descriptor names another encoding or invalid encoding context.
     WrongType(CollectionTypeError),
-    /// Descriptor facts did not have the mandatory generic shape.
-    InvalidDescriptor(RecordDecodeError),
     /// One attachment or the canonical descriptor archive could not be stored.
     DependencyPut(PutError),
 }
@@ -357,9 +355,6 @@ where
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongType(source) => write!(formatter, "wrong collection type: {source}"),
-            Self::InvalidDescriptor(source) => {
-                write!(formatter, "invalid collection descriptor: {source}")
-            }
             Self::DependencyPut(source) => {
                 write!(
                     formatter,
@@ -377,7 +372,6 @@ where
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::WrongType(source) => Some(source),
-            Self::InvalidDescriptor(source) => Some(source),
             Self::DependencyPut(source) => Some(source),
         }
     }
@@ -977,10 +971,6 @@ where
     }
 }
 
-fn validate_generic_descriptor(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> {
-    descriptor::validate(facts)
-}
-
 pub(crate) struct LoadedCollectionDescriptor {
     pub(crate) fragment: Fragment,
     pub(crate) policy: CollectionPolicy,
@@ -1002,7 +992,7 @@ where
                 collection,
                 source: RecordDecodeError::from(source),
             })?;
-    let policy = validate_generic_descriptor(&facts)
+    let policy = descriptor::policy(&facts)
         .map_err(|source| CollectionDescriptorError::Invalid { collection, source })?;
     Ok(LoadedCollectionDescriptor {
         fragment: Fragment::from(facts),
@@ -1165,7 +1155,7 @@ where
 ///
 /// This is deliberately representation-neutral: READ authority concerns the
 /// exact descriptor handle, not the collection member encoding. The
-/// descriptor is first loaded and structurally validated through one coherent
+/// descriptor policy is first read through one coherent
 /// store snapshot. `root` must be named by its READ quorum; an open READ policy
 /// needs no grant and is rejected as a redundant operation.
 ///
@@ -1275,8 +1265,8 @@ where
 /// supplied portable proofs.
 ///
 /// Network discovery starts from the descriptor handle carried on the wire,
-/// before its member encoding is known. This boundary therefore validates the
-/// generic descriptor and its READ policy without manufacturing a typed
+/// before its member encoding is known. This boundary therefore queries the
+/// descriptor's READ policy without manufacturing a typed
 /// [`Collection`]. It neither enumerates nor persists ambient proof state.
 pub fn collection_reader_is_admitted_by<S>(
     snapshot: &S,
@@ -1405,8 +1395,9 @@ impl<L: CollectionEncoding> Collection<L> {
     /// backing store.
     ///
     /// `snapshot` should be the caller's coherent immutable read boundary. The
-    /// descriptor is fetched by `handle`, validated generically, and then
-    /// checked against `L` before the cheap typed handle is returned.
+    /// descriptor is fetched by `handle`, its local policy is read, and the
+    /// encoding facts needed by `L` are recognized before the cheap typed
+    /// handle is returned.
     pub fn open<S>(
         snapshot: &S,
         handle: CollectionHandle,
@@ -1423,8 +1414,8 @@ impl<L: CollectionEncoding> Collection<L> {
 
     /// Read this collection's immutable admission policy from `snapshot`.
     ///
-    /// The descriptor is fetched and structurally validated before its local
-    /// READ and WRITE policies are returned. This does not enumerate capability
+    /// The descriptor is fetched and queried for its local READ and WRITE
+    /// policies. This does not enumerate capability
     /// proofs or make an admission decision.
     pub fn policy<S>(
         self,
@@ -1904,6 +1895,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     /// Normal root and derived construction should use [`collection`](Self::collection)
     /// and [`derive`](Self::derive), which make canonical descriptors by
     /// construction.
+    ///
+    /// Registration recognizes only the encoding facts needed by `L` and
+    /// stores the complete fragment. Policy and lineage are queried when a
+    /// consumer needs them; unrecognized policy never grants admission.
     fn register_collection<L>(
         &mut self,
         descriptor: Fragment,
@@ -1911,14 +1906,8 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     where
         L: CollectionEncoding,
     {
-        super::encoding::validate_descriptor_type::<L>(&descriptor).map_err(
-            |source| match source {
-                CollectionTypeError::Malformed(source) => {
-                    CollectionRegistrationError::InvalidDescriptor(source)
-                }
-                source => CollectionRegistrationError::WrongType(source),
-            },
-        )?;
+        super::encoding::validate_descriptor_type::<L>(&descriptor)
+            .map_err(CollectionRegistrationError::WrongType)?;
         let handle = descriptor::put_closure(self, &descriptor)
             .map_err(CollectionRegistrationError::DependencyPut)?;
         Ok(Collection::from_handle(handle))
@@ -1933,7 +1922,10 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
         Collection<SimpleArchive>,
         CollectionRegistrationError<<Self as BlobStorePut>::PutError>,
     > {
-        self.register_collection::<SimpleArchive>(descriptor::naming::<SimpleArchive>(name, policy))
+        let descriptor = descriptor::naming::<SimpleArchive>(name, policy);
+        let handle = descriptor::put_closure(self, &descriptor)
+            .map_err(CollectionRegistrationError::DependencyPut)?;
+        Ok(Collection::from_handle(handle))
     }
 
     /// Create and register one canonical derived collection.
@@ -1970,11 +1962,15 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     where
         M: CollectionMapping,
     {
-        self.register_collection::<M::Target>(descriptor::deriving_with(
-            source.handle(),
-            &mapping,
-            policy,
-        ))
+        let descriptor = descriptor::deriving_with(source.handle(), &mapping, policy);
+        // The constructor already supplies the target encoding and both
+        // policies. Only target-specific context may still need checking.
+        M::Target::validate_descriptor(&descriptor).map_err(|source| {
+            CollectionRegistrationError::WrongType(CollectionTypeError::InvalidDescriptor(source))
+        })?;
+        let handle = descriptor::put_closure(self, &descriptor)
+            .map_err(CollectionRegistrationError::DependencyPut)?;
+        Ok(Collection::from_handle(handle))
     }
 
     /// Ensure the currently available input of one collection.

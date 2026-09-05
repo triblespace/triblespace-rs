@@ -1,10 +1,13 @@
 use std::collections::BTreeMap;
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
+use futures::executor::block_on;
 use hifitime::Epoch;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-use triblespace_core::blob::encodings::succinctarchive::SuccinctArchiveBlob;
+use triblespace_core::blob::encodings::succinctarchive::{
+    OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+};
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::{BlobEncoding, IntoBlob};
 use triblespace_core::capability::{
@@ -12,15 +15,26 @@ use triblespace_core::capability::{
     CapabilityProof, CapabilityResource,
 };
 use triblespace_core::collection::descriptor;
+use triblespace_core::collection::records::{
+    admission_invoke_threshold, admission_policy_root, collection_mapping, collection_name,
+    collection_read_policy, collection_representation, collection_source, collection_write_policy,
+    mapping_algorithm, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
+};
+use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1;
 use triblespace_core::collection::{
     collection_read_audience, grant_collection_read, grant_collection_write, AdmissionPolicy,
-    Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
-    CollectionReadAudience, CollectionReadGrantError, CollectionRecord, CollectionStore,
-    CollectionStoreExt, CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit,
-    ACTION_READ, ACTION_WRITE,
+    Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy, CollectionRead,
+    CollectionReadAudience, CollectionReadGrantError, CollectionRecord,
+    CollectionRegistrationError, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit, ACTION_READ,
+    ACTION_WRITE, KIND_ADMISSION_POLICY_QUORUM,
 };
+use triblespace_core::id::rngid;
+use triblespace_core::inline::encodings::genid::GenId;
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::inline::{Inline, InlineEncoding};
+use triblespace_core::metadata::{self, MetaDescribe};
+use triblespace_core::prelude::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
     BlobStoreGet, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
@@ -226,6 +240,178 @@ fn typed_collection_open_rejects_an_invalid_descriptor() {
             ..
         }) if collection == invalid
     ));
+}
+
+#[test]
+fn encoding_recognition_is_existential_and_entity_scoped() {
+    let mut store = CountingRepo::default();
+    let unrelated_encoding = rngid();
+    let mut facts = entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation: &unrelated_encoding,
+    };
+    // The requested representation on an untagged entity cannot complete a
+    // descriptor interpretation on its neighbor.
+    facts += entity! {
+        collection_representation: SimpleArchive::id(),
+    };
+    assert!(matches!(
+        store.register_collection::<SimpleArchive>(facts.clone()),
+        Err(CollectionRegistrationError::WrongType(
+            CollectionTypeError::WrongEncoding { .. }
+        ))
+    ));
+    assert!(store.events.is_empty());
+
+    // Registration asks only whether the requested encoding is represented.
+    // This is not policy selection: the existing singular policy consumers
+    // still need a separate API decision for multiple descriptor entities.
+    facts += entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation*: [SimpleArchive::id(), unrelated_encoding.id],
+    };
+    store.register_collection::<SimpleArchive>(facts).unwrap();
+}
+
+#[test]
+fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
+    let authority = key(40);
+    let expected_policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let subject = rngid();
+    let read = rngid();
+    let write = rngid();
+    let unknown_encoding = rngid();
+    let mut descriptor = entity! { &subject @
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_name*: ["annotated-source", "a second descriptive name"],
+        collection_representation*: [SimpleArchive::id(), unknown_encoding.id],
+        collection_read_policy*: entity! { &read @
+            metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+            admission_policy_root: authority.verifying_key(),
+            admission_invoke_threshold: 1_u32,
+        },
+        collection_write_policy*: entity! { &write @
+            metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+            admission_policy_root: authority.verifying_key(),
+            admission_invoke_threshold: 1_u32,
+        },
+    };
+    // This exact retired attribute was minted on 2026-08-07. It is ordinary
+    // unknown data to the current reader, not a whole-archive rejection marker.
+    let retired_recipe = triblespace_core::id_hex!("5D338C58D897B969BE1AE0956CCFE301");
+    descriptor.facts_mut().insert(&Trible::force(
+        &subject.id,
+        &retired_recipe,
+        &Inline::<GenId>::new([0xFF; 32]),
+    ));
+    // Embedded descriptions may use attributes the collection also uses.
+    descriptor += entity! {
+        collection_read_policy*: AdmissionPolicy::Open.fragment(),
+        collection_write_policy*: AdmissionPolicy::Open.fragment(),
+    };
+    let mut store = MemoryRepo::default();
+    let source = store
+        .register_collection::<SimpleArchive>(descriptor)
+        .unwrap();
+    let target_subject = rngid();
+    let mapping_subject = rngid();
+    let target = store
+        .register_collection::<SuccinctArchiveBlob>(entity! { &target_subject @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_source: source.handle(),
+            // A name annotates this derivation; it does not turn it into a root.
+            collection_name: "annotated-derivation",
+            collection_representation: SuccinctArchiveBlob::id(),
+            collection_read_policy*: expected_policy.read().fragment(),
+            collection_write_policy*: expected_policy.write().fragment(),
+            collection_mapping*: entity! { &mapping_subject @
+                metadata::tag: KIND_COLLECTION_MAPPING,
+                mapping_algorithm: SIMPLE_TO_SUCCINCT_MAPPING_V1,
+                metadata::name: "opaque mapping entity",
+            },
+        })
+        .unwrap();
+    let first = fragment(41);
+    let second = fragment(42);
+    let expected = first.facts().clone() + second.facts().clone();
+    store.commit(source, &authority, first).unwrap();
+    store.commit(source, &authority, second).unwrap();
+
+    let maintained = block_on(store.maintain(target)).unwrap();
+    assert_eq!(source.policy(&maintained).unwrap(), expected_policy);
+    assert_eq!(
+        Collection::<SimpleArchive>::open(&maintained, source.handle()).unwrap(),
+        source
+    );
+    assert_eq!(
+        Collection::<SuccinctArchiveBlob>::open(&maintained, target.handle()).unwrap(),
+        target
+    );
+    let observed = maintained.collection(target).unwrap();
+    assert_eq!(observed.support().len(), 2);
+    assert_eq!(
+        observed
+            .view::<UnionArchive<OrderedUniverse>>()
+            .unwrap()
+            .iter()
+            .collect::<TribleSet>(),
+        expected,
+    );
+    let before = maintained
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let after = block_on(store.maintain(target)).unwrap();
+    assert_eq!(
+        after
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        before
+    );
+}
+
+#[test]
+fn unrecognized_policy_never_grants_access_or_poison_other_collections() {
+    let authority = key(43);
+    let expected = fragment(44);
+    let expected_facts = expected.facts().clone();
+    let unknown_kind = rngid();
+    let mut store = MemoryRepo::default();
+    let unknown = store
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: SimpleArchive::id(),
+            collection_read_policy*: entity! { metadata::tag: &unknown_kind },
+            collection_write_policy*: entity! { metadata::tag: &unknown_kind },
+        })
+        .unwrap();
+    let healthy = store
+        .collection("healthy", policy(authority.verifying_key()))
+        .unwrap();
+    store.commit(unknown, &authority, expected.clone()).unwrap();
+    store.commit(healthy, &authority, expected).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    // These singular consumers still report a policy-query miss as an error.
+    // Changing them to expose absent/multiple interpretations is deliberately
+    // not smuggled into the encoding/annotation cleanup.
+    assert!(Collection::<SimpleArchive>::open(&snapshot, unknown.handle()).is_err());
+    assert!(unknown
+        .reader_is_admitted(&snapshot, authority.verifying_key())
+        .is_err());
+    assert!(unknown
+        .writer_is_admitted(&snapshot, authority.verifying_key())
+        .is_err());
+    assert!(unknown.admitted(&snapshot).is_err());
+    assert_eq!(
+        healthy.read::<TribleSet, _>(&snapshot).unwrap(),
+        expected_facts
+    );
 }
 
 #[test]

@@ -55,9 +55,16 @@ let snapshot = storage.snapshot()?;
 let models = Collection::<SimpleArchive>::open(&snapshot, collection_handle)?;
 ```
 
-`open` fetches and validates the canonical descriptor and checks that its
-member encoding is `SimpleArchive`. It never registers, rewrites, or otherwise
-mutates the store.
+`open` fetches the canonical archive, reads its local policy, and queries for a
+tagged descriptor entity naming `SimpleArchive`. Extra representation facts,
+retired attributes, or descriptive names do not negate that match. It never
+registers, rewrites, or otherwise mutates the store.
+
+Raw `register_collection::<E>` similarly recognizes the encoding context it
+needs and stores the complete fragment; policy and lineage are queried when a
+consumer needs them. The current policy and ancestry APIs remain singular:
+they do not yet expose multiple descriptor interpretations, and an unknown
+policy is never treated as public admission.
 
 ## Publish a root collection
 

@@ -1,6 +1,6 @@
-//! Reading one collection descriptor.
+//! Reading collection descriptor facts.
 //!
-//! A descriptor is an ordinary [`TribleSet`]: the facts of one
+//! A descriptor is an ordinary [`TribleSet`]: facts constructed with
 //! [`entity!`](crate::macros::entity), stored as a
 //! [`SimpleArchive`](crate::blob::encodings::simplearchive::SimpleArchive)
 //! blob whose handle is the collection identity. The descriptor names its
@@ -15,10 +15,11 @@
 //! READ and WRITE policy fragments. Each action is either open or governed by
 //! a quorum over its own canonical root set; there is no privileged collection
 //! owner or shared anchor. Policy is never inferred by walking the source
-//! chain. Readers first locate the one tagged
-//! descriptor entity, then bind
-//! every field lookup to that exact entity so embedded descriptions cannot
-//! accidentally satisfy descriptor shape.
+//! chain. Readers query the facts they need; unrelated fields and retired
+//! attributes are not a reason to reject the archive. The singular accessors
+//! below still require one descriptor entity and unambiguous field values;
+//! they do not define a law for combining multiple policy or lineage
+//! interpretations.
 
 use itertools::Itertools;
 
@@ -29,10 +30,9 @@ use crate::blob::Blob;
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
-use crate::inline::encodings::iu256::U256;
-use crate::inline::{Inline, InlineEncoding, IntoInline, RawInline};
+use crate::inline::{Inline, IntoInline, RawInline};
 use crate::metadata::{self, MetaDescribe};
-use crate::prelude::{entity, find, pattern};
+use crate::prelude::{and, entity, find, or, pattern};
 use crate::query::TriblePattern;
 use crate::repo::{BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
@@ -48,18 +48,12 @@ use super::records::{
 };
 use super::{CollectionEncoding, CollectionMapping};
 
-/// Retired `collection_recipe` attribute, minted with `trible genid` on
-/// 2026-08-07. It remains only as a rejection marker: accepting an old recipe
-/// descriptor as a recipe-free encoding descriptor would silently reinterpret
-/// its identity and laws.
-const OBSOLETE_COLLECTION_RECIPE: Id = crate::id::id_hex!("5D338C58D897B969BE1AE0956CCFE301");
-
 /// Store one descriptor archive and every blob carried by its self-contained
 /// Fragment, returning the canonical descriptor handle.
 ///
 /// The descriptor identity covers only its fact archive. Names and embedded
 /// self-descriptions may reference separate blobs, so publishing facts alone
-/// would leave a descriptor whose shape validates but whose descriptions
+/// would leave a descriptor whose facts are readable but whose descriptions
 /// cannot be read. Registration therefore stores the complete closure before
 /// publishing any later record which names the descriptor handle.
 pub(crate) fn put_closure<S>(
@@ -198,24 +192,17 @@ pub fn mapping_algorithm(facts: &TribleSet) -> Result<Option<Id>, RecordDecodeEr
     let Some(mapping) = mapping(facts)? else {
         return Ok(None);
     };
-    let kind: Inline<GenId> = KIND_COLLECTION_MAPPING.to_inline();
-    if !facts.iter().any(|fact| {
-        fact.e() == &mapping && fact.a() == &metadata::tag.id() && fact.v::<GenId>() == &kind
-    }) {
-        return Err(RecordDecodeError::MissingField(
-            "mapping metadata::tag KIND_COLLECTION_MAPPING",
-        ));
-    }
     exactly_one(
         find!(
-            (v: Id?),
-            pattern!(facts, [{ mapping @ mapping_algorithm_attribute: ?v }])
-        )
-        .map(|(v,)| v),
+            v: Id,
+            pattern!(facts, [{ mapping @
+                metadata::tag: KIND_COLLECTION_MAPPING,
+                mapping_algorithm_attribute: ?v,
+            }])
+        ),
         "mapping_algorithm",
-    )?
+    )
     .map(Some)
-    .map_err(|_| RecordDecodeError::InvalidId("mapping_algorithm"))
 }
 
 /// The collection this one derives from, if it derives from one.
@@ -252,18 +239,26 @@ pub fn name(facts: &TribleSet) -> Result<Option<Inline<Handle<UTF8String>>>, Rec
 
 /// Immutable capability policy declared by this descriptor.
 ///
-/// Both links are required and single-valued. Their linked policy entities are
-/// decoded independently; unknown kinds and invalid quorum geometry fail
-/// closed as malformed descriptors.
+/// This singular accessor still requires both links to be single-valued.
+/// Only facts on the descriptor and the linked policy entities participate;
+/// fields on embedded descriptions cannot supply or invalidate a policy.
+/// Unknown kinds and invalid quorum geometry never imply open admission.
 pub fn policy(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> {
-    let read =
-        exactly_one_descriptor_inline(facts, &collection_read_policy, "collection_read_policy")?
-            .try_from_inline::<Id>()
-            .map_err(|_| RecordDecodeError::InvalidId("collection_read_policy"))?;
-    let write =
-        exactly_one_descriptor_inline(facts, &collection_write_policy, "collection_write_policy")?
-            .try_from_inline::<Id>()
-            .map_err(|_| RecordDecodeError::InvalidId("collection_write_policy"))?;
+    let descriptor = entity(facts)?;
+    let read = exactly_one(
+        find!(
+            read: Id,
+            pattern!(facts, [{ descriptor @ collection_read_policy: ?read }])
+        ),
+        "collection_read_policy",
+    )?;
+    let write = exactly_one(
+        find!(
+            write: Id,
+            pattern!(facts, [{ descriptor @ collection_write_policy: ?write }])
+        ),
+        "collection_write_policy",
+    )?;
     Ok(CollectionPolicy::new(
         decode_admission_policy(facts, read)?,
         decode_admission_policy(facts, write)?,
@@ -275,105 +270,43 @@ fn decode_admission_policy(
     policy: Id,
 ) -> Result<AdmissionPolicy, RecordDecodeError> {
     let kind = exactly_one(
-        facts
-            .iter()
-            .filter(|fact| fact.e() == &policy && fact.a() == &metadata::tag.id())
-            .map(|fact| *fact.v::<GenId>()),
+        find!(
+            kind: Id,
+            and!(
+                pattern!(facts, [{ policy @ metadata::tag: ?kind }]),
+                or!(
+                    kind.is(KIND_ADMISSION_POLICY_OPEN.to_inline()),
+                    kind.is(KIND_ADMISSION_POLICY_QUORUM.to_inline()),
+                ),
+            )
+        ),
         "admission policy metadata::tag",
-    )?
-    .try_from_inline::<Id>()
-    .map_err(|_| RecordDecodeError::InvalidId("admission policy metadata::tag"))?;
+    )?;
 
-    let policy_fields = [
-        admission_policy_root.id(),
-        admission_invoke_threshold.id(),
-        admission_delegate_threshold.id(),
-    ];
     if kind == KIND_ADMISSION_POLICY_OPEN {
-        if facts.iter().any(|fact| {
-            fact.e() == &policy && policy_fields.iter().any(|attribute| fact.a() == attribute)
-        }) {
-            return Err(RecordDecodeError::InvalidId("open admission policy fields"));
-        }
         return Ok(AdmissionPolicy::Open);
     }
-    if kind != KIND_ADMISSION_POLICY_QUORUM {
-        return Err(RecordDecodeError::InvalidId(
-            "admission policy metadata::tag",
-        ));
-    }
 
-    let roots = facts
-        .iter()
-        .filter(|fact| fact.e() == &policy && fact.a() == &admission_policy_root.id())
-        .map(|fact| {
-            (*fact.v::<crate::inline::encodings::ed25519::ED25519PublicKey>())
-                .try_from_inline::<ed25519_dalek::VerifyingKey>()
-                .map_err(|_| RecordDecodeError::InvalidId("admission_policy_root"))
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let roots = find!(
+        root: ed25519_dalek::VerifyingKey,
+        pattern!(facts, [{ policy @ admission_policy_root: ?root }])
+    );
     let invoke = exactly_one(
-        facts
-            .iter()
-            .filter(|fact| fact.e() == &policy && fact.a() == &admission_invoke_threshold.id())
-            .map(|fact| *fact.v::<U256>()),
+        find!(
+            invoke: u32,
+            pattern!(facts, [{ policy @ admission_invoke_threshold: ?invoke }])
+        ),
         "admission_invoke_threshold",
-    )?
-    .try_from_inline::<u32>()
-    .map_err(|_| RecordDecodeError::InvalidId("admission_invoke_threshold"))?;
+    )?;
     let delegate = at_most_one(
-        facts
-            .iter()
-            .filter(|fact| fact.e() == &policy && fact.a() == &admission_delegate_threshold.id())
-            .map(|fact| *fact.v::<U256>()),
+        find!(
+            delegate: u32,
+            pattern!(facts, [{ policy @ admission_delegate_threshold: ?delegate }])
+        ),
         "admission_delegate_threshold",
-    )?
-    .map(|value| {
-        value
-            .try_from_inline::<u32>()
-            .map_err(|_| RecordDecodeError::InvalidId("admission_delegate_threshold"))
-    })
-    .transpose()?;
+    )?;
     AdmissionPolicy::quorum(roots, invoke, delegate)
         .map_err(|_| RecordDecodeError::InvalidId("admission policy quorum"))
-}
-
-/// Validate the representation-independent shape shared by every collection
-/// descriptor and return its local policy.
-///
-/// A root is named and has no source mapping. A derived collection is unnamed
-/// and carries both its source and one concrete mapping. Encoding-specific
-/// context is deliberately left to [`CollectionEncoding::validate_descriptor`]
-/// at the typed boundary.
-pub fn validate(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> {
-    let descriptor = entity(facts)?;
-    if facts
-        .iter()
-        .any(|fact| fact.e() == &descriptor && fact.a() == &OBSOLETE_COLLECTION_RECIPE)
-    {
-        return Err(RecordDecodeError::ObsoleteField("collection_recipe"));
-    }
-    representation(facts)?;
-    let name = name(facts)?;
-    let source = source(facts)?;
-    let mapping = mapping(facts)?;
-    match (name, source, mapping) {
-        (Some(_), None, None) => {}
-        (None, Some(_), Some(_)) => {
-            mapping_algorithm(facts)?;
-        }
-        (None, None, None) => {
-            return Err(RecordDecodeError::MissingField(
-                "collection_name or collection_source with collection_mapping",
-            ));
-        }
-        _ => {
-            return Err(RecordDecodeError::RepeatedField(
-                "collection shape (root name or derived source/mapping)",
-            ));
-        }
-    }
-    policy(facts)
 }
 
 /// Look up one descriptor argument by attribute.
@@ -411,24 +344,6 @@ fn argument_on(
         .map(|(v,)| v.raw),
         field,
     )
-}
-
-/// Decode one required single-valued field and require that it belongs to the
-/// exact tagged descriptor entity.
-fn exactly_one_descriptor_inline<S: InlineEncoding>(
-    facts: &TribleSet,
-    attribute: &crate::attribute::Attribute<S>,
-    field: &'static str,
-) -> Result<Inline<S>, RecordDecodeError> {
-    let descriptor = entity(facts)?;
-    let fact = exactly_one(
-        facts.iter().filter(|fact| fact.a() == &attribute.id()),
-        field,
-    )?;
-    if fact.e() != &descriptor {
-        return Err(RecordDecodeError::FieldOnWrongEntity(field));
-    }
-    Ok(*fact.v::<S>())
 }
 
 /// `Itertools::exactly_one`, saying which field the rows came from.
@@ -579,7 +494,7 @@ mod policy_tests {
         };
         assert_eq!(
             policy(fragment.facts()),
-            Err(RecordDecodeError::InvalidId(
+            Err(RecordDecodeError::MissingField(
                 "admission policy metadata::tag"
             ))
         );
@@ -612,24 +527,93 @@ mod policy_tests {
     }
 
     #[test]
-    fn retired_recipe_is_still_rejected() {
-        let mut fragment = root(
-            "legacy",
-            CollectionPolicy::new(
-                AdmissionPolicy::direct(key(9)),
-                AdmissionPolicy::direct(key(9)),
-            ),
-        );
-        let descriptor = fragment.root().expect("descriptor root");
-        let value: Inline<GenId> = KIND_COLLECTION_MAPPING.to_inline();
-        fragment.facts_mut().insert(&Trible::force(
-            &descriptor,
-            &OBSOLETE_COLLECTION_RECIPE,
-            &value,
-        ));
+    fn policy_ignores_annotations_and_fields_on_other_entities() {
+        let read = crate::id::rngid();
+        let write = crate::id::rngid();
+        let subject = crate::id::rngid();
+        let mut fragment = entity! { &subject @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_read_policy*: entity! { &read @
+                metadata::tag*: [KIND_ADMISSION_POLICY_OPEN, metadata::KIND_BLOB_ENCODING],
+                admission_policy_root: key(9),
+                admission_invoke_threshold: 0_u32,
+            },
+            collection_write_policy*: entity! { &write @
+                metadata::tag*: [KIND_ADMISSION_POLICY_QUORUM, metadata::KIND_BLOB_ENCODING],
+                admission_policy_root: key(9),
+                admission_invoke_threshold: 1_u32,
+            },
+        };
+        // An embedded description may use the same attributes. It is not a
+        // second policy link on this descriptor.
+        fragment += entity! {
+            collection_read_policy*: AdmissionPolicy::direct(key(10)).fragment(),
+            collection_write_policy*: AdmissionPolicy::Open.fragment(),
+        };
         assert_eq!(
-            validate(fragment.facts()),
-            Err(RecordDecodeError::ObsoleteField("collection_recipe"))
+            policy(fragment.facts()),
+            Ok(CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(key(9))
+            ))
+        );
+    }
+
+    #[test]
+    fn policy_does_not_borrow_a_missing_link_from_another_entity() {
+        let mut fragment = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_write_policy*: AdmissionPolicy::direct(key(9)).fragment(),
+        };
+        fragment += entity! {
+            collection_read_policy*: AdmissionPolicy::Open.fragment(),
+        };
+        assert_eq!(
+            policy(fragment.facts()),
+            Err(RecordDecodeError::MissingField("collection_read_policy"))
+        );
+    }
+
+    #[test]
+    fn typed_policy_queries_ignore_undecodable_values() {
+        let expected =
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::direct(key(9)));
+        let mut fragment = root("typed-policy-values", expected.clone());
+        let subject = fragment.root().unwrap();
+        let write = find!(
+            write: Id,
+            pattern!(fragment.facts(), [{ subject @ collection_write_policy: ?write }])
+        )
+        .next()
+        .unwrap();
+        fragment.facts_mut().insert(&Trible::force(
+            &subject,
+            &collection_read_policy.id(),
+            &Inline::<GenId>::new([0xFF; 32]),
+        ));
+        fragment.facts_mut().insert(&Trible::force(
+            &write,
+            &admission_invoke_threshold.id(),
+            &Inline::<crate::inline::encodings::iu256::U256>::new([0xFF; 32]),
+        ));
+        assert_eq!(policy(fragment.facts()), Ok(expected));
+
+        // Filtering is not a fallback to Open when no threshold decodes.
+        let unreadable = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_read_policy*: AdmissionPolicy::Open.fragment(),
+            collection_write_policy*: entity! {
+                metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+                admission_policy_root: key(9),
+                admission_invoke_threshold:
+                    Inline::<crate::inline::encodings::iu256::U256>::new([0xFF; 32]),
+            },
+        };
+        assert_eq!(
+            policy(unreadable.facts()),
+            Err(RecordDecodeError::MissingField(
+                "admission_invoke_threshold"
+            ))
         );
     }
 }

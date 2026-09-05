@@ -21,11 +21,14 @@ use std::marker::PhantomData;
 
 use crate::blob::{Blob, BlobEncoding};
 use crate::inline::encodings::hash::Handle;
-use crate::metadata::MetaDescribe;
+use crate::metadata::{self, MetaDescribe};
+use crate::prelude::{exists, pattern};
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta};
 use crate::trible::Fragment;
 
-use super::{descriptor, CollectionData, CollectionHandle, RecordDecodeError};
+use super::{
+    collection_representation, CollectionData, CollectionHandle, KIND_COLLECTION_DESCRIPTOR,
+};
 
 /// Failure of one exact canonical collection operation.
 ///
@@ -386,14 +389,10 @@ impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
 /// A descriptor does not denote the encoding requested by its Rust type.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionTypeError {
-    /// The descriptor could not be decoded structurally.
-    Malformed(RecordDecodeError),
-    /// The descriptor names another canonical encoding.
+    /// No tagged descriptor entity names the requested encoding.
     WrongEncoding {
         /// Encoding required by the Rust type.
         expected: crate::id::Id,
-        /// Encoding carried by the descriptor.
-        actual: crate::id::Id,
     },
     /// The descriptor names the right encoding but supplies invalid context.
     InvalidDescriptor(CollectionOperationError),
@@ -402,10 +401,9 @@ pub enum CollectionTypeError {
 impl fmt::Display for CollectionTypeError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Malformed(source) => source.fmt(formatter),
-            Self::WrongEncoding { expected, actual } => write!(
+            Self::WrongEncoding { expected } => write!(
                 formatter,
-                "collection encoding {actual:X} does not match {expected:X}",
+                "no collection descriptor names encoding {expected:X}",
             ),
             Self::InvalidDescriptor(source) => {
                 write!(formatter, "invalid collection encoding context: {source}")
@@ -417,26 +415,29 @@ impl fmt::Display for CollectionTypeError {
 impl Error for CollectionTypeError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Malformed(source) => Some(source),
             Self::InvalidDescriptor(source) => Some(source),
             Self::WrongEncoding { .. } => None,
         }
     }
 }
 
-/// Verify that one descriptor denotes `E`.
+/// Recognize the descriptor facts needed to interpret members as `E`.
+///
+/// A matching encoding fact is sufficient; other representations, annotations,
+/// and legacy fields do not invalidate it. Policy and lineage are separate
+/// queries at their respective consumers, not encoding prerequisites.
 pub(crate) fn validate_descriptor_type<E>(
     descriptor_fragment: &Fragment,
 ) -> Result<(), CollectionTypeError>
 where
     E: CollectionEncoding,
 {
-    descriptor::validate(descriptor_fragment.facts()).map_err(CollectionTypeError::Malformed)?;
-    let actual = descriptor::representation(descriptor_fragment.facts())
-        .map_err(CollectionTypeError::Malformed)?;
     let expected = E::id();
-    if actual != expected {
-        return Err(CollectionTypeError::WrongEncoding { expected, actual });
+    if !exists!(pattern!(descriptor_fragment.facts(), [{ _?descriptor @
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation: expected,
+    }])) {
+        return Err(CollectionTypeError::WrongEncoding { expected });
     }
     E::validate_descriptor(descriptor_fragment).map_err(CollectionTypeError::InvalidDescriptor)
 }
