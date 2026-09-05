@@ -527,9 +527,8 @@ the edge always runs successor-to-predecessor — "I observed that" is a claim
 about your own new entity, whereas "I replace that" would be a claim about
 someone else's. `metadata::supersedes` is the published attribute for it.
 
-The question "which states are current" is answered by *absence*, which the
-monotone engine cannot state as a constraint. It is nevertheless a lawful
-lattice operation, and it lives in the query layer as
+The pure utility answers "which of these candidates has no known successor"
+with reverse-index probes. It lives in the query layer as
 [`latest`](triblespace::core::query::frontier::latest):
 
 ```rust,ignore
@@ -546,13 +545,11 @@ designs usually go wrong:
   of commits*, which is exactly what a collection view is. Two readers holding
   different commit sets legitimately disagree, and that is frame-relativity,
   not a consistency bug. The `facts` argument is that frame.
-- **It is monotone, in the right lattice.** `latest` maps the commit-set
-  lattice (joined by union) into the antichain lattice ordered by domination
-  (joined by taking the maximal elements of the union), and
-  `latest(C₁ ∪ C₂) = latest(C₁) ⊔ latest(C₂)`. Head resolution looks
-  non-monotone only when it is evaluated in the *inclusion* lattice, where a
-  new successor shrinks the answer; under domination a taller element absorbing
-  a shorter one **is** the join.
+- **A maintained head set needs its evidence.** For a fixed transitive partial
+  order, antichains join by taking maxima of their union. Here the order evidence
+  arrives with the source facts: bare opaque head ids do not retain discarded
+  ancestry. The maintained form below therefore retains historical superseded
+  targets beside known live heads, and is monotone under that pair's join order.
 - **The predicate is local.** `s` is maximal in `C` exactly when no state in
   `C` observes `s` — note "in `C`", not "in the frontier". Anything that
   observes `s` already dominates it, so immediate edges suffice: no transitive
@@ -633,7 +630,7 @@ nothing else.
 An earlier design folded concrete parameters into an otherwise opaque
 algorithm id. The digest became their only carrier, so no reader could recover
 which attributes a register was over. The current shape stores parameters on
-the mapping entity itself; `observed_union`, `lww_register`, and other derived
+the mapping entity itself; `latest`, `lww_register`, and other derived
 collections all use the same content-derived mechanism.
 
 An order composes into a query directly. `maximal` is a filter-only constraint:
@@ -665,24 +662,45 @@ resolution rather than after it — materialise with `resolve` and propose from 
 
 ### The maintained form
 
-[`collection::observed_union`](triblespace::core::collection::observed_union) is
-the same resolution as an exact derived collection, for readers that would
-otherwise pay a probe per candidate on every read.
-
-It maintains the set of *observed* states rather than the frontier, and the
-asymmetry is the whole point. The frontier is antitone in the inclusion lattice
-the store runs on — a new commit can remove a member — so a derive producing it
-would not be lawful. Its complement only ever grows:
+[`collection::latest`](triblespace::core::collection::latest) maintains an
+ordinary latest-state lattice. `LatestBlob` stores `(H, D)`: known live states
+and all historically superseded targets, including targets whose own facts
+have not arrived. Its canonical join is
 
 ```text
-observed(C₁ ∪ C₂) = observed(C₁) ∪ observed(C₂)
+(H₁, D₁) ⊔ (H₂, D₂) = ((H₁ ∪ H₂) ∖ (D₁ ∪ D₂), D₁ ∪ D₂)
 ```
 
-which is a join homomorphism into a plain union lattice. **The store maintains
-what accumulates; the reader performs what negates**, by subtracting, in its own
-frame — where the light-cone argument says currency belongs anyway. The
-resulting `ObservedIndex` implements the same `RegisterOrder` trait, so moving a
-call from live probes to the maintained index changes its cost and nothing else.
+Leaf derivation projects every source subject into `S` and every well-formed
+target of the configured observation attribute into `D`, then stores
+`(S ∖ D, D)`. Both projections preserve source union. They do not require a
+multi-field state shape, whose fields might arrive in separate commits.
+`derive(C₁ ∪ C₂) = derive(C₁) ⊔ derive(C₂)` therefore holds byte-exactly.
+
+Historical `D` is necessary: after `b → a, c → b` leaves only `c` live, a
+later arrival of `a` must still be suppressed. Cycles are deterministic too:
+every observed cycle member is retired; no DAG validation is imposed. The
+head projection is **neither monotone nor antitone under inclusion**. The
+maintained pair is monotone under its own join order.
+
+`LatestIndex` exposes `H` as ordinary positive membership, with exact
+cardinality, complete proposals, and binary-search confirmation:
+
+```rust,ignore
+let index: LatestIndex = snapshot.collection(latest_collection)?.view()?;
+let heads: Vec<Id> = find!(state: Id, index.has(state)).collect();
+let current: Vec<Id> = find!(state: Id, and!(
+    index.has(state),
+    pattern!(&facts, [{ ?state @ metadata::tag: revision_kind }]),
+)).collect();
+```
+
+Unknown candidates are excluded, unlike the pure negative register utilities.
+Facts and latest may advance independently: an unobserved new state stays
+invisible, while an already-known old state can remain visible until latest
+advances. There is no shared-support requirement or global-current promise.
+Queries are pure reads of frozen observations; ordinary `ensure`/`maintain`
+advances the collection outside the query.
 
 [`collection::lww_register`](triblespace::core::collection::lww_register) is
 the maintained counterpart for a stated last-write-wins register. Its target
@@ -691,8 +709,9 @@ That detail is essential: the two facts for one state may arrive in different
 source commits, so deriving only already-complete coordinates would not commute
 with source union. Once an exact target cover is joined, `LwwIndex` pairs the
 sets and selects the greatest `(order, state-id)` coordinate for every register.
-It implements `RegisterOrder`, and therefore substitutes for
-`StatedOrder::tiebreak_by_id()` at read time.
+Its `.has(state)` constraint positively proposes and confirms only known
+complete winners, excluding unknown and incomplete states. Its existing
+`RegisterOrder` implementation remains available for pure order-based reads.
 
 The maintained LWW form makes one validity contract explicit: within an exact
 cover, a state which has both halves has at most one well-formed identity and

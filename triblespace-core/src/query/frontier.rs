@@ -36,20 +36,19 @@
 //!
 //! # Monotonicity
 //!
-//! `latest` is a join homomorphism between two lattices. The domain is the
-//! commit-set lattice ordered by inclusion, joined by union. The codomain is
-//! the **antichain lattice** ordered by domination — `A` is below `B` when
-//! every element of `A` is dominated by (or equal to) some element of `B` —
-//! joined by taking the maximal elements of the union:
+//! For a fixed transitive partial order, antichains join by taking maxima of
+//! their union. Observation-dependent ordering needs additional evidence:
+//! discarded ancestors are not recoverable from opaque surviving head ids.
+//! This utility reads that evidence from `facts` for caller-supplied candidates;
+//! it is not itself a persisted heads-only lattice.
 //!
-//! ```text
-//! latest(C1 union C2) = latest(C1) join latest(C2)
-//! ```
-//!
-//! Head resolution looks non-monotone only when it is evaluated in the
-//! *inclusion* lattice, where adding a successor shrinks the answer. In the
-//! domination lattice a taller element absorbing a shorter one **is** the
-//! join, and the map is monotone.
+//! The maintained [`latest`](crate::collection::latest) collection instead
+//! stores `(known live states, all historical superseded targets)`. Its join
+//! preserves the history needed to prevent resurrection, while exposing known
+//! live states through positive membership. Unknown caller candidates can
+//! survive this pure utility but cannot survive that positive index. As source
+//! subjects and observations grow, live heads are neither monotone nor antitone
+//! under inclusion; the maintained pair is monotone under its own join order.
 //!
 //! # The predicate is local
 //!

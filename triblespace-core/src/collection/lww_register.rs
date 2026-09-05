@@ -50,6 +50,12 @@
 //! equal keys are broken by state id. The order attribute must therefore use
 //! an order-preserving encoding, the same contract as
 //! [`StatedOrder::tiebreak_by_id`](crate::query::register::StatedOrder::tiebreak_by_id).
+//!
+//! [`LwwIndex`]'s `.has(state)` is ordinary positive query membership over its
+//! known complete winners. It proposes those ids with their exact cardinality
+//! and confirms only them, excluding unknown and incomplete states. The pure
+//! [`RegisterOrder`] utility remains available separately; it does not promise
+//! positive membership for candidates it has never observed.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::Infallible;
@@ -67,6 +73,10 @@ use crate::macros::entity;
 use crate::metadata;
 use crate::metadata::MetaDescribe;
 use crate::query::register::{register_identity, register_orders, RegisterOrder};
+use crate::query::{
+    Binding, Candidates, Constraint, ContainsConstraint, Frontier, ProposalBuffer, Variable,
+    VariableId, VariableSet,
+};
 use crate::repo::BlobStoreGet;
 use crate::trible::{Fragment, Trible, A_START, E_START, TRIBLE_LEN, V_START};
 use anybytes::Bytes;
@@ -586,6 +596,91 @@ impl LwwIndex {
             .get(&raw)
             .map(|(_, state)| Id::new(*state).expect("indexed states are non-nil"))
     }
+
+    /// Whether this state is a known complete winner in this observation.
+    /// Unknown states and states missing either coordinate half are excluded.
+    pub fn contains(&self, state: Id) -> bool {
+        let raw: RawId = state[..].try_into().expect("id is 16 bytes");
+        self.coordinates.get(&raw).is_some_and(|(register, _)| {
+            self.winners
+                .get(register)
+                .is_some_and(|(_, winner)| *winner == raw)
+        })
+    }
+}
+
+/// Positive membership in an attached index's known complete winning states.
+pub struct LwwConstraint<'a> {
+    variable: Variable<GenId>,
+    index: &'a LwwIndex,
+}
+
+impl<'a> ContainsConstraint<'a, GenId> for &'a LwwIndex {
+    type Constraint = LwwConstraint<'a>;
+
+    fn has(self, variable: Variable<GenId>) -> Self::Constraint {
+        LwwConstraint {
+            variable,
+            index: self,
+        }
+    }
+}
+
+impl<'a> Constraint<'a> for LwwConstraint<'a> {
+    fn variables(&self) -> VariableSet {
+        VariableSet::new_singleton(self.variable.index)
+    }
+
+    fn estimate(&self, variable: VariableId, _binding: &Binding) -> Option<usize> {
+        (self.variable.index == variable).then_some(self.index.register_count())
+    }
+
+    fn propose(
+        &self,
+        variable: VariableId,
+        frontier: &Frontier<'_>,
+        proposals: &mut ProposalBuffer,
+    ) {
+        use crate::inline::IntoInline;
+        if self.variable.index == variable {
+            for row in 0..frontier.len() {
+                proposals.open(row as u32);
+                proposals.extend(self.index.winners.values().map(|(_, state)| {
+                    let value: Inline<GenId> = state.to_inline();
+                    value.raw
+                }));
+            }
+        }
+    }
+
+    fn confirm(
+        &self,
+        variable: VariableId,
+        _frontier: &Frontier<'_>,
+        candidates: &mut Candidates<'_>,
+    ) {
+        if self.variable.index == variable {
+            for i in 0..candidates.len() {
+                if !candidates.is_live(i) {
+                    continue;
+                }
+                let keep = Inline::<GenId>::as_transmute_raw(&candidates.values()[i])
+                    .try_from_inline::<Id>()
+                    .is_ok_and(|state| self.index.contains(state));
+                if !keep {
+                    candidates.kill(i);
+                }
+            }
+        }
+    }
+
+    fn satisfied(&self, binding: &Binding) -> bool {
+        binding.get(self.variable.index).is_none_or(|raw| {
+            Inline::<GenId>::as_transmute_raw(raw)
+                .try_from_inline::<Id>()
+                .is_ok_and(|state| self.index.contains(state))
+        })
+    }
 }
 
 impl RegisterOrder for LwwIndex {
@@ -676,6 +771,38 @@ mod tests {
 
     fn project(facts: &TribleSet) -> Blob<LwwRegisterBlob> {
         derive_element(&archive(facts), state_of.id(), written_at.id()).expect("valid projection")
+    }
+
+    #[test]
+    fn positive_membership_proposes_known_winners_and_confirms_without_unknowns() {
+        let register = ufoid();
+        let other_register = ufoid();
+        let old = ufoid();
+        let winner = ufoid();
+        let other_winner = ufoid();
+        let incomplete = ufoid();
+        let unknown = ufoid();
+        let mut facts = coordinate(&old, &register, 1);
+        facts += coordinate(&winner, &register, 2);
+        facts += coordinate(&other_winner, &other_register, 1);
+        facts += identity(&incomplete, &register);
+        let index = LwwIndex::decode(&project(&facts)).unwrap();
+        let standalone: BTreeSet<_> = find!(state: Id, index.has(state)).collect();
+        assert_eq!(standalone, BTreeSet::from([*winner, *other_winner]));
+        facts += coordinate(&unknown, &register, 3);
+        let joined: BTreeSet<_> = find!(state: Id, and!(
+            pattern!(&facts, [{ ?state @ state_of: _?register }]),
+            index.has(state),
+        ))
+        .collect();
+        assert_eq!(joined, standalone);
+        for candidate in [*old, *winner, *other_winner, *incomplete, *unknown] {
+            let accepted =
+                exists!(state: Id, and!(state.is(candidate.to_inline()), index.has(state)));
+            assert_eq!(accepted, standalone.contains(&candidate));
+        }
+        let empty = LwwIndex::default();
+        assert_eq!(find!(state: Id, empty.has(state)).count(), 0);
     }
 
     #[test]

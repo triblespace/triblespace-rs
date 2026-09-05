@@ -71,7 +71,7 @@
 //! That made the digest the only carrier of the pair: nothing stored them, so
 //! no reader could recover which attributes a register was over. The same
 //! correction applies to
-//! [`observed_union`](crate::collection::observed_union)'s observed edge and
+//! [`latest`](crate::collection::latest)'s observed edge and
 //! to a path collection's automaton: both are parameters of content-derived
 //! mapping entities embedded in their target descriptors.
 //!
@@ -88,23 +88,18 @@
 //!
 //! # Monotonicity
 //!
-//! Resolution is a join homomorphism between two lattices. The domain is the
-//! commit-set lattice ordered by inclusion, joined by union. The codomain is
-//! the **antichain lattice** ordered by domination, joined by taking the
-//! maximal elements of the union:
+//! For a fixed transitive partial order, finite antichains form a lattice
+//! joined by taking the maximal elements of their union. Reversing that fixed
+//! order gives the corresponding minimum operation.
 //!
-//! ```text
-//! resolve(C1 union C2) = resolve(C1) join resolve(C2)
-//! ```
-//!
-//! Head resolution looks non-monotone only when it is evaluated in the
-//! *inclusion* lattice, where adding a successor shrinks the answer. In the
-//! domination lattice a taller element absorbing a shorter one **is** the
-//! join, and the map is monotone. This holds for every order here, including
-//! the reversed ones: reversing exchanges the lattice for its dual, and a
-//! join homomorphism into a dual lattice is still a join homomorphism — the
-//! meet of the original order. `min` is as lawful a join as `max`; it is
-//! simply the join of the opposite order.
+//! An observation relation is different: new source facts can supply order
+//! evidence which neither surviving head id carries. Re-resolving two head
+//! sets against their complete union frame is a useful pure operation, but
+//! is not a join on bare head sets alone. The maintained
+//! [`latest`](crate::collection::latest) collection stores known live states
+//! together with every historical superseded target, so its join needs no
+//! ambient source graph. Its live projection is neither monotone nor antitone
+//! under inclusion; the pair is monotone under its own join order.
 //!
 //! # Two exposures
 //!
@@ -1057,11 +1052,11 @@ mod tests {
     /// and this pins the difference — without it the homomorphism tests
     /// above could pass under a wrong-but-coincidental join.
     ///
-    /// In the inclusion lattice the same map is antitone: a state maximal
-    /// in `C1` alone can be demoted by a successor that only `C2` knows
-    /// about, so `resolve(C1) union resolve(C2)` strictly overshoots. The
-    /// operation was never non-monotone; it was being read in the wrong
-    /// lattice.
+    /// With a fixed candidate set, new observation edges can remove survivors,
+    /// so plain union of the two answers can overshoot. This test re-resolves
+    /// against the full union frame; it does not demonstrate a sufficient
+    /// standalone heads-only representation. When known subjects also grow,
+    /// the head projection is neither monotone nor antitone under inclusion.
     #[test]
     fn plain_union_is_not_the_join_in_the_codomain() {
         let base = ufoid();

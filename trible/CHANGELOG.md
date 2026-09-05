@@ -19,6 +19,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Changed
 
+- Name the new `LATEST_STATES_MAPPING_V1` algorithm in collection inspection,
+  replacing the retired unshipped observed-only mapping name.
 - Let each repair request carry bounded native READ(C) proofs only as cold
   bootstrap input. Same-session admission uses self-contained
   collection-scoped proof evidence pinned locally; newly supplied proofs land

@@ -32,11 +32,10 @@ pub mod encoding;
 mod exact_derived;
 /// Deterministic size-tiered maintenance behind exact derived collections.
 mod exact_target_compaction;
+/// Maintained positive latest states and historical supersession evidence.
+pub mod latest;
 /// Maintained stated last-write-wins registers over exact source covers.
 pub mod lww_register;
-/// Maintained observed-set projection — the monotone half of register
-/// resolution, derived and joined by the store.
-pub mod observed_union;
 mod operation_snapshot;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;

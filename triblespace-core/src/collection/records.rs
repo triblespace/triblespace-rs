@@ -1197,8 +1197,8 @@ mod tests {
 mod mapping_algorithm_description_tests {
     use crate::blob::encodings::utf8string::UTF8String;
     use crate::blob::IntoBlob;
+    use crate::collection::latest::LatestStatesMappingV1;
     use crate::collection::lww_register::RegisterCoordinatesMappingV1;
-    use crate::collection::observed_union::ObserveStatesMappingV1;
     use crate::collection::succinctarchive_union::{
         RawToRank9AcceleratedMappingV1, SimpleToSuccinctMappingV1,
     };
@@ -1237,9 +1237,9 @@ mod mapping_algorithm_description_tests {
             crate::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPPING_V1,
             "simple-to-succinct-v1",
         );
-        check::<ObserveStatesMappingV1>(
-            crate::collection::observed_union::OBSERVE_STATES_MAPPING_V1,
-            "observe-states-v1",
+        check::<LatestStatesMappingV1>(
+            crate::collection::latest::LATEST_STATES_MAPPING_V1,
+            "latest-states-mapping-v1",
         );
         check::<RegisterCoordinatesMappingV1>(
             crate::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1,

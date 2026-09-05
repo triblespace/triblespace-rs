@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Replace the unshipped observed-only register collection with
+  `collection::latest::{LatestBlob, LatestIndex}`. Maintain known live heads
+  and all historical superseded targets with a canonical no-resurrection join;
+  project every source subject so derivation distributes over split entity
+  fields. Expose positive `.has(state)` membership through the ordinary query
+  protocol, also for `LwwIndex`'s existing known complete winners. Correct the
+  distinction between fixed-order antichains and observation-dependent heads.
+  Fresh encoding/mapping ids were minted with installed `trible genid` on
+  2026-09-05: `35304D6FF3421A1F9C0DCF4F8C45D392` and
+  `2D3DFB807700200A43FD841406B46D77`. Source identities and old bytes are unchanged.
 - Ordinary derived `ensure` and `maintain` select the admitted support already
   realized by their immediate source. A new foundational commit, an unbuilt
   intermediate member, or a dangling source equation no longer makes a
@@ -1183,14 +1193,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   sorts it last and a `pattern!` proposes the scope — which removes the
   caller's obligation to materialise candidates. For an exact cardinality the
   planner can order around, `resolve` materialises and `SortedSlice` proposes.
-  `collection::observed_union` is the maintained form: an exact derived
+  `collection::observed_union` was the initial maintained form: an exact derived
   collection over `SimpleArchive` whose target is the sorted set of observed
   ids. It materialises the *dominated* half deliberately, because that half is
   the monotone one — a commit can only add to it — while the frontier is
-  antitone in the store's inclusion lattice. The reader subtracts, so the
-  negation stays in the reader's frame. `ObservedIndex` implements the same
-  `RegisterOrder` trait, so switching from live probes to the maintained index
-  changes a call's cost and nothing else.
+  non-monotone in the store's inclusion lattice. This unshipped design was
+  replaced by the maintained `(H,D)` latest lattice described above. The reader
+  subtracted the dominated set in its own frame. `ObservedIndex` implemented
+  `RegisterOrder`; the replacement positively exposes known live membership.
 
   Gated read-only against the live pile, with every count asserted non-zero so
   nothing passes vacuously: wiki frontiers (13006 revisions, 3098 entries),

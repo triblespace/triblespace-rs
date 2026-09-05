@@ -300,8 +300,8 @@ fn representation_name(id: Id) -> Option<&'static str> {
 
 /// Resolve a mapping-algorithm id against the algorithms declared in core.
 fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
+    use triblespace_core::collection::latest::LATEST_STATES_MAPPING_V1;
     use triblespace_core::collection::lww_register::REGISTER_COORDINATES_MAPPING_V1;
-    use triblespace_core::collection::observed_union::OBSERVE_STATES_MAPPING_V1;
     use triblespace_core::collection::succinctarchive_union::{
         RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE, RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE,
         RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE, RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE,
@@ -318,8 +318,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_LE")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_64_BE")
-    } else if id == OBSERVE_STATES_MAPPING_V1 {
-        Some("OBSERVE_STATES_MAPPING_V1")
+    } else if id == LATEST_STATES_MAPPING_V1 {
+        Some("LATEST_STATES_MAPPING_V1")
     } else if id == REGISTER_COORDINATES_MAPPING_V1 {
         Some("REGISTER_COORDINATES_MAPPING_V1")
     } else {
