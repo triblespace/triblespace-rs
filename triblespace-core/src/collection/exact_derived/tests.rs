@@ -1411,8 +1411,8 @@ fn target_maintenance_reprobes_once_per_tier_not_per_carry() {
     assert_eq!(merges, MEMBERS - 1);
     assert_eq!(
         store.semantic_probes.load(Ordering::SeqCst),
-        5,
-        "one ensure probe plus one target-resolution probe for each dyadic tier round",
+        6,
+        "one ensure probe, one source-guidance probe, and one target-resolution probe for each dyadic tier round",
     );
 
     let snapshot = store.inner.snapshot().unwrap();
@@ -1646,6 +1646,93 @@ fn optional_target_dependency_keeps_the_finer_cover() {
         record,
         CollectionRecord::Merge(merge) if merge.collection() == root.handle()
     )));
+}
+
+#[test]
+fn source_guidance_maps_only_the_resident_coarsest_upper_and_repeats_without_work() {
+    let (mut inner, root, first, _second) = collections();
+    let members = [archive(1, 1), archive(2, 2), archive(3, 3)];
+    for member in &members {
+        inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    let support = support(root, &members);
+    ensure_exact_resident::<_, FirstEncoding>(&mut inner, first, &support).unwrap();
+    let mut store = GuardStore::new(inner);
+
+    reset_mapping_calls();
+    block_on(store.maintain_exact(first, &support)).unwrap();
+    assert!(
+        store.events.is_empty(),
+        "missing source unions stay missing"
+    );
+    assert!(
+        store.acquired.is_empty(),
+        "optional source coarsening never fetches"
+    );
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+
+    let intermediate =
+        crate::collection::simplearchive_union::join(&members[0], &members[1]).unwrap();
+    let upper = crate::collection::simplearchive_union::join(&intermediate, &members[2]).unwrap();
+    // A resident upper outside the requested foundational support must not
+    // become a coarsening candidate merely because its bytes and record exist.
+    let outside = archive(4, 4);
+    let overreach = crate::collection::simplearchive_union::join(&upper, &outside).unwrap();
+    for member in [&intermediate, &upper, &outside, &overreach] {
+        store.inner.put::<SimpleArchive, _>(member.clone()).unwrap();
+    }
+    for (low, high, result) in [
+        (&members[0], &members[1], &intermediate),
+        (&intermediate, &members[2], &upper),
+        (&upper, &outside, &overreach),
+    ] {
+        store
+            .inner
+            .insert(CollectionRecord::Merge(CollectionMerge::new(
+                root.handle(),
+                data(low),
+                data(high),
+                data(result),
+            )))
+            .unwrap();
+    }
+
+    let after = block_on(store.maintain_exact(first, &support)).unwrap();
+    assert_eq!(
+        after
+            .collection_exact(first, &support)
+            .unwrap()
+            .cover()
+            .len(),
+        1
+    );
+    drop(after);
+    assert_eq!(
+        FIRST_MAP_CALLS.get(),
+        1,
+        "skip the historical intermediate image"
+    );
+    assert_eq!(
+        store.events.len(),
+        2,
+        "one target blob and one target DERIVE only"
+    );
+    assert!(matches!(store.events[0], WriteEvent::Put(_)));
+    assert!(
+        matches!(store.events[1], WriteEvent::Insert(CollectionRecord::Derive(derive))
+        if derive.collection() == first.handle() && derive.input() == data(&upper))
+    );
+    assert!(store.acquired.is_empty());
+
+    store.events.clear();
+    reset_mapping_calls();
+    block_on(store.maintain_exact(first, &support)).unwrap();
+    assert!(store.events.is_empty());
+    assert_eq!(
+        FIRST_MAP_CALLS.get(),
+        0,
+        "the already resident upper image is reused"
+    );
 }
 
 #[test]

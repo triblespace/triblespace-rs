@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Let derived maintenance follow the coarsest resident immediate-source cover
+  before ordinary target size-tier carries. Reuse existing child images when
+  a source merge witnesses their union, or map the resident coarse source
+  directly; do not construct historical intermediate images or upstream blobs.
+  Source-guided carries can cross target size tiers. Keep `ensure` coverage-only.
+  Add an optional image-join computation hook, allowing Rank9 construction to
+  reuse the resident raw union without serializing or hashing it again and to
+  decline unwitnessed carries before speculative raw work. Persisted records,
+  descriptor identities, and canonical blob encodings are unchanged.
 - Replace the unshipped observed-only register collection with
   `collection::latest::{LatestBlob, LatestIndex}`. Maintain known live heads
   and all historical superseded targets with a canonical no-resurrection join;

@@ -376,24 +376,35 @@ not necessary boilerplate for an ordinary multi-hop read.
   support. Both publish only missing `DERIVE` work and return a fresh store
   snapshot. Missing source members are invisible to ordinary selection, but
   remain unsatisfied obligations when explicitly requested.
-- `maintain` and `maintain_exact` additionally carry colliding target members
-  by serialized-size tier. They also return a fresh store snapshot.
+- `maintain` and `maintain_exact` additionally reuse coarsening already resident
+  in the immediate source, then carry colliding target members by serialized-size
+  tier. They also return a fresh store snapshot.
 
 An ensure may follow existing `MERGE` equations to reuse a resident
 support-equivalent target decomposition, but newly executed work crosses only
 the mapping. It stores each target artifact before its unsigned `DERIVE`
 record. It never creates a source or target `MERGE`.
 
-Maintenance starts from that derive-complete target cover and publishes only
-horizontal target `MERGE` work. If a target join cannot run because an optional
-immutable dependency is absent or the encoding has reached a capacity limit,
-the finer exact target cover remains the answer. A downstream operation never
-constructs an upstream member as a side effect.
+Maintenance starts from that derive-complete target cover. If a member `c` of
+the coarsest resident source cover provably subsumes at least two current target
+images, maintenance can publish `f(c)` even when those images occupy different
+target size tiers. A direct source equation `a ⊔ b = c` and resident images
+`f(a)`, `f(b)` let the mapping reuse their join with the already-built `c` as a
+witness. Otherwise it maps `c` directly. Historical intermediate images are not
+constructed merely to reach the selected coarse image; existing equal or larger
+target images already discharge the opportunity.
 
-The maintenance policy has no knob: a raw target member belongs to
+This adds a source-guided route, not recursive upstream maintenance or a global
+cost optimizer. It publishes only target `DERIVE` and `MERGE` records and their
+outputs. If a target join cannot run because an optional immutable dependency
+is absent or the encoding has reached a capacity limit, the finer exact target
+cover remains the answer. A downstream operation never constructs an upstream
+member as a side effect.
+
+The subsequent target-only LSM policy has no knob: a target member belongs to
 `floor(log2(max(1, serialized_len)))`, and the lowest two content handles in
-the lowest colliding tier are carried first. A capacity-limited encoding may
-leave a collision stable; otherwise the resulting cover has at
+the lowest colliding tier are carried first. An unavailable join route or
+capacity limit may leave a collision stable; otherwise the resulting cover has at
 most one member per tier. Pairwise-disjoint carries in one tier share a
 deterministic semantic plan, but each output is constructed against a cheap
 fresh store snapshot and published immediately. The exact per-point planner is
@@ -419,7 +430,11 @@ Rank9 acceleration both use the same collection algebra. The accelerated
 encoding is a Merkle root whose first 32 bytes name its exact portable raw
 child. It is also a full lattice: resident accelerated children `A(a)` and
 `A(b)` join canonically to `A(a ⊔ b)` when their exact raw union is already
-resident. If that dependency is absent, maintenance keeps `{A(a), A(b)}`; a
+resident with a source-merge witness. The mapping's optional `join_images` hook
+passes that union to accelerated construction, avoiding raw serialization and
+hashing; the hook's default is the ordinary canonical target join. If the raw
+union is absent, accelerated maintenance declines that carry before attempting
+to reconstruct it and keeps `{A(a), A(b)}`; a
 separate upstream maintenance call may later publish the raw union, after which
 a retry can carry the accelerated lattice. Each mapping or join emits exactly
 one blob and then its equation. Physical resolution excludes an accelerated

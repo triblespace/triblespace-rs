@@ -21,11 +21,12 @@ use crate::trible::Fragment;
 use super::discovery::{
     discover_collection_equations_for_lineage, discover_collection_equations_for_lineage_raw,
 };
+use super::encoding::{collection_member_availability, CollectionMemberAvailability};
 use super::operation_snapshot::OperationFrontier;
 use super::{
     collection_complete_physical_cover, descriptor, resolve_collection_semantics_from_roots,
     Collection, CollectionClaimValidation, CollectionData, CollectionDerive, CollectionEncoding,
-    CollectionHandle, CollectionMapping, CollectionOperationError, CollectionRead,
+    CollectionHandle, CollectionMapping, CollectionMerge, CollectionOperationError, CollectionRead,
     CollectionRecord, CollectionResolutionError, CollectionSemantics, Cover, Support,
 };
 #[cfg(test)]
@@ -892,7 +893,176 @@ where
     M: CollectionMapping,
 {
     ensure_exact_resident_in_frontier_with::<S, M>(store, target, support, unavailable, frontier)?;
-    super::exact_target_compaction::maintain_target(store, target, support, frontier)
+    let mapping =
+        coarsen_from_resident_source::<S, M>(store, target, support, unavailable, frontier)?;
+    super::exact_target_compaction::maintain_target_with(
+        store,
+        target,
+        support,
+        frontier,
+        |descriptor, low, high, reader| mapping.join_images(descriptor, None, low, high, reader),
+    )
+}
+
+/// Reuse coarsening already paid for by the immediate source. This is optional
+/// maintenance over an exact target, never coverage repair or upstream work.
+/// Only the coarsest complete resident source cover is considered; unavailable
+/// child images do not cause intermediate images to be constructed.
+fn coarsen_from_resident_source<S, M>(
+    store: &mut S,
+    target: Collection<M::Target>,
+    support: &Support,
+    unavailable: &BTreeSet<CollectionData>,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+) -> Result<M, CollectionRealizationError>
+where
+    S: Store,
+    M: CollectionMapping,
+{
+    let mut attempted = BTreeSet::new();
+    loop {
+        let snapshot = frontier.view(store.snapshot().map_err(|error| {
+            CollectionRealizationError::storage("open source-guided maintenance snapshot", error)
+        })?);
+        let probe = probe_mapping::<_, M>(&snapshot, target, support, unavailable)?;
+        let semantics = &probe.target_resolution.semantics;
+        let source = probe.source.handle();
+        let mut resident = BTreeSet::new();
+        for member in semantics.members(source).into_iter().flatten().copied() {
+            if snapshot
+                .metadata(Handle::<M::Source>::from_hash(member))
+                .map_err(|error| {
+                    CollectionRealizationError::storage(
+                        "inspect source coarsening residency",
+                        error,
+                    )
+                })?
+                .is_some()
+            {
+                resident.insert(member);
+            }
+        }
+        let selected = collection_complete_physical_cover::<M::Source, _>(
+            semantics, source, &resident, &snapshot,
+        );
+        let target_cover = probe.target_resolution.cover.data_members().collect();
+        let candidate = semantics
+            .source_coarsenings(
+                source,
+                target.handle(),
+                &selected.physical.cover,
+                &target_cover,
+            )
+            .into_iter()
+            .find(|(member, _)| !attempted.contains(member));
+        let Some((input_data, image_pairs)) = candidate else {
+            return Ok(probe.mapping);
+        };
+        attempted.insert(input_data);
+        let input: Blob<M::Source> = snapshot
+            .get(Handle::<M::Source>::from_hash(input_data))
+            .map_err(|error| {
+                CollectionRealizationError::storage("load resident source coarsening", error)
+            })?;
+        let descriptor = super::api::load_collection_descriptor(&snapshot, target.handle())
+            .map_err(|error| {
+                CollectionRealizationError::Resolution(format!(
+                    "load target descriptor for source-guided maintenance: {error}"
+                ))
+            })?
+            .fragment;
+
+        let mut joined = None;
+        for (low_data, high_data) in image_pairs {
+            let mut complete = true;
+            for member in [low_data, high_data] {
+                if !matches!(
+                    collection_member_availability::<M::Target, _>(member, &snapshot).map_err(
+                        |error| {
+                            CollectionRealizationError::storage(
+                                "inspect reusable target image",
+                                error,
+                            )
+                        }
+                    )?,
+                    CollectionMemberAvailability::Complete
+                ) {
+                    complete = false;
+                    break;
+                }
+            }
+            if !complete {
+                continue;
+            }
+            let low = snapshot
+                .get(Handle::<M::Target>::from_hash(low_data))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("load lower reusable target image", error)
+                })?;
+            let high = snapshot
+                .get(Handle::<M::Target>::from_hash(high_data))
+                .map_err(|error| {
+                    CollectionRealizationError::storage("load higher reusable target image", error)
+                })?;
+            match probe
+                .mapping
+                .join_images(&descriptor, Some(&input), &low, &high, &snapshot)
+            {
+                Ok(Some(output)) => joined = Some((output, (low_data, high_data))),
+                Ok(None)
+                | Err(CollectionOperationError::Capacity(_))
+                | Err(CollectionOperationError::MissingDependency(_)) => {}
+                Err(CollectionOperationError::Fatal(reason)) => {
+                    return Err(CollectionRealizationError::Merge {
+                        low: low_data,
+                        high: high_data,
+                        reason,
+                    });
+                }
+            }
+            break;
+        }
+        let (output, pair) = match joined {
+            Some((output, pair)) => (output, Some(pair)),
+            None => match probe.mapping.map(&input, &snapshot) {
+                Ok(output) => (output, None),
+                Err(CollectionOperationError::Capacity(_))
+                | Err(CollectionOperationError::MissingDependency(_)) => continue,
+                Err(CollectionOperationError::Fatal(reason)) => {
+                    return Err(CollectionRealizationError::Derive {
+                        input: input_data,
+                        reason,
+                    });
+                }
+            },
+        };
+        drop(snapshot);
+        let output_data = data_identity::<M::Target>(&output);
+        store.put::<M::Target, _>(output).map_err(|error| {
+            CollectionRealizationError::storage("store source-guided target member", error)
+        })?;
+        if let Some((low, high)) = pair {
+            let record = CollectionRecord::Merge(CollectionMerge::new(
+                target.handle(),
+                low,
+                high,
+                output_data,
+            ));
+            store.insert(record).map_err(|error| {
+                CollectionRealizationError::storage("publish source-guided target MERGE", error)
+            })?;
+            frontier.include_record(record);
+        }
+        let record = CollectionRecord::Derive(CollectionDerive::new(
+            target.handle(),
+            input_data,
+            output_data,
+        ));
+        store.insert(record).map_err(|error| {
+            CollectionRealizationError::storage("publish source-guided target DERIVE", error)
+        })?;
+        frontier.include_record(record);
+    }
 }
 
 pub(crate) async fn acquire_missing<S>(

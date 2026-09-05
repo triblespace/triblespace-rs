@@ -2085,11 +2085,12 @@ pub trait CollectionStoreExt: BlobStorePut + CollectionStore + Sized {
     ///
     /// A derived target selects the admitted support already realized by its
     /// immediate source; a root acquires its own admitted support. The chosen
-    /// support is frozen once before work begins. Maintenance has
-    /// no caller-visible budget or tuning knob: the encoding's deterministic
-    /// size-tier rule runs to its stable LSM fixed point, publishing each
-    /// useful carry independently on the way. The live store may acquire exact
-    /// dependencies while doing so.
+    /// support is frozen once before work begins. Derived maintenance first
+    /// reuses coarsening already resident in that source, without constructing
+    /// upstream members. Then deterministic target size-tier carries run to
+    /// their feasible LSM fixed point. There is no caller-visible budget or
+    /// tuning knob; every useful result is published independently. The live
+    /// store may acquire exact dependencies while doing so.
     fn maintain<T>(
         &mut self,
         target: Collection<T>,

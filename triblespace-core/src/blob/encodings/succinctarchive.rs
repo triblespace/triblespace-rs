@@ -2759,6 +2759,7 @@ fn stable_sort_materialized_rows(
 fn merge_ordered_archives_with_factory<F>(
     segments: &[SuccinctArchive<OrderedUniverse>],
     factory: &F,
+    source_union: Option<&Blob<SuccinctArchiveBlob>>,
 ) -> Result<SuccinctArchive<OrderedUniverse>, F::Error>
 where
     F: MergedWaveletFactory,
@@ -2802,8 +2803,8 @@ where
     let mut row_scratch = Vec::with_capacity(triple_count);
     let mut radix_counts = vec![0usize; domain_len];
 
-    // Reserve one compact process-local arena for the runtime. Public bytes are
-    // emitted independently through `encode_portable_runtime` below.
+    // Reserve one compact process-local arena for the runtime. Public raw bytes
+    // are supplied by a witnessed source union or encoded independently below.
     let mut e_a_builder =
         BitVectorBuilder::from_bit(false, triple_count + domain_len + 1, &mut sections).unwrap();
     let mut a_a_builder =
@@ -2951,8 +2952,12 @@ where
         changed_v_a,
     ));
     let runtime_bytes = area.freeze().unwrap();
-    let bytes = encode_portable_runtime(&meta, &domain, &runtime_bytes).unwrap();
-    let raw_blob = Blob::<SuccinctArchiveBlob>::new(bytes.clone());
+    let raw_blob = match source_union {
+        Some(raw) => raw.clone(),
+        None => Blob::<SuccinctArchiveBlob>::new(
+            encode_portable_runtime(&meta, &domain, &runtime_bytes).unwrap(),
+        ),
+    };
     rank9_header[0].source = raw_blob.get_handle().raw;
     rank9_header.freeze().unwrap();
     let rank9_bytes = rank9_area.freeze().unwrap();
@@ -2970,14 +2975,35 @@ where
 pub fn merge_ordered_archives(
     segments: &[SuccinctArchive<OrderedUniverse>],
 ) -> SuccinctArchive<OrderedUniverse> {
-    match merge_ordered_archives_with_factory(segments, &PackedCpuWaveletFactory) {
+    merge_ordered_archives_with_source_union(segments, None)
+}
+
+fn merge_ordered_archives_with_source_union(
+    segments: &[SuccinctArchive<OrderedUniverse>],
+    source_union: Option<&Blob<SuccinctArchiveBlob>>,
+) -> SuccinctArchive<OrderedUniverse> {
+    match merge_ordered_archives_with_factory(segments, &PackedCpuWaveletFactory, source_union) {
         Ok(archive) => archive,
         Err(SuccinctArchiveMergeError::DomainTooWide(_)) => {
-            merge_ordered_archives_with_factory(segments, &JerkyWaveletFactory).unwrap()
+            merge_ordered_archives_with_factory(segments, &JerkyWaveletFactory, source_union)
+                .unwrap()
         }
         Err(SuccinctArchiveMergeError::Backend(never)) => match never {},
         Err(error) => panic!("internal packed wavelet freeze violated its contract: {error}"),
     }
+}
+
+/// Reuse a witnessed, resident raw union while merging its accelerated children.
+///
+/// The collection mapping caller has accepted the equations identifying
+/// `source_union` as the canonical raw union of these exact segments. This
+/// internal path trusts that witness: it neither replays the equation nor
+/// serializes or hashes raw union bytes. Only the accelerated root is produced.
+pub(crate) fn merge_accelerated_archives_with_source_union(
+    segments: &[SuccinctArchive<OrderedUniverse>],
+    source_union: &Blob<SuccinctArchiveBlob>,
+) -> Blob<Rank9AcceleratedSuccinctArchiveBlob> {
+    merge_ordered_archives_with_source_union(segments, Some(source_union)).accelerated_root()
 }
 
 /// Structurally merge sorted succinct-archive segments while delegating only
@@ -2999,7 +3025,7 @@ pub fn merge_ordered_archives_with_backend<B>(
 where
     B: WaveletMatrixFreezeBackend,
 {
-    merge_ordered_archives_with_factory(segments, &BackendWaveletFactory { backend })
+    merge_ordered_archives_with_factory(segments, &BackendWaveletFactory { backend }, None)
 }
 
 fn fill_tribleset_wavelet<O, I>(
@@ -4709,6 +4735,40 @@ mod tests {
                 .fold(TribleSet::new(), |union, set| union + set);
             let rebuilt: SuccinctArchive<OrderedUniverse> = (&union).into();
             assert_eq!(merged.bytes.as_ref(), rebuilt.bytes.as_ref(), "{rows} rows");
+        }
+    }
+
+    #[test]
+    fn witnessed_source_merge_reuses_raw_bytes_and_preserves_canonical_rank9() {
+        for rows in [0usize, 1, 31, 32, 33, 63, 64, 65, 255, 256, 257] {
+            let mut sets: [TribleSet; 2] = std::array::from_fn(|_| TribleSet::new());
+            for ordinal in 0..rows {
+                let trible = synthetic_trible(ordinal);
+                sets[ordinal % 2].insert(&trible);
+                if ordinal % 3 == 0 {
+                    sets[(ordinal + 1) % 2].insert(&trible);
+                }
+            }
+            let mut archives: Vec<SuccinctArchive<OrderedUniverse>> =
+                sets.iter().map(Into::into).collect();
+            let union = sets
+                .into_iter()
+                .fold(TribleSet::new(), |union, set| union + set);
+            let simple: Blob<SimpleArchive> = union.clone().to_blob();
+            let raw = SuccinctArchiveBlob::build_from_simple_archive(&simple).unwrap();
+            let expected =
+                SuccinctArchive::<OrderedUniverse>::build_accelerated_root(raw.clone()).unwrap();
+
+            for _ in 0..2 {
+                let merged = merge_ordered_archives_with_source_union(&archives, Some(&raw));
+                assert_eq!(merged.bytes.as_ref().as_ptr(), raw.bytes.as_ref().as_ptr());
+                assert_eq!(merged.raw_handle, raw.get_handle());
+                let root = merged.accelerated_root();
+                assert_eq!(root.bytes, expected.bytes, "{rows} rows");
+                assert_eq!(root.get_handle(), expected.get_handle(), "{rows} rows");
+                assert_eq!(TribleSet::from(&merged), union);
+                archives.reverse();
+            }
         }
     }
 

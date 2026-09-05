@@ -5,7 +5,8 @@ use std::collections::BTreeSet;
 
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::encodings::succinctarchive::{
-    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchiveBlob, UnionArchive,
+    OrderedUniverse, Rank9AcceleratedSuccinctArchiveBlob, SuccinctArchive, SuccinctArchiveBlob,
+    UnionArchive,
 };
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
@@ -14,15 +15,15 @@ use triblespace_core::capability::{
 };
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
-    AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionPolicy, CollectionRead,
-    CollectionRealizationError, CollectionRecord, CollectionSnapshotExt, CollectionStore,
-    CollectionStoreExt, ACTION_WRITE,
+    AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge, CollectionPolicy,
+    CollectionRead, CollectionRealizationError, CollectionRecord, CollectionSnapshotExt,
+    CollectionStore, CollectionStoreExt, ACTION_WRITE,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource,
-    StoreChanges, StoreSnapshot, WantRead,
+    BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
+    SnapshotSource, StoreChanges, StoreSnapshot, WantRead,
 };
 use triblespace_core::trible::{Fragment, Trible, TribleSet, TRIBLE_LEN};
 
@@ -184,6 +185,174 @@ fn exact_apis_accept_a_derived_source_encoding() {
         .view::<UnionArchive<OrderedUniverse>>()
         .unwrap();
     assert_eq!(materialized.iter().collect::<TribleSet>(), expected);
+}
+
+#[test]
+fn maintenance_follows_a_resident_source_union_across_target_size_tiers() {
+    let authority = SigningKey::from_bytes(&[61; 32]);
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority.verifying_key()),
+        AdmissionPolicy::direct(authority.verifying_key()),
+    );
+    let small = one_fact(211);
+    let mut large = TribleSet::new();
+    for ordinal in 0u64..512 {
+        let mut row = [77; TRIBLE_LEN];
+        row[8..16].copy_from_slice(&ordinal.to_be_bytes());
+        row[56..64].copy_from_slice(&ordinal.to_be_bytes());
+        large.insert(&Trible::force_raw(row).unwrap());
+    }
+    let expected = small.clone() + large.clone();
+    let mut store = MemoryRepo::default();
+    let source = store
+        .collection("source-guided-unequal-tiers", policy.clone())
+        .unwrap();
+    let raw = store
+        .derive::<SuccinctArchiveBlob>(source, (), policy.clone())
+        .unwrap();
+    let accelerated = store
+        .derive::<Rank9AcceleratedSuccinctArchiveBlob>(raw, (), policy)
+        .unwrap();
+    for facts in [small, large] {
+        store
+            .commit(source, &authority, Fragment::from(facts))
+            .unwrap();
+    }
+    block_on(store.ensure(raw)).unwrap();
+    let children = block_on(store.ensure(accelerated)).unwrap();
+    let support = source.admitted(&children).unwrap();
+    let raw_cover = children.collection(raw).unwrap();
+    let inputs = raw_cover
+        .cover()
+        .members()
+        .map(|handle| {
+            children
+                .get::<Blob<SuccinctArchiveBlob>, _>(handle)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inputs.len(), 2);
+    let accelerated_children = children.collection(accelerated).unwrap();
+    let tiers = accelerated_children
+        .cover()
+        .members()
+        .map(|handle| children.blob_info(handle).unwrap().unwrap().length.ilog2())
+        .collect::<Vec<_>>();
+    assert_eq!(tiers.len(), 2);
+    assert_ne!(
+        tiers[0], tiers[1],
+        "ordinary target LSM would not pair these"
+    );
+
+    // An independent producer has already compacted the immediate source.
+    // Target maintenance must consume this fact, not create upstream artifacts.
+    let union = SuccinctArchiveBlob::merge(&inputs).unwrap();
+    let expected_root =
+        SuccinctArchive::<OrderedUniverse>::build_accelerated_root(union.clone()).unwrap();
+    let union_handle = store.put(union).unwrap();
+    store
+        .insert(CollectionRecord::Merge(CollectionMerge::new(
+            raw.handle(),
+            Handle::<SuccinctArchiveBlob>::to_hash(inputs[0].get_handle()),
+            Handle::<SuccinctArchiveBlob>::to_hash(inputs[1].get_handle()),
+            Handle::<SuccinctArchiveBlob>::to_hash(union_handle),
+        )))
+        .unwrap();
+    let before = store.snapshot().unwrap();
+    assert_eq!(before.collection(raw).unwrap().cover().len(), 1);
+    // BlobStoreList::blobs_diff permits an over-eager full listing. Compare
+    // resident identities here because this test requires exact additions.
+    let blobs_before = before
+        .blobs()
+        .map(|info| info.unwrap().handle)
+        .collect::<BTreeSet<_>>();
+
+    // Coverage is already complete: ensure does not perform upkeep.
+    let ensured = block_on(store.ensure(accelerated)).unwrap();
+    assert_eq!(ensured.collection(accelerated).unwrap().cover().len(), 2);
+    assert_eq!(
+        ensured
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .collect::<BTreeSet<_>>(),
+        blobs_before
+    );
+    let records_before = before
+        .records()
+        .unwrap()
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap();
+    assert_eq!(
+        ensured
+            .records()
+            .unwrap()
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap(),
+        records_before
+    );
+
+    let after = block_on(store.maintain(accelerated)).unwrap();
+    let observed = after.collection(accelerated).unwrap();
+    assert_eq!(observed.support(), &support);
+    assert_eq!(
+        observed.cover().members().collect::<Vec<_>>(),
+        vec![expected_root.get_handle()]
+    );
+    assert_eq!(
+        observed
+            .view::<UnionArchive<OrderedUniverse>>()
+            .unwrap()
+            .iter()
+            .collect::<TribleSet>(),
+        expected
+    );
+    let blobs_after = after
+        .blobs()
+        .map(|info| info.unwrap().handle)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        blobs_after.difference(&blobs_before).count(),
+        1,
+        "only the target root is new"
+    );
+    assert!(blobs_before.is_subset(&blobs_after));
+    assert_eq!(after.wants().unwrap().count(), 0);
+    let records_after = after
+        .records()
+        .unwrap()
+        .collect::<Result<BTreeSet<_>, _>>()
+        .unwrap();
+    for record in records_after.difference(&records_before) {
+        let collection = match record {
+            CollectionRecord::Derive(record) => record.collection(),
+            CollectionRecord::Merge(record) => record.collection(),
+            CollectionRecord::Commit(_) => panic!("maintenance must not author roots"),
+        };
+        assert_eq!(
+            collection,
+            accelerated.handle(),
+            "upstream equation published"
+        );
+    }
+    assert_eq!(children.collection(raw).unwrap().cover().len(), 2);
+    assert_eq!(children.collection(accelerated).unwrap().cover().len(), 2);
+
+    let again = block_on(store.maintain(accelerated)).unwrap();
+    assert_eq!(
+        again
+            .blobs()
+            .map(|info| info.unwrap().handle)
+            .collect::<BTreeSet<_>>(),
+        blobs_after
+    );
+    assert_eq!(
+        again
+            .records()
+            .unwrap()
+            .collect::<Result<BTreeSet<_>, _>>()
+            .unwrap(),
+        records_after
+    );
 }
 
 #[test]

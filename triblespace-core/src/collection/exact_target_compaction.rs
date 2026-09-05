@@ -7,11 +7,12 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::blob::Blob;
 use crate::inline::encodings::hash::Handle;
 use crate::repo::{BlobStoreGet, Store};
 
 use super::exact_derived::{attach_collection_exact, data_identity, CollectionRealizationError};
-use super::operation_snapshot::OperationFrontier;
+use super::operation_snapshot::{OperationFrontier, OperationSnapshot};
 use super::{
     Collection, CollectionData, CollectionEncoding, CollectionMerge, CollectionOperationError,
     CollectionRecord, Cover, Support,
@@ -37,6 +38,34 @@ where
     S: Store,
     E: CollectionEncoding,
 {
+    maintain_target_with(
+        store,
+        target,
+        support,
+        frontier,
+        |descriptor, low, high, reader| E::join_members(descriptor, low, high, reader).map(Some),
+    )
+}
+
+/// Run the ordinary target-tier policy with a mapping-specific image join.
+/// `None` declines this physical route without weakening the target lattice.
+pub(super) fn maintain_target_with<S, E, J>(
+    store: &mut S,
+    target: Collection<E>,
+    support: &Support,
+    frontier: &mut OperationFrontier<S::Snapshot>,
+    mut join: J,
+) -> Result<(), CollectionRealizationError>
+where
+    S: Store,
+    E: CollectionEncoding,
+    J: FnMut(
+        &crate::trible::Fragment,
+        &Blob<E>,
+        &Blob<E>,
+        &OperationSnapshot<S::Snapshot, S::Snapshot>,
+    ) -> Result<Option<Blob<E>>, CollectionOperationError>,
+{
     let mut blocked = BTreeSet::new();
     let mut seen = BTreeSet::new();
 
@@ -55,7 +84,15 @@ where
         let Some((descriptor, tiers)) = prepared else {
             return Ok(());
         };
-        if !publish_carry_round(store, target, &descriptor, tiers, &mut blocked, frontier)? {
+        if !publish_carry_round(
+            store,
+            target,
+            &descriptor,
+            tiers,
+            &mut blocked,
+            frontier,
+            &mut join,
+        )? {
             return Ok(());
         }
     }
@@ -119,17 +156,24 @@ where
     Ok(Some((descriptor, tiers)))
 }
 
-fn publish_carry_round<S, E>(
+fn publish_carry_round<S, E, J>(
     store: &mut S,
     target: Collection<E>,
     descriptor: &crate::trible::Fragment,
     tiers: BTreeMap<u32, BTreeSet<CollectionData>>,
     blocked: &mut BTreeSet<(CollectionData, CollectionData)>,
     frontier: &mut OperationFrontier<S::Snapshot>,
+    join: &mut J,
 ) -> Result<bool, CollectionRealizationError>
 where
     S: Store,
     E: CollectionEncoding,
+    J: FnMut(
+        &crate::trible::Fragment,
+        &Blob<E>,
+        &Blob<E>,
+        &OperationSnapshot<S::Snapshot, S::Snapshot>,
+    ) -> Result<Option<Blob<E>>, CollectionOperationError>,
 {
     for (_, mut members) in tiers {
         let mut published = false;
@@ -157,10 +201,10 @@ where
                 .map_err(|error| {
                     CollectionRealizationError::storage("load higher target-carry member", error)
                 })?;
-            let output = E::join_members(descriptor, &low, &high, &snapshot);
+            let output = join(descriptor, &low, &high, &snapshot);
             drop(snapshot);
             match output {
-                Ok(output) => {
+                Ok(Some(output)) => {
                     let result = data_identity::<E>(&output);
                     store.put::<E, _>(output).map_err(|error| {
                         CollectionRealizationError::storage("store merged target member", error)
@@ -184,7 +228,8 @@ where
                         reason,
                     });
                 }
-                Err(CollectionOperationError::Capacity(_))
+                Ok(None)
+                | Err(CollectionOperationError::Capacity(_))
                 | Err(CollectionOperationError::MissingDependency(_)) => {
                     // Retire the lower input for this planning pass and leave
                     // the higher one eligible for the next deterministic pair.

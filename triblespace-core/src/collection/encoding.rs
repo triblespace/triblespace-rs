@@ -247,6 +247,30 @@ pub trait CollectionDerivation: CollectionEncoding {
     ) -> Result<Blob<Self>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
+
+    /// Join two target images, optionally reusing their resident source union.
+    ///
+    /// When `source_union` is present, the caller supplies accepted equations
+    /// witnessing `a join b = c`, `map(a) = low`, and `map(b) = high` for this
+    /// concrete mapping, and loads `c` from `reader`'s frozen snapshot.
+    /// Implementations may reuse that result without replaying the equations
+    /// or constructing any upstream member. A returned blob is the same
+    /// canonical target join as [`CollectionEncoding::join_members`]; only the
+    /// computation differs. `Ok(None)` means this computation route is not
+    /// available, not that the encoding's join is undefined or at capacity.
+    fn join_images<R>(
+        _argument: &Self::Argument,
+        target_descriptor: &Fragment,
+        _source_union: Option<&Blob<Self::Source>>,
+        low: &Blob<Self>,
+        high: &Blob<Self>,
+        reader: &R,
+    ) -> Result<Option<Blob<Self>>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        Self::join_members(target_descriptor, low, high, reader).map(Some)
+    }
 }
 
 /// One explicit parameterized mapping between collection encodings.
@@ -278,6 +302,28 @@ pub trait CollectionMapping: Sized {
     ) -> Result<Blob<Self::Target>, CollectionOperationError>
     where
         R: BlobStoreGet + BlobStoreMeta;
+
+    /// Join target images, optionally reusing a resident, witnessed source union.
+    ///
+    /// The caller must establish the same accepted source-merge and mapping
+    /// equations as [`CollectionDerivation::join_images`] when supplying a
+    /// source union. This hook may reuse that result, but any returned blob
+    /// must be the canonical target join, without constructing upstream
+    /// members or changing storage. `Ok(None)` declines this computation route
+    /// without claiming capacity failure or naming an unknown dependency.
+    fn join_images<R>(
+        &self,
+        target_descriptor: &Fragment,
+        _source_union: Option<&Blob<Self::Source>>,
+        low: &Blob<Self::Target>,
+        high: &Blob<Self::Target>,
+        reader: &R,
+    ) -> Result<Option<Blob<Self::Target>>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        Self::Target::join_members(target_descriptor, low, high, reader).map(Some)
+    }
 }
 
 /// Internal adapter from a target-owned derivation to the explicit mapping
@@ -313,6 +359,27 @@ impl<T: CollectionDerivation> CollectionMapping for CanonicalDerivation<T> {
         R: BlobStoreGet + BlobStoreMeta,
     {
         T::map(&self.argument, source, reader)
+    }
+
+    fn join_images<R>(
+        &self,
+        target_descriptor: &Fragment,
+        source_union: Option<&Blob<Self::Source>>,
+        low: &Blob<Self::Target>,
+        high: &Blob<Self::Target>,
+        reader: &R,
+    ) -> Result<Option<Blob<Self::Target>>, CollectionOperationError>
+    where
+        R: BlobStoreGet + BlobStoreMeta,
+    {
+        T::join_images(
+            &self.argument,
+            target_descriptor,
+            source_union,
+            low,
+            high,
+            reader,
+        )
     }
 }
 
