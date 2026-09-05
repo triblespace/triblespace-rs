@@ -34,15 +34,17 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::encodings::utf8string::UTF8String;
 use triblespace_core::blob::Blob;
+use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
-    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, CollectionPolicy,
-    CollectionStoreExt,
+    descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
+    CollectionPolicy, CollectionStoreExt,
 };
+use triblespace_core::trible::Fragment;
 use triblespace_core::id::Id;
-use triblespace_core::inline::encodings::hash::{Blake3, Hash};
+use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::repo::pile::PileSnapshot;
@@ -126,6 +128,33 @@ pub enum Command {
         #[arg(long)]
         long: bool,
     },
+    /// Re-sign every commit of one collection into another, under this key.
+    ///
+    /// Concatenation is the merge: after `cat other.pile >> pile`, the other
+    /// pile's collections are here physically, but under their own authority,
+    /// so nothing reading this pile's collections sees them. Adopt reads each
+    /// COMMIT of the source collection from one frozen snapshot, verifies its
+    /// signature, and commits the exact same data and metadata archives into
+    /// the target collection signed by this key. A claim-level act: no data is
+    /// rewritten, no id is minted, and repeating it appends nothing new.
+    Adopt {
+        /// Path to the pile file to update.
+        pile: PathBuf,
+        /// Source collection: name, or descriptor handle (`name:` / `blake3:`).
+        #[arg(long)]
+        from: String,
+        /// Target collection: name, or descriptor handle (`name:` / `blake3:`).
+        #[arg(long)]
+        into: String,
+        /// Signing key for the target commits: one of the target's WRITE roots,
+        /// or an author with a resident WRITE proof. Defaults to TRIBLESPACE_KEY
+        /// or self.key beside the pile.
+        #[arg(long)]
+        key: Option<PathBuf>,
+        /// Report what would be adopted without appending anything.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+    },
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
     /// The signing key must be one of the collection descriptor's READ roots.
@@ -180,6 +209,13 @@ pub fn run(cmd: Command) -> Result<()> {
             limit,
             long,
         } => run_log(pile, collection, limit, long),
+        Command::Adopt {
+            pile,
+            from,
+            into,
+            key,
+            dry_run,
+        } => run_adopt(pile, from, into, key, dry_run),
         Command::GrantRead {
             pile,
             collection,
@@ -975,6 +1011,116 @@ fn run_grant(
         );
         println!("recipient:  {}", hex::encode(recipient.to_bytes()));
         println!("proof:      blake3:{}", hex::encode(proof.id().raw));
+        Ok(())
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    res.and(close_res)
+}
+
+fn run_adopt(
+    path: PathBuf,
+    from: String,
+    into: String,
+    key: Option<PathBuf>,
+    dry_run: bool,
+) -> Result<()> {
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let signer = triblespace_core::signing_key_file::load_existing(&key_path)
+        .map_err(|error| anyhow!("load adopting signing key {}: {error}", key_path.display()))?;
+
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<()> {
+        // One frozen view chooses both collections and every commit adopted;
+        // a concurrent append cannot change what this run means.
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let rows = enumerate(&snapshot)?;
+        let source = resolve(&rows, &from)?;
+        let target = resolve(&rows, &into)?;
+        if source == target {
+            return Err(anyhow!("source and target are the same collection"));
+        }
+        let target_collection: Collection<SimpleArchive> = Collection::open(&snapshot, target)
+            .map_err(|error| anyhow!("open target collection descriptor: {error}"))?;
+
+        // Prepare everything before appending anything: every source commit
+        // verified, its exact data and metadata decoded. Re-wrapping canonical
+        // fact sets mints nothing; `commit` serializes them back to the same
+        // data and metadata handles while signing the native record.
+        let empty_metadata: Blob<SimpleArchive> = TribleSet::new().to_blob();
+        let mut prepared: Vec<(CollectionRecord, Fragment)> = Vec::new();
+        let mut invalid = 0usize;
+        let records = snapshot
+            .records()
+            .map_err(|error| anyhow!("enumerate collection records: {error:?}"))?;
+        for record in records {
+            let record = record.map_err(|error| anyhow!("decode collection record: {error:?}"))?;
+            let CollectionRecord::Commit(commit) = &record else {
+                continue;
+            };
+            if commit.collection() != source {
+                continue;
+            }
+            if let Err(error) = commit.verify_strict() {
+                eprintln!(
+                    "skipping commit {:X}: invalid signature ({error})",
+                    record.fingerprint()
+                );
+                invalid += 1;
+                continue;
+            }
+            // A commit names its member by bare content hash; the member of a
+            // SimpleArchive collection is a SimpleArchive.
+            let data_handle: Inline<Handle<SimpleArchive>> = Inline::new(commit.data().raw);
+            let data: Blob<SimpleArchive> = snapshot
+                .get(data_handle)
+                .map_err(|error| anyhow!("read commit data {}: {error}", hex::encode(commit.data().raw)))?;
+            let metadata: Blob<SimpleArchive> = match snapshot.get(commit.metadata()) {
+                Ok(blob) => blob,
+                Err(error) => {
+                    if commit.metadata() == empty_metadata.get_handle() {
+                        empty_metadata.clone()
+                    } else {
+                        return Err(anyhow!(
+                            "read commit metadata {}: {error}",
+                            hex::encode(commit.metadata().raw)
+                        ));
+                    }
+                }
+            };
+            let facts = TribleSet::try_from_blob(data)
+                .map_err(|error| anyhow!("decode commit data: {error:?}"))?;
+            let metafacts = TribleSet::try_from_blob(metadata)
+                .map_err(|error| anyhow!("decode commit metadata: {error:?}"))?;
+            prepared.push((
+                record,
+                Fragment::from_parts(facts, metafacts, Default::default()),
+            ));
+        }
+        drop(snapshot);
+
+        println!("source: blake3:{}", handle_hex(source));
+        println!("target: blake3:{}", handle_hex(target));
+        println!(
+            "signer: {}",
+            hex::encode_upper(signer.verifying_key().to_bytes())
+        );
+        println!("commits: {} to adopt, {} skipped as invalid", prepared.len(), invalid);
+        if dry_run {
+            println!("dry run: nothing appended");
+            return Ok(());
+        }
+        let mut adopted = std::collections::BTreeSet::new();
+        for (record, fragment) in prepared {
+            let commit = pile
+                .commit(target_collection, &signer, fragment)
+                .map_err(|error| anyhow!("adopt commit {:X}: {error}", record.fingerprint()))?;
+            adopted.insert(commit.data().raw);
+        }
+        println!("adopted: {} distinct data archive(s) now asserted in the target", adopted.len());
         Ok(())
     })();
     let close_res = pile
