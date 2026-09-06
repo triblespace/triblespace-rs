@@ -226,7 +226,7 @@ fn typed_collection_open_rejects_the_wrong_encoding() {
 }
 
 #[test]
-fn typed_collection_open_rejects_an_invalid_descriptor() {
+fn typed_collection_open_reports_no_matching_encoding() {
     let mut store = MemoryRepo::default();
     let invalid = store.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
 
@@ -235,10 +235,7 @@ fn typed_collection_open_rejects_an_invalid_descriptor() {
 
     assert!(matches!(
         error,
-        CollectionOpenError::Descriptor(CollectionDescriptorError::Invalid {
-            collection,
-            ..
-        }) if collection == invalid
+        CollectionOpenError::WrongType(CollectionTypeError::WrongEncoding { .. })
     ));
 }
 
@@ -263,9 +260,8 @@ fn encoding_recognition_is_existential_and_entity_scoped() {
     ));
     assert!(store.events.is_empty());
 
-    // Registration asks only whether the requested encoding is represented.
-    // This is not policy selection: the existing singular policy consumers
-    // still need a separate API decision for multiple descriptor entities.
+    // Registration asks only whether the requested encoding is represented;
+    // admission separately queries same-entity encoding and policy links.
     facts += entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_representation*: [SimpleArchive::id(), unrelated_encoding.id],
@@ -377,7 +373,7 @@ fn annotations_and_opaque_ids_preserve_ordinary_maintenance() {
 }
 
 #[test]
-fn unrecognized_policy_never_grants_access_or_poison_other_collections() {
+fn unrecognized_policy_is_invisible_without_poisoning_other_collections() {
     let authority = key(43);
     let expected = fragment(44);
     let expected_facts = expected.facts().clone();
@@ -397,21 +393,192 @@ fn unrecognized_policy_never_grants_access_or_poison_other_collections() {
     store.commit(unknown, &authority, expected.clone()).unwrap();
     store.commit(healthy, &authority, expected).unwrap();
     let snapshot = store.snapshot().unwrap();
-    // These singular consumers still report a policy-query miss as an error.
-    // Changing them to expose absent/multiple interpretations is deliberately
-    // not smuggled into the encoding/annotation cleanup.
-    assert!(Collection::<SimpleArchive>::open(&snapshot, unknown.handle()).is_err());
-    assert!(unknown
+    assert_eq!(
+        Collection::<SimpleArchive>::open(&snapshot, unknown.handle()).unwrap(),
+        unknown
+    );
+    assert!(!unknown
         .reader_is_admitted(&snapshot, authority.verifying_key())
-        .is_err());
-    assert!(unknown
+        .unwrap());
+    assert!(!unknown
         .writer_is_admitted(&snapshot, authority.verifying_key())
-        .is_err());
-    assert!(unknown.admitted(&snapshot).is_err());
+        .unwrap());
+    assert!(!unknown
+        .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
+        .unwrap());
+    assert!(unknown.admitted(&snapshot).unwrap().is_empty());
+    assert!(unknown.read::<TribleSet, _>(&snapshot).unwrap().is_empty());
+    assert_eq!(
+        collection_read_audience(&snapshot, unknown.handle()).unwrap(),
+        CollectionReadAudience::Restricted(Vec::new())
+    );
+    // Explicit scalar inspection remains diagnostic, not an admission gate.
+    assert!(unknown.policy(&snapshot).is_err());
     assert_eq!(
         healthy.read::<TribleSet, _>(&snapshot).unwrap(),
         expected_facts
     );
+}
+
+#[test]
+fn missing_read_policy_does_not_hide_supported_write_admission() {
+    let writer = key(45);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: SimpleArchive::id(),
+            collection_write_policy*: AdmissionPolicy::direct(writer.verifying_key()).fragment(),
+        })
+        .unwrap();
+    let expected = fragment(46);
+    store.commit(collection, &writer, expected.clone()).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!collection
+        .reader_is_admitted(&snapshot, writer.verifying_key())
+        .unwrap());
+    assert!(collection
+        .writer_is_admitted(&snapshot, writer.verifying_key())
+        .unwrap());
+    assert_eq!(
+        collection.read::<TribleSet, _>(&snapshot).unwrap(),
+        *expected.facts()
+    );
+    assert!(collection.policy(&snapshot).is_err());
+}
+
+#[test]
+fn multiple_policy_alternatives_union_admission_without_combining_quorum_shares() {
+    let a = key(47);
+    let b = key(48);
+    let c = key(49);
+    let d = key(50);
+    let writer = key(51);
+    let mut store = MemoryRepo::default();
+    let alternatives = entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation: SimpleArchive::id(),
+        collection_read_policy*: AdmissionPolicy::direct(a.verifying_key()).fragment()
+            + AdmissionPolicy::direct(c.verifying_key()).fragment(),
+        collection_write_policy*: AdmissionPolicy::quorum([a.verifying_key(), b.verifying_key()], 2, None).unwrap().fragment()
+            + AdmissionPolicy::quorum([c.verifying_key(), d.verifying_key()], 2, None).unwrap().fragment(),
+    };
+    let collection = store
+        .register_collection::<SimpleArchive>(alternatives)
+        .unwrap();
+    let expected = fragment(52);
+    store.commit(collection, &writer, expected.clone()).unwrap();
+    for root in [&a, &c] {
+        store
+            .insert_proof(CapabilityProof::issue_root(
+                root,
+                CapabilityResource::from(collection.handle()),
+                Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+                None,
+                writer.verifying_key(),
+            ))
+            .unwrap();
+    }
+    let before = store.snapshot().unwrap();
+    // One share from each alternative is not a two-root proof of either.
+    assert!(!collection
+        .writer_is_admitted(&before, writer.verifying_key())
+        .unwrap());
+    assert!(collection.admitted(&before).unwrap().is_empty());
+    assert!(collection
+        .reader_is_admitted(&before, a.verifying_key())
+        .unwrap());
+    assert!(collection
+        .reader_is_admitted_by(&before, c.verifying_key(), &[])
+        .unwrap());
+    let mut audience = vec![a.verifying_key(), c.verifying_key()];
+    audience.sort_unstable_by_key(VerifyingKey::to_bytes);
+    assert_eq!(
+        collection_read_audience(&before, collection.handle()).unwrap(),
+        CollectionReadAudience::Restricted(audience)
+    );
+    assert!(collection.policy(&before).is_err());
+
+    store
+        .insert_proof(CapabilityProof::issue_root(
+            &b,
+            CapabilityResource::from(collection.handle()),
+            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            None,
+            writer.verifying_key(),
+        ))
+        .unwrap();
+    let after = store.snapshot().unwrap();
+    assert!(collection
+        .writer_is_admitted(&after, writer.verifying_key())
+        .unwrap());
+    assert_eq!(
+        collection.read::<TribleSet, _>(&after).unwrap(),
+        *expected.facts()
+    );
+    assert!(collection.admitted(&before).unwrap().is_empty());
+}
+
+#[test]
+fn typed_admission_cannot_borrow_policy_from_another_descriptor_entity() {
+    let authority = key(53);
+    let unrelated_encoding = rngid();
+    let mut facts = entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation: SimpleArchive::id(),
+    };
+    facts += entity! {
+        metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+        collection_representation: &unrelated_encoding,
+        collection_read_policy*: AdmissionPolicy::Open.fragment(),
+        collection_write_policy*: AdmissionPolicy::Open.fragment(),
+    };
+    let mut store = MemoryRepo::default();
+    let collection = store.register_collection::<SimpleArchive>(facts).unwrap();
+    store.commit(collection, &authority, fragment(54)).unwrap();
+    let snapshot = store.snapshot().unwrap();
+    assert!(!collection
+        .reader_is_admitted(&snapshot, authority.verifying_key())
+        .unwrap());
+    assert!(!collection
+        .reader_is_admitted_by(&snapshot, authority.verifying_key(), &[])
+        .unwrap());
+    assert!(!collection
+        .writer_is_admitted(&snapshot, authority.verifying_key())
+        .unwrap());
+    assert!(collection.admitted(&snapshot).unwrap().is_empty());
+}
+
+#[test]
+fn missing_policies_leave_ordinary_root_maintenance_inert() {
+    let authority = key(55);
+    let mut store = MemoryRepo::default();
+    let collection = store
+        .register_collection::<SimpleArchive>(entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: SimpleArchive::id(),
+        })
+        .unwrap();
+    store.commit(collection, &authority, fragment(56)).unwrap();
+    let before = store.snapshot().unwrap();
+    let records = before
+        .records()
+        .unwrap()
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let after = block_on(store.maintain(collection)).unwrap();
+    assert_eq!(
+        after
+            .records()
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap(),
+        records
+    );
+    let observed = after.collection(collection).unwrap();
+    assert!(observed.support().is_empty());
+    assert!(observed.cover().is_empty());
+    assert!(observed.view::<TribleSet>().unwrap().is_empty());
 }
 
 #[test]

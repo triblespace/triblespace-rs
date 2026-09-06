@@ -55,16 +55,50 @@ let snapshot = storage.snapshot()?;
 let models = Collection::<SimpleArchive>::open(&snapshot, collection_handle)?;
 ```
 
-`open` fetches the canonical archive, reads its local policy, and queries for a
-tagged descriptor entity naming `SimpleArchive`. Extra representation facts,
-retired attributes, or descriptive names do not negate that match. It never
-registers, rewrites, or otherwise mutates the store.
+`open` fetches the canonical archive and queries for a tagged descriptor entity
+naming `SimpleArchive`, without requiring either policy. Extra representation
+facts, retired attributes, or descriptive names do not negate that match. The
+encoding may require its own interpretation context. This explicit typed-open
+boundary reports a wrong-type error when no supported encoding interpretation
+exists. It never registers, rewrites, or otherwise mutates the store.
 
 Raw `register_collection::<E>` similarly recognizes the encoding context it
 needs and stores the complete fragment; policy and lineage are queried when a
-consumer needs them. The current policy and ancestry APIs remain singular:
-they do not yet expose multiple descriptor interpretations, and an unknown
-policy is never treated as public admission.
+consumer needs them. Descriptor decoding checks the canonical archive bytes,
+not a closed-world document shape. No descriptor or native-record bytes change
+when a reader learns these query semantics.
+
+### Admission is a positive query
+
+Ordinary admission considers every supported policy interpretation for the
+requested action. A typed consumer joins the encoding fact and policy link on
+the **same tagged descriptor entity**; it cannot borrow a policy from another
+entity merely because both occur in one archive. Representation-neutral network
+disclosure queries the tagged descriptor's READ links directly. The linked
+policy must explicitly describe `Open` or a usable quorum. Unknown kinds,
+undecodable values, and unsupported thresholds contribute no interpretation.
+
+A subject is admitted when at least one supported alternative authorizes it.
+Each quorum is evaluated independently: one share from each of two alternatives
+does not combine into a threshold proof of either. This is union of query
+results, not another serialized policy kind. Finite READ audiences likewise
+union; an explicitly recognized open alternative makes the audience `Open`.
+No matching READ interpretation means denied disclosure, and no matching WRITE
+interpretation means no admitted COMMITs. A root with no usable WRITE policy
+therefore has an empty ordinary collection snapshot. Missing READ policy does
+not hide otherwise admitted local data: the two actions are independent.
+Real descriptor/proof-store I/O failures remain errors, as do malformed archive
+bytes; query invisibility does not excuse failed storage observations.
+
+The explicit `collection.policy()`/`descriptor::policy` inspection and
+root-grant conveniences still require one unambiguous scalar policy. Executable
+ancestry also remains singular: source, mapping, and argument ambiguity is
+diagnosed when that route is demanded. General plural lineage is unresolved,
+not silently selected by hash order or combined into a made-up foundation.
+`Support` still belongs to exactly one foundational collection, and native
+`DERIVE(target, input, output)` still names no separate mapping witness. This
+query-use improvement does not claim to define every possible descriptor
+interpretation.
 
 ## Publish a root collection
 

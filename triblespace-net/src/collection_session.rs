@@ -6,9 +6,7 @@ use anyhow::{Result, bail};
 use ed25519_dalek::VerifyingKey;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use triblespace_core::capability::{CapabilityProof, CapabilityProofId};
-use triblespace_core::collection::{
-    CollectionHandle, CollectionRecord, collection_reader_is_admitted_by_policy_at,
-};
+use triblespace_core::collection::{CollectionHandle, CollectionRecord};
 
 use crate::collection_activation::CollectionRepairOverlay;
 use crate::collection_delta::{decode_record, encode_record};
@@ -63,14 +61,18 @@ where
         return Ok(Vec::new());
     };
     let hello = recv_repair_hello(recv).await?;
-    let read_roots = overlay.policy().read().roots();
+    let evidence = overlay.authorization_evidence();
     let bootstrap = hello
         .bootstrap_proofs
         .into_iter()
         .filter(|proof| {
             proof.verify_signatures().is_ok()
                 && proof.leaf_key() == remote
-                && read_roots.is_some_and(|roots| roots.contains(&proof.root_key()))
+                && evidence.read_policies().any(|policy| {
+                    policy
+                        .roots()
+                        .is_some_and(|roots| roots.contains(&proof.root_key()))
+                })
         })
         .collect::<Vec<_>>();
     let read_evidence = overlay
@@ -78,13 +80,8 @@ where
         .proofs()
         .cloned()
         .collect::<Vec<_>>();
-    let admitted = collection_reader_is_admitted_by_policy_at(
-        collection,
-        overlay.policy(),
-        remote,
-        &read_evidence,
-        crate::clock::epoch_now(),
-    );
+    let admitted =
+        evidence.reader_is_admitted_by_at(remote, &read_evidence, crate::clock::epoch_now());
     if !admitted {
         send_repair_admission(send, CollectionRepairAdmission::Rejected).await?;
         send.shutdown().await?;
@@ -363,11 +360,15 @@ where
             if proof.id().raw.as_slice() != key {
                 bail!("authorization proof body does not match its PATCH leaf key");
             }
-            let relevant = [local.policy().read(), local.policy().write()]
-                .into_iter()
-                .filter_map(|policy| policy.roots())
-                .flatten()
-                .any(|root| *root == proof.root_key());
+            let evidence = local.authorization_evidence();
+            let relevant = evidence
+                .read_policies()
+                .chain(evidence.write_policies())
+                .any(|policy| {
+                    policy
+                        .roots()
+                        .is_some_and(|roots| roots.contains(&proof.root_key()))
+                });
             if !relevant {
                 bail!("authorization proof starts outside the collection policy roots");
             }
@@ -423,20 +424,103 @@ async fn require_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::capability::{
         Capability, CapabilityAction, CapabilityMode, CapabilityResource,
     };
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
-        CollectionStore, CollectionStoreExt, empty_metadata_handle,
+        CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, collection_read_policy,
+        collection_write_policy, empty_metadata_handle,
     };
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{CapabilityProofStore, SnapshotSource};
+    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
 
     use crate::collection_activation::collection_repair_overlay;
     use crate::protocol::recv_u8;
 
     use super::*;
+
+    #[tokio::test]
+    async fn repair_disclosure_uses_read_alternatives_and_never_open_write() {
+        for allowed in [false, true] {
+            let root_a = SigningKey::from_bytes(&[20; 32]);
+            let root_b = SigningKey::from_bytes(&[21; 32]);
+            let reader = SigningKey::from_bytes(&[22; 32]);
+            let alternatives = if allowed {
+                AdmissionPolicy::direct(root_a.verifying_key()).fragment()
+                    + AdmissionPolicy::direct(root_b.verifying_key()).fragment()
+            } else {
+                triblespace_core::trible::Fragment::empty()
+            };
+            let descriptor = entity! {
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                collection_read_policy*: alternatives,
+                collection_write_policy*: AdmissionPolicy::Open.fragment(),
+            };
+            let mut store = MemoryRepo::default();
+            let collection = store
+                .put::<SimpleArchive, _>(descriptor.facts().clone())
+                .unwrap();
+            let proof = CapabilityProof::issue_root(
+                &root_b,
+                CapabilityResource::from(collection),
+                Capability::new(
+                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    CapabilityMode::Invoke,
+                ),
+                None,
+                reader.verifying_key(),
+            );
+            store.insert_proof(proof).unwrap();
+            let client = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+            store
+                .insert(CollectionRecord::Commit(CollectionCommit::sign(
+                    &root_a,
+                    collection,
+                    CollectionData::new([23; 32]),
+                    empty_metadata_handle(),
+                )))
+                .unwrap();
+            let server = Arc::new(
+                collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap(),
+            );
+            let (server_io, client_io) = tokio::io::duplex(1 << 20);
+            let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+            let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+            let server_task = tokio::spawn(async move {
+                assert_eq!(
+                    recv_u8(&mut server_recv).await.unwrap(),
+                    crate::collection_wire::OP_COLLECTION_REPAIR
+                );
+                let bootstrap = serve_collection_repair(
+                    &mut server_recv,
+                    &mut server_send,
+                    reader.verifying_key(),
+                    |collection| (collection == server.collection()).then_some(server),
+                )
+                .await
+                .unwrap();
+                assert!(bootstrap.is_empty());
+            });
+            let result =
+                pull_collection_stream(&mut client_send, &mut client_recv, &client, vec![]).await;
+            if allowed {
+                assert_eq!(result.unwrap().records.len(), 1);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("rejected READ(C)"));
+                let mut remaining = Vec::new();
+                client_recv.read_to_end(&mut remaining).await.unwrap();
+                assert!(
+                    remaining.is_empty(),
+                    "denial must not disclose a manifest or records"
+                );
+            }
+            server_task.await.unwrap();
+        }
+    }
 
     #[tokio::test]
     async fn one_stream_repairs_records_without_global_inventory() {

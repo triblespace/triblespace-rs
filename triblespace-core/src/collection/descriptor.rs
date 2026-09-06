@@ -17,12 +17,14 @@
 //! owner or shared anchor. Policy is never inferred by walking the source
 //! chain. Readers query the facts they need; unrelated fields and retired
 //! attributes are not a reason to reject the archive. The singular accessors
-//! below still require one descriptor entity and unambiguous field values;
-//! they do not define a law for combining multiple policy or lineage
-//! interpretations.
+//! below are explicit diagnostics requiring one descriptor entity and
+//! unambiguous field values. Ordinary admission uses [`admission_policies`]
+//! and accepts any supported alternative. Executable lineage still requires
+//! an unambiguous source and mapping; plural lineage is not defined here.
 
 use itertools::Itertools;
 
+use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
@@ -32,7 +34,7 @@ use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, IntoInline, RawInline};
 use crate::metadata::{self, MetaDescribe};
-use crate::prelude::{and, entity, find, or, pattern};
+use crate::prelude::{and, entity, exists, find, or, pattern};
 use crate::query::TriblePattern;
 use crate::repo::{BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
@@ -263,6 +265,65 @@ pub fn policy(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> 
         decode_admission_policy(facts, read)?,
         decode_admission_policy(facts, write)?,
     ))
+}
+
+/// Query the supported policy alternatives for one descriptor-local action.
+///
+/// `policy_attribute` is normally [`collection_read_policy`] or
+/// [`collection_write_policy`]. A typed consumer supplies its representation;
+/// that fact and the policy link must belong to the same tagged descriptor
+/// entity. A representation-neutral consumer supplies `None`.
+///
+/// Every recognized alternative contributes independently. Unknown kinds,
+/// undecodable values, and unsupported quorum thresholds contribute no row;
+/// absence never supplies an open policy. Legacy delegation thresholds do not
+/// govern admission: each signed proof path carries its own delegation mode.
+/// The singular [`policy`] accessor remains available for explicit inspection.
+pub fn admission_policies<'a>(
+    facts: &'a TribleSet,
+    policy_attribute: &'a Attribute<GenId>,
+    representation: Option<Id>,
+) -> impl Iterator<Item = AdmissionPolicy> + 'a {
+    let policies: Box<dyn Iterator<Item = Id> + 'a> = match representation {
+        Some(representation) => Box::new(find!(
+            policy: Id,
+            pattern!(facts, [{ _?descriptor @
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                collection_representation: representation,
+                policy_attribute: ?policy,
+            }])
+        )),
+        None => Box::new(find!(
+            policy: Id,
+            pattern!(facts, [{ _?descriptor @
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                policy_attribute: ?policy,
+            }])
+        )),
+    };
+    policies.flat_map(move |policy| {
+        let open = exists!(pattern!(facts, [{ policy @
+            metadata::tag: KIND_ADMISSION_POLICY_OPEN,
+        }]))
+        .then_some(AdmissionPolicy::Open);
+        let roots: Vec<_> = find!(
+            root: ed25519_dalek::VerifyingKey,
+            pattern!(facts, [{ policy @ admission_policy_root: ?root }])
+        )
+        .filter(crate::capability::is_valid_capability_principal)
+        .collect();
+        let quorums = find!(
+            invoke: u32,
+            pattern!(facts, [{ policy @
+                metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
+                admission_invoke_threshold: ?invoke,
+            }])
+        )
+        .filter_map(move |invoke| {
+            AdmissionPolicy::quorum(roots.iter().copied(), invoke, None).ok()
+        });
+        open.into_iter().chain(quorums)
+    })
 }
 
 fn decode_admission_policy(
@@ -615,5 +676,65 @@ mod policy_tests {
                 "admission_invoke_threshold"
             ))
         );
+    }
+
+    #[test]
+    fn admission_queries_skip_unsupported_values_without_losing_valid_alternatives() {
+        let subject = crate::id::rngid();
+        let policy = crate::id::rngid();
+        let unknown = crate::id::rngid();
+        let representation = <SimpleArchive as MetaDescribe>::id();
+        let mut fragment = entity! { &subject @
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: representation,
+            collection_write_policy*: entity! { &policy @
+                metadata::tag*: [KIND_ADMISSION_POLICY_QUORUM, unknown.id],
+                admission_policy_root: key(13),
+                admission_invoke_threshold*: [0_u32, 1_u32, 2_u32],
+                // This retired field cannot alter proof-path delegation.
+                admission_delegate_threshold*: [0_u32, 2_u32],
+            },
+        };
+        let invalid = Inline::<GenId>::new([0xFF; 32]);
+        for attribute in [collection_write_policy.id(), collection_representation.id()] {
+            fragment
+                .facts_mut()
+                .insert(&Trible::force(&subject.id, &attribute, &invalid));
+        }
+        fragment.facts_mut().insert(&Trible::force(
+            &policy.id,
+            &admission_invoke_threshold.id(),
+            &invalid,
+        ));
+        fragment.facts_mut().insert(&Trible::force(
+            &policy.id,
+            &admission_policy_root.id(),
+            &Inline::<GenId>::new([0; 32]),
+        ));
+        let policies: Vec<_> = admission_policies(
+            fragment.facts(),
+            &collection_write_policy,
+            Some(representation),
+        )
+        .collect();
+        assert_eq!(policies, vec![AdmissionPolicy::direct(key(13))]);
+    }
+
+    #[test]
+    fn admission_queries_preserve_both_recognized_kinds() {
+        let fragment = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            collection_representation: <SimpleArchive as MetaDescribe>::id(),
+            collection_read_policy*: entity! {
+                metadata::tag*: [KIND_ADMISSION_POLICY_OPEN, KIND_ADMISSION_POLICY_QUORUM],
+                admission_policy_root: key(14),
+                admission_invoke_threshold: 1_u32,
+            },
+        };
+        let policies: Vec<_> =
+            admission_policies(fragment.facts(), &collection_read_policy, None).collect();
+        assert_eq!(policies.len(), 2);
+        assert!(policies.contains(&AdmissionPolicy::Open));
+        assert!(policies.contains(&AdmissionPolicy::direct(key(14))));
     }
 }

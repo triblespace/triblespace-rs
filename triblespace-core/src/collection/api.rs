@@ -46,6 +46,7 @@ use super::encoding::{
 };
 use super::exact_derived::CollectionRealizationError;
 use super::operation_snapshot::OperationFrontier;
+use super::records::{collection_read_policy, collection_write_policy};
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
     collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
@@ -973,7 +974,6 @@ where
 
 pub(crate) struct LoadedCollectionDescriptor {
     pub(crate) fragment: Fragment,
-    pub(crate) policy: CollectionPolicy,
 }
 
 pub(crate) fn load_collection_descriptor<R>(
@@ -992,16 +992,14 @@ where
                 collection,
                 source: RecordDecodeError::from(source),
             })?;
-    let policy = descriptor::policy(&facts)
-        .map_err(|source| CollectionDescriptorError::Invalid { collection, source })?;
     Ok(LoadedCollectionDescriptor {
         fragment: Fragment::from(facts),
-        policy,
     })
 }
 
 pub(crate) enum AdmissionEvidence {
     Open,
+    Alternatives(Vec<AdmissionEvidence>),
     Quorum {
         roots: Vec<VerifyingKey>,
         invoke_threshold: NonZeroUsize,
@@ -1014,6 +1012,9 @@ impl AdmissionEvidence {
     pub(crate) fn authorizes(&self, subject: VerifyingKey, instant: hifitime::Epoch) -> bool {
         match self {
             Self::Open => true,
+            Self::Alternatives(alternatives) => alternatives
+                .iter()
+                .any(|evidence| evidence.authorizes(subject, instant)),
             Self::Quorum {
                 roots,
                 invoke_threshold,
@@ -1033,6 +1034,22 @@ impl AdmissionEvidence {
     fn authorized_subjects(&self, instant: hifitime::Epoch) -> CollectionReadAudience {
         match self {
             Self::Open => CollectionReadAudience::Open,
+            Self::Alternatives(alternatives) => {
+                let mut subjects = BTreeMap::new();
+                for alternative in alternatives {
+                    match alternative.authorized_subjects(instant) {
+                        CollectionReadAudience::Open => return CollectionReadAudience::Open,
+                        CollectionReadAudience::Restricted(audience) => {
+                            subjects.extend(
+                                audience
+                                    .into_iter()
+                                    .map(|subject| (subject.to_bytes(), subject)),
+                            );
+                        }
+                    }
+                }
+                CollectionReadAudience::Restricted(subjects.into_values().collect())
+            }
             Self::Quorum {
                 roots,
                 invoke_threshold,
@@ -1073,25 +1090,9 @@ pub(crate) fn admission_evidence_from_proofs(
     }
 }
 
-fn admission_evidence(
-    policy: &AdmissionPolicy,
-    action: crate::id::Id,
-    required: CapabilityMode,
-    collection: CollectionHandle,
-    proofs: impl IntoIterator<Item = CapabilityProof>,
-) -> AdmissionEvidence {
-    admission_evidence_from_proofs(
-        policy,
-        action,
-        required,
-        collection,
-        proofs.into_iter().collect::<Vec<_>>().into(),
-    )
-}
-
 fn discover_admission_evidence<S>(
     snapshot: &S,
-    policy: &AdmissionPolicy,
+    policies: impl IntoIterator<Item = AdmissionPolicy>,
     action: crate::id::Id,
     required: CapabilityMode,
     collection: CollectionHandle,
@@ -1099,17 +1100,35 @@ fn discover_admission_evidence<S>(
 where
     S: CapabilityProofRead,
 {
-    let needs_proofs = matches!(policy, AdmissionPolicy::Quorum(_));
-    if !needs_proofs {
-        return Ok(admission_evidence(policy, action, required, collection, []));
+    let policies: Vec<_> = policies.into_iter().collect();
+    if policies
+        .iter()
+        .any(|policy| matches!(policy, AdmissionPolicy::Open))
+    {
+        return Ok(AdmissionEvidence::Open);
+    }
+    if policies.is_empty() {
+        return Ok(AdmissionEvidence::Alternatives(Vec::new()));
     }
     let proofs = snapshot
         .proofs()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?
         .collect::<Result<Vec<_>, _>>()
         .map_err(CollectionEvidenceDiscoveryError::Proofs)?;
-    Ok(admission_evidence(
-        policy, action, required, collection, proofs,
+    let proofs: Arc<[CapabilityProof]> = proofs.into();
+    Ok(AdmissionEvidence::Alternatives(
+        policies
+            .iter()
+            .map(|policy| {
+                admission_evidence_from_proofs(
+                    policy,
+                    action,
+                    required,
+                    collection,
+                    Arc::clone(&proofs),
+                )
+            })
+            .collect(),
     ))
 }
 
@@ -1128,7 +1147,11 @@ where
         .map_err(CollectionCoverError::Descriptor)?;
     let evidence = discover_admission_evidence(
         snapshot,
-        loaded.policy.write(),
+        descriptor::admission_policies(
+            loaded.fragment.facts(),
+            &collection_write_policy,
+            Some(L::id()),
+        ),
         ACTION_WRITE,
         CapabilityMode::Invoke,
         collection.handle(),
@@ -1230,9 +1253,12 @@ where
     let snapshot = store.snapshot().map_err(CollectionGrantError::Snapshot)?;
     let descriptor = load_collection_descriptor(&snapshot, collection)
         .map_err(CollectionGrantError::Descriptor)?;
+    let policy = descriptor::policy(descriptor.fragment.facts()).map_err(|source| {
+        CollectionGrantError::Descriptor(CollectionDescriptorError::Invalid { collection, source })
+    })?;
     let policy = match action {
-        ACTION_READ => descriptor.policy.read(),
-        ACTION_WRITE => descriptor.policy.write(),
+        ACTION_READ => policy.read(),
+        ACTION_WRITE => policy.write(),
         _ => unreachable!("grant wrappers only supply collection actions"),
     };
     let roots = policy
@@ -1278,13 +1304,19 @@ where
     S: StoreSnapshot + BlobStoreGet,
 {
     let loaded = load_collection_descriptor(snapshot, collection)?;
-    Ok(collection_reader_is_admitted_by_policy_at(
-        collection,
-        &loaded.policy,
-        subject,
-        proofs,
-        snapshot.instant(),
-    ))
+    Ok(
+        descriptor::admission_policies(loaded.fragment.facts(), &collection_read_policy, None).any(
+            |policy| {
+                collection_reader_is_admitted_by_policy_at(
+                    collection,
+                    &policy,
+                    subject,
+                    proofs,
+                    snapshot.instant(),
+                )
+            },
+        ),
+    )
 }
 
 /// Decide READ admission against one already validated collection policy.
@@ -1294,13 +1326,13 @@ where
 /// performs no store access, proof discovery, persistence, or clock sampling.
 pub fn collection_reader_is_admitted_by_policy_at(
     collection: CollectionHandle,
-    policy: &CollectionPolicy,
+    policy: &AdmissionPolicy,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> bool {
     let evidence = admission_evidence_from_proofs(
-        policy.read(),
+        policy,
         ACTION_READ,
         CapabilityMode::Invoke,
         collection,
@@ -1319,12 +1351,12 @@ pub fn collection_reader_is_admitted_by_policy_at(
 /// Open admission remains explicit because it cannot be finitely enumerated.
 pub fn collection_read_audience_by_policy_at(
     collection: CollectionHandle,
-    policy: &CollectionPolicy,
+    policy: &AdmissionPolicy,
     proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> CollectionReadAudience {
     admission_evidence_from_proofs(
-        policy.read(),
+        policy,
         ACTION_READ,
         CapabilityMode::Invoke,
         collection,
@@ -1348,7 +1380,7 @@ where
         .map_err(CollectionAdmissionError::Descriptor)?;
     let evidence = discover_admission_evidence(
         snapshot,
-        loaded.policy.read(),
+        descriptor::admission_policies(loaded.fragment.facts(), &collection_read_policy, None),
         ACTION_READ,
         CapabilityMode::Invoke,
         collection,
@@ -1365,13 +1397,13 @@ where
 /// persistence, or clock sampling.
 pub fn collection_writer_is_admitted_by_policy_at(
     collection: CollectionHandle,
-    policy: &CollectionPolicy,
+    policy: &AdmissionPolicy,
     subject: VerifyingKey,
     proofs: &[CapabilityProof],
     instant: hifitime::Epoch,
 ) -> bool {
     let evidence = admission_evidence_from_proofs(
-        policy.write(),
+        policy,
         ACTION_WRITE,
         CapabilityMode::Invoke,
         collection,
@@ -1424,7 +1456,13 @@ impl<L: CollectionEncoding> Collection<L> {
     where
         S: BlobStoreGet,
     {
-        load_collection_descriptor(snapshot, self.handle()).map(|descriptor| descriptor.policy)
+        let loaded = load_collection_descriptor(snapshot, self.handle())?;
+        descriptor::policy(loaded.fragment.facts()).map_err(|source| {
+            CollectionDescriptorError::Invalid {
+                collection: self.handle(),
+                source,
+            }
+        })
     }
 
     /// Decide whether `subject` is admitted as a writer in this snapshot.
@@ -1444,7 +1482,11 @@ impl<L: CollectionEncoding> Collection<L> {
             .map_err(CollectionAdmissionError::Descriptor)?;
         let evidence = discover_admission_evidence(
             snapshot,
-            loaded.policy.write(),
+            descriptor::admission_policies(
+                loaded.fragment.facts(),
+                &collection_write_policy,
+                Some(L::id()),
+            ),
             ACTION_WRITE,
             CapabilityMode::Invoke,
             self.handle(),
@@ -1470,7 +1512,11 @@ impl<L: CollectionEncoding> Collection<L> {
             .map_err(CollectionAdmissionError::Descriptor)?;
         let evidence = discover_admission_evidence(
             snapshot,
-            loaded.policy.read(),
+            descriptor::admission_policies(
+                loaded.fragment.facts(),
+                &collection_read_policy,
+                Some(L::id()),
+            ),
             ACTION_READ,
             CapabilityMode::Invoke,
             self.handle(),
@@ -1495,7 +1541,21 @@ impl<L: CollectionEncoding> Collection<L> {
     where
         S: StoreSnapshot + BlobStoreGet,
     {
-        collection_reader_is_admitted_by(snapshot, self.handle(), subject, proofs)
+        let loaded = load_collection_descriptor(snapshot, self.handle())?;
+        Ok(descriptor::admission_policies(
+            loaded.fragment.facts(),
+            &collection_read_policy,
+            Some(L::id()),
+        )
+        .any(|policy| {
+            collection_reader_is_admitted_by_policy_at(
+                self.handle(),
+                &policy,
+                subject,
+                proofs,
+                snapshot.instant(),
+            )
+        }))
     }
 
     /// Discover the exact payload cover admitted in this snapshot.
@@ -1662,7 +1722,11 @@ where
         })?;
     let evidence = discover_admission_evidence(
         &bounded,
-        descriptor.policy.write(),
+        descriptor::admission_policies(
+            descriptor.fragment.facts(),
+            &collection_write_policy,
+            Some(SimpleArchive::id()),
+        ),
         ACTION_WRITE,
         CapabilityMode::Invoke,
         foundation.handle(),

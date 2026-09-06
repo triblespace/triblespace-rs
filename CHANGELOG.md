@@ -30,11 +30,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `2D3DFB807700200A43FD841406B46D77`. Source identities and old bytes are unchanged.
 - Remove whole-document collection descriptor validation: retired attributes,
   extra names, and annotations on derived descriptors no longer reject usable
-  collection facts. Typed registration recognizes its requested encoding by
-  an existential query, and policy decoding queries only linked entities and
-  recognized typed values. Canonical constructors skip redundant generic
-  validation. Existing singular-policy and lineage consumers remain singular;
-  this does not define how multiple authorization interpretations combine.
+  collection facts. Typed opening/registration recognizes its requested encoding
+  independently of policy. Ordinary READ/WRITE admission queries supported
+  policy alternatives on the same descriptor entity as the requested encoding;
+  any authorizing alternative suffices, without pooling quorum shares between
+  alternatives. Missing/unknown policy interpretations grant nothing and leave
+  ordinary root observations empty. Network repair uses the same policy-query
+  semantics. Explicit scalar policy inspection and executable lineage retain
+  their ambiguity diagnostics; plural source/mapping interpretation remains
+  unresolved. Descriptor, blob, native-record, and protocol bytes are unchanged.
 - Ordinary derived `ensure` and `maintain` select the admitted support already
   realized by their immediate source. A new foundational commit, an unbuilt
   intermediate member, or a dangling source equation no longer makes a
