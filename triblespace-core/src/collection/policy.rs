@@ -144,7 +144,7 @@ mod tests {
             handles,
             [read_capability(), write_capability(), handle].into()
         );
-        let blobs = fragment.blobs().snapshot().unwrap();
+        let blobs = fragment.blobs().clone().snapshot().unwrap();
         for handle in handles {
             assert!(blobs
                 .get::<crate::blob::Blob<SimpleArchive>, _>(handle)

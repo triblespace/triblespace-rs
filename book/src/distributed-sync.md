@@ -54,14 +54,17 @@ For one collection, semantic repair derives two independent grow-only sets:
 - every structurally valid native collection record naming exact C: signed
   `COMMIT`s independent of current WRITE(C) admission, plus unsigned `MERGE`
   and `DERIVE` equations; and
-- every self-contained native proof which is structurally relevant to exact
-  READ(C) or WRITE(C) and begins at that action policy's roots.
+- every self-contained native proof for a capability declared by C's descriptor,
+  scoped to exact C and beginning at that capability policy's roots.
 
 Each set is represented by an immutable BLAKE3-Merkle PATCH. Collection
 records are keyed physically by the full 32-byte fingerprint of their exact
-canonical value; authorization evidence is keyed by its 32-byte proof ID and its
-repair leaf is the complete canonical native proof body. There is no companion
-claim blob or authorization closure. The opaque semantic repair root
+canonical value; authorization evidence uses a `resource | proof_hash` PATCH
+whose values share ownership of the original proof bytes. Only C's prefix is
+exposed; the wire leaf key is the 32-byte proof hash and its payload is the
+complete native proof body. The host currently keeps one such index per
+overlay, not a shared global inventory. There is no companion claim blob or
+authorization closure to transfer. The opaque semantic repair root
 commits to C, both PATCH roots, and both leaf counts under a versioned domain.
 
 The authorization projection is structural rather than a snapshot of who is
@@ -75,9 +78,11 @@ subject the self-contained proof bytes. That is the capability invitation
 boundary, not a Secrets-specific delivery channel. Once one collection
 participant has the proof, authorization-evidence repair distributes that one
 record to READ(C) peers without a second content-acquisition phase. A Secrets
-writer can therefore derive a restricted collection's current finite READ
-audience from the same snapshot and materialize recipient envelopes without a
-separate envelope RPC or roster. Open READ remains explicitly non-enumerable.
+writer can therefore derive its current finite key-delivery audience from the
+same snapshot and materialize recipient envelopes without a separate envelope
+RPC or roster. That capability is distinct from READ: ciphertext replication
+does not imply decryption-key delivery. Open capabilities remain explicitly
+non-enumerable.
 
 This product matters. Synchronizing only collection records would miss the
 case where a newly arrived proof activates an old COMMIT. Synchronizing a whole
@@ -145,7 +150,7 @@ the same opaque root. The client may then walk only differing prefixes and
 receive missing leaf bodies:
 
 - canonical signature-valid `COMMIT(C)` records, whether active or inert;
-- native structurally relevant READ(C)/WRITE(C) proofs.
+- native structurally relevant proofs for C's declared capabilities.
 
 Each proof leaf already contains the complete path and all of its restrictions.
 Records may land before sufficient WRITE proof evidence and remain harmlessly
@@ -279,7 +284,7 @@ WRITE, retention, or membership semantics.
 
 ## Wire surface
 
-Protocol version 23 keeps the direct operation set narrow:
+Protocol version 24 keeps the direct operation set narrow:
 
 | Operation | Code | Meaning |
 |---|---:|---|

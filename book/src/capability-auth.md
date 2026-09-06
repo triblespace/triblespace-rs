@@ -6,7 +6,7 @@ or more delegates:
 
 ```text
 magic | resource | root |
-    (action | mode/validity flags | validity | delegate | signature)+
+    (capability handle | mode/validity flags | validity | delegate | signature)+
 ```
 
 The high-entropy magic identifies this exact grammar. An incompatible grammar
@@ -17,7 +17,7 @@ while another subsystem may give the same kernel a different kind of resource.
 makes each exact 32-byte value one usable principal rather than allowing
 multiple encodings of the same curve point to count as distinct quorum roots.
 
-Each edge contains one exact 128-bit action, an invocation/delegation mode, an
+Each edge contains one exact 256-bit capability-definition handle, an invocation/delegation mode, an
 optional inclusive TAI interval, the next delegate, and a signature by the
 current issuer. The signature comes last and signs every preceding byte of the
 proof through that delegate. It therefore covers the magic, resource, root,
@@ -42,11 +42,11 @@ The proof header is 80 bytes:
 | 32 | opaque resource identity |
 | 32 | root public key |
 
-Every edge is 145 bytes:
+Every edge is 161 bytes:
 
 | bytes | field |
 |---:|---|
-| 16 | exact action ID |
+| 32 | exact `Handle<SimpleArchive>` capability definition |
 | 1 | mode and validity-presence flags |
 | 32 | signed inclusive validity bounds, or canonical zeros when absent |
 | 32 | delegate public key |
@@ -54,21 +54,28 @@ Every edge is 145 bytes:
 
 There is no count, padding, parent pointer, claim handle, or alternate field
 order in the proof body. Its exact length determines the nonzero edge count,
-which is bounded at 255. Decoding rejects unknown flag bits, nil actions,
+which is bounded at 255. Decoding rejects unknown flag bits,
 malformed, noncanonical, or weak keys, inverted intervals, nonzero
 absent-validity bytes, trailing bytes, and overlong paths. Signature
 verification is strict. The proof ID is BLAKE3 over the exact canonical body.
 
-The old `K(S,C,K)+` format separated semantic restrictions into claim blobs.
-That indirection is gone. A proof no longer depends on a blob closure, needs no
-portable bundle wrapper, and can be verified or repaired as one value.
+The old `K(S,C,K)+` format put per-hop restrictions into claim blobs. The
+current definition handle instead names a stable operation and its parameters;
+per-hop attenuation is inline. Signatures and attenuation can be verified
+without loading any definition. A resource descriptor fixes the finite
+vocabulary it recognizes, and consumers query definitions for operations they
+understand. Unsupported definitions remain uninterpreted, not invalid.
+
+Definitions must not contain the resource descriptor's handle when that
+descriptor names their handles: that would be a content-address cycle. The
+proof already binds the exact resource separately.
 
 ## Attenuation is a meet
 
 The three nonempty modes are `Invoke`, `Delegate`, and
 `InvokeAndDelegate`. Effective authority is the meet of every edge:
 
-- the action must remain exactly equal;
+- the capability handle must remain exactly equal;
 - mode bits combine by intersection;
 - validity intervals combine by inclusive intersection; and
 - every non-final issuer must still have effective `Delegate` authority.
@@ -76,7 +83,7 @@ The three nonempty modes are `Invoke`, `Delegate`, and
 A syntactically wider child is harmless: it cannot restore a mode bit or time
 range removed by an ancestor. An empty mode or interval intersection rejects
 the path. Verification additionally receives the expected trust root, subject,
-instant, resource/action request, and required mode; the proof cannot nominate
+instant, resource/capability request, and required mode; the proof cannot nominate
 those boundary values on the verifier's behalf.
 
 `CapabilityProof::issue_root` creates the first signed edge.
@@ -110,9 +117,12 @@ insertion, deterministic enumeration, and exact lookup by proof ID. Storage is
 evidence, not authority: callers still choose roots, request, subject, and
 instant when verifying it.
 
-A proof is a native record and has no blob references. Conservative collection
-retains the proof record and its record-kind description, but does not invent a
-blob lifetime edge. Re-inserting identical proof bytes is idempotent.
+A proof is a native record. Conservative collection retains its resident
+capability definition blobs and its record-kind description, but never treats
+the opaque resource as a blob reference and never fetches absent definitions.
+Repair exchanges proofs only and does not emit WANTs. Re-inserting identical
+proof bytes is idempotent. Pile indexes hold shared owning `anybytes::View`
+values; parsing and replay do not verify signatures or assign authority.
 
 The proof grammar's magic, the pile record kind, and the network protocol are
 separate compatibility boundaries. The new proof body uses a fresh pile record
@@ -123,17 +133,21 @@ must be reissued by the relevant private keys.
 
 ## Collections consume authority
 
-A collection descriptor supplies independent READ and WRITE policies. Each is
-open or a quorum over a canonical root set:
+A resource descriptor links capability-policy bindings. Each names an exact
+capability handle and an open policy or a quorum over a canonical root set.
+Collections interpret two standard definition blobs:
 
 ```text
-READ(C)  = action ACTION_READ  over resource C
-WRITE(C) = action ACTION_WRITE over resource C
+READ(C)  = read_capability()  over resource C
+WRITE(C) = write_capability() over resource C
 ```
 
 Here `C` is the exact descriptor handle. The generic capability kernel does not
 know what a collection, team, secret, or query is. Collection admission merely
-interprets its own resource and action IDs.
+interprets its own resource and recognized capability definitions. The existing
+READ/WRITE operation IDs are facts inside those stable definition blobs, not
+special cases in the proof grammar. Extra capabilities use the same binding
+relation without changing the kernel.
 
 WRITE admission decides which strictly signed COMMIT records contribute to an
 observed collection. Local insertion remains unconditional: an inactive commit
@@ -147,6 +161,7 @@ The common root-grant helpers are:
 ```text
 grant_collection_read(&mut store, collection, &root, recipient)
 grant_collection_write(&mut store, collection, &root, recipient)
+grant_collection_capability(&mut store, collection, capability, &root, recipient)
 ```
 
 They validate the descriptor and matching root against one snapshot, create an
@@ -160,12 +175,23 @@ returns the finite restricted audience in canonical key order, including valid
 intermediate delegates. It returns `Open` for an open READ policy because no
 finite key list describes that audience.
 
+Secrets uses a distinct key-delivery capability on its source resource.
+Collection READ authorizes encrypted replication, not decryption-key delivery.
+Envelope creation and maintenance enumerate the current key-delivery audience;
+expiry can stop new deliveries but cannot revoke possession of a key already
+delivered. Adding that binding to an immutable descriptor changes its handle:
+existing data needs an explicit additive transition, never a name-based alias
+or automatic fallback from key delivery to READ.
+
 ## Repair and discovery
 
 Authorization repair exchanges proof records only. There are no claim blobs,
 proof bundles, claim-specific WANTs, or hidden out-of-band closure. A collection
-session projects only proofs relevant to its descriptor's READ or WRITE action;
-the receiver applies its own policy and instant.
+session projects proofs for every descriptor-declared capability, not just
+READ and WRITE. Relevance checks the exact resource, capability handle, and
+configured root before verifying the signed path. The receiver still applies
+the recognized READ policy before disclosing a repair manifest; transporting
+an unknown operation's proof does not grant access to the collection.
 
 This leaves the layers deliberately independent:
 

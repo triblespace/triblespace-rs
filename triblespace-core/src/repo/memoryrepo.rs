@@ -449,9 +449,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-    };
+    use crate::capability::{Capability, CapabilityMode, CapabilityProof, CapabilityResource};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{CollectionDerive, CollectionMerge, CollectionPolicy};
 
@@ -460,15 +458,15 @@ mod tests {
     }
 
     #[test]
-    fn capability_proofs_are_an_idempotent_set_without_blob_closure() {
+    fn capability_proofs_are_an_idempotent_set_without_resident_definitions() {
         let mut repo = MemoryRepo::default();
         let root = SigningKey::from_bytes(&[61; 32]);
         let leaf = SigningKey::from_bytes(&[62; 32]);
-        let action = CapabilityAction::new(Id::new([63; 16]).unwrap());
+        let capability = Inline::new([63; 32]);
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::new([64; 32]),
-            Capability::new(action, CapabilityMode::Invoke),
+            Capability::new(capability, CapabilityMode::Invoke),
             None,
             leaf.verifying_key(),
         );
@@ -726,7 +724,7 @@ mod tests {
     #[test]
     fn proof_expiry_requires_a_new_snapshot_without_changing_stored_content() {
         use crate::capability::CapabilityValidity;
-        use crate::collection::{AdmissionPolicy, CollectionStoreExt, ACTION_WRITE};
+        use crate::collection::{AdmissionPolicy, CollectionStoreExt};
 
         let root = SigningKey::from_bytes(&[91; 32]);
         let writer = SigningKey::from_bytes(&[92; 32]);
@@ -743,7 +741,10 @@ mod tests {
         repo.insert_proof(CapabilityProof::issue_root(
             &root,
             CapabilityResource::from(collection.handle()),
-            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            Capability::new(
+                crate::collection::write_capability(),
+                CapabilityMode::Invoke,
+            ),
             Some(
                 CapabilityValidity::new(
                     hifitime::Epoch::from_tai_seconds(10.0),
@@ -823,10 +824,7 @@ mod tests {
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::new([78; 32]),
-            Capability::new(
-                CapabilityAction::new(Id::new([77; 16]).unwrap()),
-                CapabilityMode::Invoke,
-            ),
+            Capability::new(Inline::new([77; 32]), CapabilityMode::Invoke),
             None,
             leaf.verifying_key(),
         );

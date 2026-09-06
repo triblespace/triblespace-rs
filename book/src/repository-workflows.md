@@ -71,10 +71,11 @@ when a reader learns these query semantics.
 ### Admission is a positive query
 
 Ordinary admission considers every supported policy interpretation for the
-requested action. A typed consumer joins the encoding fact and policy link on
+requested capability handle. A typed consumer joins the encoding fact and policy link on
 the **same tagged descriptor entity**; it cannot borrow a policy from another
 entity merely because both occur in one archive. Representation-neutral network
-disclosure queries the tagged descriptor's READ links directly. The linked
+disclosure queries the tagged descriptor's generic bindings for the recognized
+READ capability handle. The linked
 policy must explicitly describe `Open` or a usable quorum. Unknown kinds,
 undecodable values, and unsupported thresholds contribute no interpretation.
 
@@ -291,11 +292,12 @@ the caller may then ask that snapshot for the collection it actually contains.
 Raw record readers still expose dangling native collection records and stored
 proof records for repair. A `COMMIT`, `MERGE`, or `DERIVE` is semantically
 invisible until all of its direct blob references are resident in that exact
-frozen snapshot. A capability proof is already self-contained and has no blob
-residency gate. Snapshot operations never acquire, wait, write, or emit
+frozen snapshot. A capability proof's signatures and attenuation are already
+self-contained and have no definition-blob residency gate. Snapshot operations never acquire, wait, write, or emit
 `WANT`. Record retention is a separate lifetime rule: a retained non-blob
 record strongly retains every directly referenced blob which is resident, but
-does not fetch an absent one; proofs simply have no such references. A `WANT`
+does not fetch an absent one; proofs reference stable capability definitions,
+not the opaque resource. A `WANT`
 is itself only an explicit durable demand record, never automatic cache-miss
 bookkeeping.
 

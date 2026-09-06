@@ -576,9 +576,9 @@ impl Yard {
         Ok(combined)
     }
 
-    /// Retain the physical kind description whenever native proofs exist.
-    ///
-    /// A self-contained proof has no blob closure of its own.
+    /// Retain physical kind and resident capability definitions of native proofs.
+    /// The opaque resource is not a blob reference; missing definitions remain
+    /// missing rather than causing acquisition during GC.
     fn retention_with_capability_proofs(
         &self,
         snapshot: &YardSnapshot,
@@ -591,6 +591,13 @@ impl Yard {
             .collect::<Result<Vec<_>, YardCapabilityProofError>>()?;
         if !proofs.is_empty() {
             retain_kind_if_present(&mut combined, present, capability_proof_record_kind());
+        }
+        for proof in proofs {
+            for handle in proof.blob_references() {
+                if present.get(&handle.raw).is_some() {
+                    combined.retain_recursive(handle);
+                }
+            }
         }
         Ok(combined)
     }
@@ -1548,9 +1555,7 @@ mod tests {
     use super::*;
     use crate::blob::encodings::rawbytes::RawBytes;
     use crate::blob::encodings::simplearchive::SimpleArchive;
-    use crate::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-    };
+    use crate::capability::{Capability, CapabilityMode, CapabilityProof, CapabilityResource};
     use crate::collection::descriptor::{identity_for_tests, named_for_tests};
     use crate::collection::{
         empty_metadata_handle, CollectionCommit, CollectionDerive, CollectionMerge,
@@ -1848,7 +1853,7 @@ mod tests {
     }
 
     #[test]
-    fn capability_proofs_union_generations_without_blob_closure_and_survive_reclaim() {
+    fn capability_proofs_retain_definitions_not_resources_and_survive_reclaim() {
         let config = YardConfig::default();
         let (_dir, paths, mut yard) = yard_with_paths(2, config);
         publish_record_kind_descriptions(&mut yard);
@@ -1857,10 +1862,11 @@ mod tests {
             .unwrap();
         let root = SigningKey::from_bytes(&[71; 32]);
         let leaf = SigningKey::from_bytes(&[72; 32]);
+        let definition = yard.put::<SimpleArchive, _>(TribleSet::new()).unwrap();
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::new(coincident_resource_blob.raw),
-            Capability::new(CapabilityAction::new(pin_id(73)), CapabilityMode::Invoke),
+            Capability::new(definition, CapabilityMode::Invoke),
             None,
             leaf.verifying_key(),
         );
@@ -1885,6 +1891,7 @@ mod tests {
 
         yard.collect(&RetentionRoots::new()).unwrap();
         let reader = yard.snapshot().unwrap();
+        assert!(reader.get::<Blob<SimpleArchive>, _>(definition).is_ok());
         assert!(reader
             .get::<Blob<RawBytes>, _>(coincident_resource_blob)
             .is_err());
@@ -1894,6 +1901,7 @@ mod tests {
 
         yard.reclaim().unwrap();
         let snapshot = yard.snapshot().unwrap();
+        assert!(snapshot.get::<Blob<SimpleArchive>, _>(definition).is_ok());
         assert_record_kind_description_resident(&snapshot, capability_proof_record_kind());
         assert_record_kind_description_resident(&snapshot, blob_record_kind());
         assert_eq!(

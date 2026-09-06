@@ -25,8 +25,8 @@ use triblespace_core::collection::succinctarchive_union::SIMPLE_TO_SUCCINCT_MAPP
 use triblespace_core::collection::{
     collection_capability_audience, collection_read_audience, grant_collection_capability,
     grant_collection_read, grant_collection_write, read_capability, write_capability,
-    AdmissionPolicy, Collection, CollectionDescriptorError, CollectionOpenError, CollectionPolicy,
-    CollectionRead, CollectionReadAudience, CollectionReadGrantError, CollectionRecord,
+    AdmissionPolicy, Collection, CollectionOpenError, CollectionPolicy, CollectionRead,
+    CollectionReadAudience, CollectionReadGrantError, CollectionRecord,
     CollectionRegistrationError, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
     CollectionTypeError, CollectionWriteGrantError, PreparedCollectionCommit,
     KIND_ADMISSION_POLICY_QUORUM,

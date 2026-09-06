@@ -79,6 +79,10 @@ pub const KIND_WANT_RETRACT: RawInline =
 pub const KIND_AUTH_PROOF_V1: RawInline =
     hex_literal::hex!("29AC46C61788022D62BE6E2388DA4A164419BA648377D48B2E6DB092EE0A8053");
 
+/// Historical action-ID prefix proofs, recognized only as inert physical evidence.
+pub const KIND_AUTH_PROOF_V2: RawInline =
+    hex_literal::hex!("334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5");
+
 /// Archive one description fragment and take its content identity.
 ///
 /// Only the fragment's facts are archived, exactly as a collection descriptor
@@ -179,11 +183,11 @@ record_kinds! {
 
     /// A self-contained prefix-signed capability proof.
     ///
-    /// Kind id minted with `trible genid` on 2026-09-04.
-    CapabilityProofRecordV2 = KIND_ID_AUTH_PROOF "C1E5E9D46B4D72AAC1D22170E546C144",
-        KIND_AUTH_PROOF "334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5",
-        "pile-auth-proof-v2",
-        "A canonical self-contained prefix-signed capability proof. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with a 16-byte grammar magic, a 32-byte opaque resource, and the 32-byte root Ed25519 public key, followed by one or more 145-byte edges. Each edge holds a 16-byte action id, one flags byte whose low two bits encode invocation and delegation and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix through its edge's delegate, including all preceding signatures. The declared length is exactly 80 + 145n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id.";
+    /// Kind id minted with `trible genid` on 2026-09-06.
+    CapabilityProofRecordV3 = KIND_ID_AUTH_PROOF "0A1F399185ED9AB70299C951D32B1041",
+        KIND_AUTH_PROOF "CFAD21DF6FA3D3ADF9939E432DDCF8447CB9C57081B979F1CFD669E4800D3E32",
+        "pile-auth-proof-v3",
+        "A canonical self-contained prefix-signed capability proof. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with a 16-byte grammar magic, a 32-byte opaque resource, and the 32-byte root Ed25519 public key, followed by one or more 161-byte edges. Each edge holds a 32-byte SimpleArchive capability-definition handle, one flags byte whose low two bits encode invocation and delegation and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix through its edge's delegate, including all preceding signatures. The declared length is exactly 80 + 161n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id. Capability definition handles are strong blob references; the resource remains opaque. Proof verification does not acquire or interpret those definitions.";
 
 }
 

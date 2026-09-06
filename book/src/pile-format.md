@@ -43,7 +43,7 @@ absolute file offsets, not merely within the record. The predecessor framing
 put a 36-byte prefix in front of the body, which left every such field four
 bytes short of a boundary and made each one straddle two. Capability proofs are
 the deliberate exception: their compact, length-delimited grammar packs
-145-byte edges and promises no internal field alignment.
+161-byte edges and promises no internal field alignment.
 
 **The record kind resolves.** 32 bytes is a blob handle, and the handle names a
 `SimpleArchive` describing the record kind: its name, the exact byte layout of
@@ -68,7 +68,7 @@ fresh piles neither write nor advertise those dead formats.
 
 The arithmetic works out exactly. A signed commit contains six 32-byte fields,
 so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge capability
-proof has a 225-byte body after its 96-byte envelope prefix and therefore uses
+proof has a 241-byte body after its 96-byte envelope prefix and therefore uses
 two blocks. Longer proofs use the minimal additional whole blocks without
 changing their canonical body.
 
@@ -456,8 +456,10 @@ The descriptor archive holds a descriptor entity carrying:
   no name of its own: its source already anchors it. Naming the
   source by handle rather than by a shared label means a descriptor cannot claim
   a lineage it does not have;
-- `collection_read_policy` and `collection_write_policy`, each linking one
-  self-contained policy entity. An open policy needs no proof. A quorum policy
+- repeated `resource_policy` links to self-contained policy entities, each
+  naming an exact `capability_handle`. The standard READ and WRITE definitions
+  and any application-specific definitions share this relation. An open policy
+  needs no proof. A quorum policy
   carries a canonical nonempty set of Ed25519 roots and one semantic quorum
   threshold. The byte-compatible descriptor may still contain the earlier
   optional delegation-threshold fact, but authorization ignores it; a signed
@@ -546,7 +548,7 @@ canonical self-contained prefix-signed proof body
 
 ```text
 magic16 | resource32 | root32 |
-    (action16 | flags1 | validity32 | delegate32 | signature64)+
+    (capability_handle32 | flags1 | validity32 | delegate32 | signature64)+
 ```
 
 Its logical key is
@@ -557,7 +559,7 @@ is not duplicated in the frame.
 |---:|---:|---|
 | `0..28` | 28 | Framing magic |
 | `28..32` | 4 | Minimal total 256-byte-block span, little-endian |
-| `32..64` | 32 | Proof kind `334D7A044E5F9ED4F3E51618A3FB1752120F37BB5CDBC6B9F6497FB9E338E8D5`, rooted at `C1E5E9D46B4D72AAC1D22170E546C144` |
+| `32..64` | 32 | Proof kind `CFAD21DF6FA3D3ADF9939E432DDCF8447CB9C57081B979F1CFD669E4800D3E32`, rooted at `0A1F399185ED9AB70299C951D32B1041` |
 | `64..72` | 8 | Exact proof-body byte length, little-endian |
 | `72..96` | 24 | Reserved zeros |
 | `96..96+length` | variable | Canonical proof body |
@@ -567,27 +569,27 @@ The proof header is exactly 80 bytes:
 
 | Body offset | Width | Field |
 |---:|---:|---|
-| `0..16` | 16 | Grammar magic `5C154102198D7FED2EA797720C2E258D` |
+| `0..16` | 16 | Grammar magic `92DDF6E5ED9F35A5E513E74350AA1175` |
 | `16..48` | 32 | Opaque resource identity |
 | `48..80` | 32 | Root Ed25519 public key |
 
-Each following edge is exactly 145 bytes:
+Each following edge is exactly 161 bytes:
 
 | Edge offset | Width | Field |
 |---:|---:|---|
-| `0..16` | 16 | Exact non-nil action ID |
-| `16..17` | 1 | Invoke/delegate mode bits plus validity-presence bit |
-| `17..49` | 32 | Two signed big-endian 128-bit TAI-nanosecond bounds, or canonical zeros |
-| `49..81` | 32 | Delegate Ed25519 public key |
-| `81..145` | 64 | Ed25519 signature over the exact body prefix through this delegate |
+| `0..32` | 32 | Exact capability-definition `Handle<SimpleArchive>` |
+| `32..33` | 1 | Invoke/delegate mode bits plus validity-presence bit |
+| `33..65` | 32 | Two signed big-endian 128-bit TAI-nanosecond bounds, or canonical zeros |
+| `65..97` | 32 | Delegate Ed25519 public key |
+| `97..161` | 64 | Ed25519 signature over the exact body prefix through this delegate |
 
-The body length must be exactly `80 + 145n` for `1 <= n <= 255`. Replay parses
-every Ed25519 key, requires a nonzero action and known nonempty mode on each
+The body length must be exactly `80 + 161n` for `1 <= n <= 255`. Replay parses
+every Ed25519 key, requires a known nonempty mode on each
 edge, validates the optional inclusive interval encoding, requires the declared
 span to be the smallest span containing the body, and rejects any nonzero
 reserved or padding byte as corruption. The low two flag bits encode Invoke,
 Delegate, or both; bit 2 marks a present interval; all higher bits must be zero.
-A one-edge body is 225 bytes, so its pile record occupies two 256-byte blocks.
+A one-edge body is 241 bytes, so its pile record occupies two 256-byte blocks.
 
 Insertion of identical bytes is idempotent. Different bytes reconstructing to
 the same proof ID are a collision and fail. Exact lookup is only by proof ID;
@@ -597,16 +599,17 @@ body byte through its own delegate, including prior signatures. An exact prefix
 ending after any signature is therefore a complete proof for that intermediate
 delegate.
 
-Conservative rewrites preserve every current canonical proof record but create
-no blob lifetime edge from it. In particular, the opaque resource field is not
-interpreted as a blob handle by storage. Full semantic verification still
+Conservative rewrites preserve every current canonical proof record and each
+resident capability definition it references, without fetching absent blobs
+or authoring WANTs. The opaque resource field is not interpreted as a blob
+handle by storage. Full semantic verification still
 needs the external trust root, expected subject, instant, and exact request;
 physical retention grants no authority.
 
-The earlier `K(S,C,K)+` proof record kind remains structurally recognizable as
-an inert frame so an append-only pile can be traversed safely. Fresh writers do
-not emit it, replay projects no authorization evidence from it, and semantic
-rewrites may drop it. Its signatures covered a different grammar and cannot be
+The earlier `K(S,C,K)+` and 145-byte-edge action-ID proof kinds remain
+structurally recognizable as inert frames so append-only piles can be traversed
+safely. Fresh writers do not emit them, replay projects no authority from them,
+and semantic rewrites may drop them. Their signatures cover other grammars and cannot be
 mechanically migrated; the relevant private keys must reissue authority.
 
 ## Retired Team-Era Records

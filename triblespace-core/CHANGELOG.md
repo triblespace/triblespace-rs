@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Resource-scoped capability definition handles and generic descriptor policy
+  bindings. PROOF edges now carry a 32-byte `Handle<SimpleArchive>` plus the
+  existing mode/time attenuation; the kernel verifies signatures without
+  fetching or interpreting definitions. READ/WRITE are collection consumers of
+  the same mechanism as custom capabilities. Pile indexes share owning proof
+  byte views; GC retains resident definitions, not opaque resource identities.
+  The new grammar/record kind requires explicit proof reissuance and descriptor
+  transition, not entity-ID rewriting or signature translation.
+
 - Freeze one authorization instant in every `StoreSnapshot`, with
   `SnapshotSource::snapshot_at` as the single explicit-time construction seam.
   Collection observation and admission use that frozen instant; content-change

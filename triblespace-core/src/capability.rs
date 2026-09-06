@@ -4,7 +4,7 @@
 //!
 //! ```text
 //! magic | resource | root |
-//!   (action | mode/validity flags | validity | delegate | signature)+
+//!   (capability handle | mode/validity flags | validity | delegate | signature)+
 //! ```
 //!
 //! Each signature is last and covers the exact byte prefix through its
@@ -25,33 +25,41 @@ use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use hifitime::Epoch;
 
-use crate::id::{id_hex, ExclusiveId, Id, ID_LEN};
+use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
+use crate::id::{id_hex, ExclusiveId};
 use crate::inline::encodings::genid::GenId;
-use crate::inline::encodings::hash::{Blake3, Hash};
+use crate::inline::encodings::hash::{Blake3, Handle, Hash};
 use crate::inline::{Encodes, Inline, InlineEncoding, TryFromInline};
 use crate::metadata::{self, MetaDescribe};
 use crate::prelude::{attributes, entity};
 use crate::trible::Fragment;
 
+/// Immutable resource-local capability policies, independent of collections.
+pub mod policy;
+
+/// Content address of a capability definition. The kernel compares exact
+/// handles; only the resource consumer interprets the definition's facts.
+pub type CapabilityHandle = Inline<Handle<SimpleArchive>>;
+
 /// Exact magic of this canonical grammar. Incompatible grammars get new magic.
-pub const CAPABILITY_PROOF_MAGIC: [u8; 16] = [
-    0x5c, 0x15, 0x41, 0x02, 0x19, 0x8d, 0x7f, 0xed, 0x2e, 0xa7, 0x97, 0x72, 0x0c, 0x2e, 0x25, 0x8d,
-];
+/// Minted with `trible genid` on 2026-09-06.
+pub const CAPABILITY_PROOF_MAGIC: [u8; 16] = hex_literal::hex!("92DDF6E5ED9F35A5E513E74350AA1175");
 pub const MAX_CAPABILITY_PROOF_STEPS: usize = u8::MAX as usize;
 pub const CAPABILITY_PROOF_HEADER_LEN: usize = 16 + 32 + 32;
 pub const CAPABILITY_PROOF_EDGE_LEN: usize =
-    ID_LEN + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+    CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
 pub const MIN_CAPABILITY_PROOF_BYTES: usize =
     CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_PROOF_EDGE_LEN;
 pub const MAX_CAPABILITY_PROOF_BYTES: usize =
     CAPABILITY_PROOF_HEADER_LEN + MAX_CAPABILITY_PROOF_STEPS * CAPABILITY_PROOF_EDGE_LEN;
 
 const RESOURCE_LEN: usize = 32;
+const CAPABILITY_HANDLE_LEN: usize = 32;
 const PUBLIC_KEY_LEN: usize = 32;
 const SIGNATURE_LEN: usize = 64;
 const FLAGS_LEN: usize = 1;
 const VALIDITY_LEN: usize = 32;
-const EDGE_BODY_LEN: usize = ID_LEN + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN;
+const EDGE_BODY_LEN: usize = CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN;
 const MODE_MASK: u8 = 0b0000_0011;
 const VALIDITY_PRESENT: u8 = 0b0000_0100;
 const KNOWN_FLAGS: u8 = MODE_MASK | VALIDITY_PRESENT;
@@ -118,43 +126,27 @@ impl TryFromInline<'_, CapabilityResourceEncoding> for CapabilityResource {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(transparent)]
-pub struct CapabilityAction(Id);
-
-impl CapabilityAction {
-    pub const fn new(id: Id) -> Self {
-        Self(id)
-    }
-    pub const fn id(self) -> Id {
-        self.0
-    }
-}
-
-impl From<Id> for CapabilityAction {
-    fn from(id: Id) -> Self {
-        Self(id)
-    }
-}
-
 attributes! {
-    /// Exact action identifier used by resource policy entities.
+    /// Operation described by a capability definition blob.
     /// Minted with `trible genid` on 2026-08-24.
     "E68BACD3068B30DA051D3A4A2B8795FC" as pub capability_action: GenId;
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CapabilityAtom {
-    action: CapabilityAction,
+    capability: CapabilityHandle,
     resource: CapabilityResource,
 }
 
 impl CapabilityAtom {
-    pub const fn new(action: CapabilityAction, resource: CapabilityResource) -> Self {
-        Self { action, resource }
+    pub const fn new(capability: CapabilityHandle, resource: CapabilityResource) -> Self {
+        Self {
+            capability,
+            resource,
+        }
     }
-    pub const fn action(self) -> CapabilityAction {
-        self.action
+    pub const fn capability(self) -> CapabilityHandle {
+        self.capability
     }
     pub const fn resource(self) -> CapabilityResource {
         self.resource
@@ -195,37 +187,37 @@ impl CapabilityMode {
     }
 }
 
-/// Compact exact action plus invocation/delegation restriction.
+/// Exact capability definition plus invocation/delegation restriction.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Capability {
-    action: CapabilityAction,
+    handle: CapabilityHandle,
     mode: CapabilityMode,
 }
 
 impl Capability {
-    pub const fn new(action: CapabilityAction, mode: CapabilityMode) -> Self {
-        Self { action, mode }
+    pub const fn new(handle: CapabilityHandle, mode: CapabilityMode) -> Self {
+        Self { handle, mode }
     }
-    pub const fn action(self) -> CapabilityAction {
-        self.action
+    pub const fn handle(self) -> CapabilityHandle {
+        self.handle
     }
     pub const fn mode(self) -> CapabilityMode {
         self.mode
     }
     pub const fn atom(self, resource: CapabilityResource) -> CapabilityAtom {
-        CapabilityAtom::new(self.action, resource)
+        CapabilityAtom::new(self.handle, resource)
     }
     pub fn meet(self, other: Self) -> Option<Self> {
-        if self.action != other.action {
+        if self.handle != other.handle {
             return None;
         }
         match self.mode.meet(other.mode) {
-            Some(mode) => Some(Self::new(self.action, mode)),
+            Some(mode) => Some(Self::new(self.handle, mode)),
             None => None,
         }
     }
     pub fn satisfies(self, required: Self) -> bool {
-        self.action == required.action && self.mode.satisfies(required.mode)
+        self.handle == required.handle && self.mode.satisfies(required.mode)
     }
 }
 
@@ -374,55 +366,14 @@ impl CapabilityProof {
 
     /// Validate borrowed framing without allocating or assigning authority.
     pub(crate) fn validate_bytes(bytes: &[u8]) -> Result<(), CapabilityProofDecodeError> {
-        if bytes.len() < MIN_CAPABILITY_PROOF_BYTES
-            || (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) % CAPABILITY_PROOF_EDGE_LEN != 0
-        {
-            return Err(CapabilityProofDecodeError::InvalidLength {
-                actual: bytes.len(),
-            });
-        }
-        if bytes[..CAPABILITY_PROOF_MAGIC.len()] != CAPABILITY_PROOF_MAGIC {
-            return Err(CapabilityProofDecodeError::InvalidMagic);
-        }
-        let steps = (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) / CAPABILITY_PROOF_EDGE_LEN;
-        if steps > MAX_CAPABILITY_PROOF_STEPS {
-            return Err(CapabilityProofDecodeError::TooManySteps {
-                count: steps,
-                limit: MAX_CAPABILITY_PROOF_STEPS,
-            });
-        }
-        parse_key(&bytes[CAPABILITY_PROOF_MAGIC.len() + RESOURCE_LEN..CAPABILITY_PROOF_HEADER_LEN])
-            .ok_or(CapabilityProofDecodeError::InvalidKey { key: 0 })?;
+        validate_framing(bytes, CAPABILITY_PROOF_MAGIC, CAPABILITY_HANDLE_LEN)
+    }
 
-        for (step, edge) in bytes[CAPABILITY_PROOF_HEADER_LEN..]
-            .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
-            .enumerate()
-        {
-            let action: [u8; ID_LEN] = edge[..ID_LEN].try_into().expect("fixed action slice");
-            if Id::new(action).is_none() {
-                return Err(CapabilityProofDecodeError::InvalidAction { step });
-            }
-            let flags = edge[ID_LEN];
-            if flags & !KNOWN_FLAGS != 0 || CapabilityMode::from_bits(flags & MODE_MASK).is_none() {
-                return Err(CapabilityProofDecodeError::InvalidFlags { step, flags });
-            }
-            let validity = &edge[ID_LEN + FLAGS_LEN..ID_LEN + FLAGS_LEN + VALIDITY_LEN];
-            if flags & VALIDITY_PRESENT == 0 {
-                if validity.iter().any(|byte| *byte != 0) {
-                    return Err(CapabilityProofDecodeError::NonCanonicalValidity { step });
-                }
-            } else {
-                let lower = i128::from_be_bytes(validity[..16].try_into().expect("fixed bound"));
-                let upper = i128::from_be_bytes(validity[16..].try_into().expect("fixed bound"));
-                CapabilityValidity::from_bounds_ns(lower, upper).map_err(|source| {
-                    CapabilityProofDecodeError::InvalidValidity { step, source }
-                })?;
-            }
-            let delegate_start = ID_LEN + FLAGS_LEN + VALIDITY_LEN;
-            parse_key(&edge[delegate_start..delegate_start + PUBLIC_KEY_LEN])
-                .ok_or(CapabilityProofDecodeError::InvalidKey { key: step + 1 })?;
-        }
-        Ok(())
+    /// Direct strong blob references, without acquisition or interpretation.
+    /// Resource identities remain opaque and are not treated as blob handles.
+    pub fn blob_references(&self) -> impl Iterator<Item = Inline<Handle<UnknownBlob>>> + '_ {
+        self.capabilities()
+            .map(|capability| capability.handle().transmute())
     }
 
     /// Issue the first edge of one root's authority path.
@@ -479,10 +430,10 @@ impl CapabilityProof {
         if !parent.effective_capability.mode().delegates() {
             return Err(CapabilityIssueError::ParentCannotDelegate);
         }
-        if parent.effective_capability.action() != capability.action() {
-            return Err(CapabilityIssueError::ActionMismatch {
-                parent: parent.effective_capability.action(),
-                child: capability.action(),
+        if parent.effective_capability.handle() != capability.handle() {
+            return Err(CapabilityIssueError::CapabilityMismatch {
+                parent: parent.effective_capability.handle(),
+                child: capability.handle(),
             });
         }
         if parent.effective_capability.meet(capability).is_none() {
@@ -648,11 +599,11 @@ impl CapabilityProof {
             }
             effective_capability = Some(match effective_capability {
                 None => edge.capability,
-                Some(parent) if parent.action() != edge.capability.action() => {
-                    return Err(CapabilityProofError::ActionMismatch {
+                Some(parent) if parent.handle() != edge.capability.handle() => {
+                    return Err(CapabilityProofError::CapabilityMismatch {
                         step,
-                        parent: parent.action(),
-                        child: edge.capability.action(),
+                        parent: parent.handle(),
+                        child: edge.capability.handle(),
                     });
                 }
                 Some(parent) => parent
@@ -687,12 +638,16 @@ impl CapabilityProof {
             .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
             .enumerate()
             .map(|(step, edge)| {
-                let action = Id::new(edge[..ID_LEN].try_into().expect("fixed action"))
-                    .expect("proof actions were validated at construction");
-                let flags = edge[ID_LEN];
+                let handle = Inline::new(
+                    edge[..CAPABILITY_HANDLE_LEN]
+                        .try_into()
+                        .expect("fixed capability handle"),
+                );
+                let flags = edge[CAPABILITY_HANDLE_LEN];
                 let mode = CapabilityMode::from_bits(flags & MODE_MASK)
                     .expect("proof modes were validated at construction");
-                let raw_validity = &edge[ID_LEN + FLAGS_LEN..ID_LEN + FLAGS_LEN + VALIDITY_LEN];
+                let raw_validity = &edge[CAPABILITY_HANDLE_LEN + FLAGS_LEN
+                    ..CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN];
                 let validity = (flags & VALIDITY_PRESENT != 0).then(|| {
                     CapabilityValidity::from_bounds_ns(
                         i128::from_be_bytes(raw_validity[..16].try_into().expect("fixed bound")),
@@ -700,7 +655,7 @@ impl CapabilityProof {
                     )
                     .expect("proof validity was validated at construction")
                 });
-                let delegate_start = ID_LEN + FLAGS_LEN + VALIDITY_LEN;
+                let delegate_start = CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN;
                 let delegate = parse_key(&edge[delegate_start..delegate_start + PUBLIC_KEY_LEN])
                     .expect("proof keys were validated at construction");
                 let mut r = [0; 32];
@@ -708,7 +663,7 @@ impl CapabilityProof {
                 r.copy_from_slice(&edge[EDGE_BODY_LEN..EDGE_BODY_LEN + 32]);
                 s.copy_from_slice(&edge[EDGE_BODY_LEN + 32..]);
                 CapabilityProofEdge {
-                    capability: Capability::new(CapabilityAction::new(action), mode),
+                    capability: Capability::new(handle, mode),
                     validity,
                     delegate,
                     signature: Signature::from_components(r, s),
@@ -720,6 +675,73 @@ impl CapabilityProof {
     }
 }
 
+/// Structural framing shared with the known-inert action-ID grammar.
+/// No capability interpretation or signature verification occurs here.
+fn validate_framing(
+    bytes: &[u8],
+    magic: [u8; 16],
+    handle_len: usize,
+) -> Result<(), CapabilityProofDecodeError> {
+    let edge_len = handle_len + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
+    if bytes.len() < CAPABILITY_PROOF_HEADER_LEN + edge_len
+        || (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) % edge_len != 0
+    {
+        return Err(CapabilityProofDecodeError::InvalidLength {
+            actual: bytes.len(),
+        });
+    }
+    if bytes[..magic.len()] != magic {
+        return Err(CapabilityProofDecodeError::InvalidMagic);
+    }
+    let steps = (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) / edge_len;
+    if steps > MAX_CAPABILITY_PROOF_STEPS {
+        return Err(CapabilityProofDecodeError::TooManySteps {
+            count: steps,
+            limit: MAX_CAPABILITY_PROOF_STEPS,
+        });
+    }
+    parse_key(&bytes[magic.len() + RESOURCE_LEN..CAPABILITY_PROOF_HEADER_LEN])
+        .ok_or(CapabilityProofDecodeError::InvalidKey { key: 0 })?;
+
+    for (step, edge) in bytes[CAPABILITY_PROOF_HEADER_LEN..]
+        .chunks_exact(edge_len)
+        .enumerate()
+    {
+        let flags = edge[handle_len];
+        if flags & !KNOWN_FLAGS != 0 || CapabilityMode::from_bits(flags & MODE_MASK).is_none() {
+            return Err(CapabilityProofDecodeError::InvalidFlags { step, flags });
+        }
+        let validity = &edge[handle_len + FLAGS_LEN..handle_len + FLAGS_LEN + VALIDITY_LEN];
+        if flags & VALIDITY_PRESENT == 0 {
+            if validity.iter().any(|byte| *byte != 0) {
+                return Err(CapabilityProofDecodeError::NonCanonicalValidity { step });
+            }
+        } else {
+            let lower = i128::from_be_bytes(validity[..16].try_into().expect("fixed bound"));
+            let upper = i128::from_be_bytes(validity[16..].try_into().expect("fixed bound"));
+            CapabilityValidity::from_bounds_ns(lower, upper)
+                .map_err(|source| CapabilityProofDecodeError::InvalidValidity { step, source })?;
+        }
+        let delegate_start = handle_len + FLAGS_LEN + VALIDITY_LEN;
+        parse_key(&edge[delegate_start..delegate_start + PUBLIC_KEY_LEN])
+            .ok_or(CapabilityProofDecodeError::InvalidKey { key: step + 1 })?;
+    }
+    Ok(())
+}
+
+/// Golden body from the historical action-ID grammar.
+#[cfg(test)]
+pub(crate) const LEGACY_ACTION_PROOF_FIXTURE: [u8; 225] = hex_literal::hex!("5c154102198d7fed2ea797720c2e258d05050505050505050505050505050505050505050505050505050505050505058a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040404040404040404040404040404040300000000000000000000000000000000000000000000000000000000000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394c013aaaadab79103f8cdb6e4b9948341e3d3b711a570743964318ee769315f6911ab060dcbb67ba1e3c7a56a6c14bcb3b3c12cb2ec3e25b86886dea6981bb20d");
+
+/// Recognize historical action-ID proofs as inert records, never authority.
+pub(crate) fn legacy_action_proof_is_structural(bytes: &[u8]) -> bool {
+    let magic = hex_literal::hex!("5C154102198D7FED2EA797720C2E258D");
+    validate_framing(bytes, magic, 16).is_ok()
+        && bytes[CAPABILITY_PROOF_HEADER_LEN..]
+            .chunks_exact(145)
+            .all(|edge| edge[..16].iter().any(|byte| *byte != 0))
+}
+
 fn append_edge(
     bytes: &mut Vec<u8>,
     issuer: &SigningKey,
@@ -727,7 +749,7 @@ fn append_edge(
     validity: Option<CapabilityValidity>,
     delegate: VerifyingKey,
 ) {
-    bytes.extend_from_slice(&capability.action().id().raw());
+    bytes.extend_from_slice(&capability.handle().raw);
     let mut flags = capability.mode().bits();
     if validity.is_some() {
         flags |= VALIDITY_PRESENT;
@@ -853,7 +875,7 @@ pub fn capability_quorum_authorizes<'a>(
         };
         if path.steps.iter().any(|step| {
             step.subject == expected_subject
-                && step.effective_capability.action() == request.atom().action()
+                && step.effective_capability.handle() == request.atom().capability()
                 && step
                     .effective_capability
                     .mode()
@@ -903,7 +925,7 @@ pub fn capability_quorum_authorized_subjects<'a>(
             continue;
         };
         for step in path.steps {
-            if step.effective_capability.action() == request.atom().action()
+            if step.effective_capability.handle() == request.atom().capability()
                 && step
                     .effective_capability
                     .mode()
@@ -939,9 +961,6 @@ pub enum CapabilityProofDecodeError {
     InvalidKey {
         key: usize,
     },
-    InvalidAction {
-        step: usize,
-    },
     InvalidFlags {
         step: usize,
         flags: u8,
@@ -964,7 +983,6 @@ impl fmt::Display for CapabilityProofDecodeError {
                 write!(f, "capability proof has {count} steps; limit is {limit}")
             }
             Self::InvalidKey { key } => write!(f, "invalid capability proof key {key}"),
-            Self::InvalidAction { step } => write!(f, "nil action at edge {step}"),
             Self::InvalidFlags { step, flags } => {
                 write!(f, "invalid flags {flags:#04x} at edge {step}")
             }
@@ -993,9 +1011,9 @@ pub enum CapabilityIssueError {
     },
     InvalidParent(CapabilityProofError),
     ParentCannotDelegate,
-    ActionMismatch {
-        parent: CapabilityAction,
-        child: CapabilityAction,
+    CapabilityMismatch {
+        parent: CapabilityHandle,
+        child: CapabilityHandle,
     },
     EmptyMode,
     EmptyValidity,
@@ -1011,7 +1029,9 @@ impl fmt::Display for CapabilityIssueError {
             }
             Self::InvalidParent(source) => write!(f, "invalid parent proof: {source}"),
             Self::ParentCannotDelegate => f.write_str("the exact prefix cannot delegate"),
-            Self::ActionMismatch { .. } => f.write_str("delegation changed action"),
+            Self::CapabilityMismatch { .. } => {
+                f.write_str("delegation changed capability definition")
+            }
             Self::EmptyMode => f.write_str("capability mode intersection is empty"),
             Self::EmptyValidity => f.write_str("capability validity intersection is empty"),
         }
@@ -1051,10 +1071,10 @@ pub enum CapabilityProofError {
     ParentCannotDelegate {
         step: usize,
     },
-    ActionMismatch {
+    CapabilityMismatch {
         step: usize,
-        parent: CapabilityAction,
-        child: CapabilityAction,
+        parent: CapabilityHandle,
+        child: CapabilityHandle,
     },
     EmptyMode {
         step: usize,
@@ -1081,7 +1101,9 @@ impl fmt::Display for CapabilityProofError {
             Self::ParentCannotDelegate { step } => {
                 write!(f, "prefix before edge {step} cannot delegate")
             }
-            Self::ActionMismatch { step, .. } => write!(f, "edge {step} changed action"),
+            Self::CapabilityMismatch { step, .. } => {
+                write!(f, "edge {step} changed capability definition")
+            }
             Self::EmptyMode { step } => write!(f, "empty mode at edge {step}"),
             Self::EmptyValidity { step } => write!(f, "empty validity at edge {step}"),
             Self::NotYetValid { lower } => write!(f, "not valid before TAI ns {lower}"),
@@ -1137,8 +1159,8 @@ mod tests {
     fn key(byte: u8) -> SigningKey {
         SigningKey::from_bytes(&[byte; 32])
     }
-    fn action(byte: u8) -> CapabilityAction {
-        CapabilityAction::new(Id::new([byte; ID_LEN]).expect("nonzero test action"))
+    fn action(byte: u8) -> CapabilityHandle {
+        Inline::new([byte; CAPABILITY_HANDLE_LEN])
     }
     fn resource(byte: u8) -> CapabilityResource {
         CapabilityResource::new([byte; RESOURCE_LEN])
@@ -1217,10 +1239,10 @@ mod tests {
         bad_magic[0] ^= 1;
         cases.push(bad_magic);
         let mut bad_flags = valid.as_bytes().to_vec();
-        bad_flags[CAPABILITY_PROOF_HEADER_LEN + ID_LEN] |= 0x80;
+        bad_flags[CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_HANDLE_LEN] |= 0x80;
         cases.push(bad_flags);
         let mut bad_validity = valid.as_bytes().to_vec();
-        bad_validity[CAPABILITY_PROOF_HEADER_LEN + ID_LEN + FLAGS_LEN] = 1;
+        bad_validity[CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_HANDLE_LEN + FLAGS_LEN] = 1;
         cases.push(bad_validity);
         for bytes in cases {
             let expected = CapabilityProof::from_bytes(&bytes).unwrap_err();
@@ -1250,12 +1272,12 @@ mod tests {
             None,
         );
         let expected = hex_literal::hex!(
-            "5c154102198d7fed2ea797720c2e258d05050505050505050505050505050505050505050505050505050505050505058a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c040404040404040404040404040404040300000000000000000000000000000000000000000000000000000000000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394c013aaaadab79103f8cdb6e4b9948341e3d3b711a570743964318ee769315f6911ab060dcbb67ba1e3c7a56a6c14bcb3b3c12cb2ec3e25b86886dea6981bb20d"
+            "92ddf6e5ed9f35a5e513e74350aa117505050505050505050505050505050505050505050505050505050505050505058a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c04040404040404040404040404040404040404040404040404040404040404040300000000000000000000000000000000000000000000000000000000000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394005560b3791d23dac6bdf3b42f7bc642c7ed9a1893565f43a12dd58155998915c2293f5ab53fc4132ab550672fa9628019b67a1024f95e96c6866f628314870c"
         );
         assert_eq!(first.as_bytes(), expected);
         assert_eq!(
             first.id().raw,
-            hex_literal::hex!("e14d764b3fdaf410eda8b28692b6d6c0744dc82e7b0073fad004693ec25ee32c")
+            hex_literal::hex!("d19203c071ace6babd555501e5f6b0f11c0b64e764643f22ccdc4e6bf75574ee")
         );
         assert_eq!(first.as_bytes().len(), MIN_CAPABILITY_PROOF_BYTES);
         assert_eq!(&first.as_bytes()[..16], &CAPABILITY_PROOF_MAGIC);
@@ -1663,13 +1685,13 @@ mod tests {
             ));
         }
         let mut bad_flags = proof.as_bytes().to_vec();
-        bad_flags[CAPABILITY_PROOF_HEADER_LEN + ID_LEN] |= 0x80;
+        bad_flags[CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_HANDLE_LEN] |= 0x80;
         assert!(matches!(
             CapabilityProof::from_bytes(&bad_flags),
             Err(CapabilityProofDecodeError::InvalidFlags { .. })
         ));
         let mut noncanonical = proof.as_bytes().to_vec();
-        noncanonical[CAPABILITY_PROOF_HEADER_LEN + ID_LEN + FLAGS_LEN] = 1;
+        noncanonical[CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_HANDLE_LEN + FLAGS_LEN] = 1;
         assert!(matches!(
             CapabilityProof::from_bytes(&noncanonical),
             Err(CapabilityProofDecodeError::NonCanonicalValidity { .. })
@@ -1686,13 +1708,87 @@ mod tests {
         );
 
         let mut weak_delegate = proof.as_bytes().to_vec();
-        let delegate_start = CAPABILITY_PROOF_HEADER_LEN + ID_LEN + FLAGS_LEN + VALIDITY_LEN;
+        let delegate_start =
+            CAPABILITY_PROOF_HEADER_LEN + CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN;
         weak_delegate[delegate_start..delegate_start + PUBLIC_KEY_LEN]
             .copy_from_slice(weak.as_bytes());
         assert_eq!(
             CapabilityProof::from_bytes(&weak_delegate),
             Err(CapabilityProofDecodeError::InvalidKey { key: 1 })
         );
+    }
+
+    #[test]
+    fn definition_handles_are_opaque_and_do_not_require_resident_blobs() {
+        let root = key(81);
+        let subject = key(82);
+        // Unlike entity IDs, every 32-byte handle representation is valid.
+        // No definition bytes or blob store participate in kernel verification.
+        let handle = Inline::new([0; 32]);
+        let resource = resource(83);
+        let proof = CapabilityProof::issue_root(
+            &root,
+            resource,
+            Capability::new(handle, CapabilityMode::Invoke),
+            None,
+            subject.verifying_key(),
+        );
+        let decoded = CapabilityProof::from_bytes(proof.as_bytes()).unwrap();
+        decoded
+            .verify(
+                root.verifying_key(),
+                epoch(0.0),
+                subject.verifying_key(),
+                CapabilityRequest::new(
+                    CapabilityAtom::new(handle, resource),
+                    CapabilityMode::Invoke,
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            decoded.blob_references().collect::<Vec<_>>(),
+            vec![handle.transmute()]
+        );
+        assert_eq!(CAPABILITY_PROOF_EDGE_LEN, 161);
+    }
+
+    #[test]
+    fn an_extended_path_cannot_change_its_capability_definition() {
+        let root = key(84);
+        let middle = key(85);
+        let leaf = key(86);
+        let proof = proof(
+            &root,
+            &middle,
+            87,
+            88,
+            CapabilityMode::InvokeAndDelegate,
+            None,
+        );
+        let mut changed_handle = [87; 32];
+        changed_handle[31] = 89; // Equal old 16-byte prefix, distinct full handle.
+        let changed_capability =
+            Capability::new(Inline::new(changed_handle), CapabilityMode::Invoke);
+        assert!(matches!(
+            proof.extend(&middle, changed_capability, None, leaf.verifying_key()),
+            Err(CapabilityIssueError::CapabilityMismatch { .. }),
+        ));
+        // A raw signer can construct the bytes anyway, but valid signatures
+        // cannot turn a capability change into an admissible delegation.
+        let mut bytes = proof.into_bytes();
+        append_edge(
+            &mut bytes,
+            &middle,
+            changed_capability,
+            None,
+            leaf.verifying_key(),
+        );
+        let changed = CapabilityProof::from_owned_bytes(Bytes::from_source(bytes)).unwrap();
+        assert!(changed.verify_signatures().is_ok());
+        assert!(matches!(
+            changed.validate_structure(),
+            Err(CapabilityProofError::CapabilityMismatch { .. })
+        ));
     }
 
     #[test]

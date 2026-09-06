@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Generalize AUTH to resource-declared capability definitions. Prefix proofs
+  retain inline delegation/time attenuation while naming exact definition
+  handles; collection admission and custom audiences query generic policy
+  bindings. Net ALPN24 repairs all declared capabilities through scoped
+  resource/proof-hash indexes without fetching definitions or weakening READ
+  admission. Old proof grammars remain known-inert for explicit cutover.
+
 ### Changed
 
 - Store resource authorization as descriptor-local capability-handle bindings
