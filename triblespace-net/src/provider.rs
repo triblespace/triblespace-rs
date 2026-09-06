@@ -12,7 +12,8 @@ use triblespace_core::patch::{
     Entry as PatchEntry, IdentitySchema, PATCH, PATCHIntoOrderedIterator,
 };
 
-use crate::bearer::{BearerLocatorIndex, blob_locator};
+use crate::bearer::BearerLocatorIndex;
+pub use crate::bearer::blob_locator;
 use crate::clock::Mono;
 use crate::transport::PeerId;
 
@@ -71,7 +72,13 @@ pub(crate) fn collection_provider_token(identity: [u8; 32], provider: PeerId) ->
     )
 }
 
-pub(crate) fn blob_provider_token(identity: [u8; 32], provider: PeerId) -> ProviderToken {
+/// Derive the expected endpoint-bound directory token for one exact blob.
+///
+/// A reader who knows the bearer handle can compare this value with a
+/// `protocol::op_provider_get` reply without fetching the blob or sending the
+/// handle. A matching token proves knowledge of the handle, not current
+/// provider reachability or residency. Never log the input handle.
+pub fn blob_provider_token(identity: [u8; 32], provider: PeerId) -> [u8; 32] {
     provider_lease_token(identity, blob_locator(identity), provider)
 }
 

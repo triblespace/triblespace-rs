@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Add a bounded, read-only DHT directory example for exact blob locators. Reuse
+  the public protocol operations and expose the existing locator/token
+  derivations without sending bearer handles, fetching bodies, or publishing
+  leases. An optional passive pile scan reports locator rank and probes the
+  minimum resident locator with constant additional inventory state.
 - Isolate exact-blob receiver unit tests that otherwise shared one process-wide
   receive permit across independent paused Tokio clocks. Cover same-runtime
   receive contention within the unchanged ten-second foreground deadline;
