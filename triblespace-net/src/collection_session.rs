@@ -65,15 +65,7 @@ where
     let bootstrap = hello
         .bootstrap_proofs
         .into_iter()
-        .filter(|proof| {
-            proof.verify_signatures().is_ok()
-                && proof.leaf_key() == remote
-                && evidence.read_policies().any(|policy| {
-                    policy
-                        .roots()
-                        .is_some_and(|roots| roots.contains(&proof.root_key()))
-                })
-        })
+        .filter(|proof| proof.leaf_key() == remote && evidence.validate_read_proof(proof).is_ok())
         .collect::<Vec<_>>();
     let read_evidence = overlay
         .authorization_evidence()
@@ -169,10 +161,10 @@ fn node_response(
         }
         CollectionRepairComponent::AuthorizationEvidence => patch_node_response(
             overlay.authorization_evidence().patch(),
-            &[],
+            &overlay.collection().raw,
             prefix,
             |key, proof| {
-                if proof.id().raw != key {
+                if proof.id().raw != key[32..] {
                     bail!("authorization proof id does not match its PATCH leaf key");
                 }
                 Ok(proof.as_bytes().to_vec())
@@ -285,13 +277,19 @@ where
         send_repair_node_request(send, &request, component).await?;
         let response = recv_repair_node_response(recv, component).await?;
         *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
-        validate_response(&request, component, &response, |key, bytes| {
-            let record = decode_record(local.collection(), bytes)?;
-            if record.fingerprint().raw().as_slice() != key {
-                bail!("collection record body does not match its PATCH leaf key");
-            }
-            Ok(())
-        })?;
+        validate_response(
+            &request,
+            component,
+            local.collection(),
+            &response,
+            |key, bytes| {
+                let record = decode_record(local.collection(), bytes)?;
+                if record.fingerprint().raw().as_slice() != key {
+                    bail!("collection record body does not match its PATCH leaf key");
+                }
+                Ok(())
+            },
+        )?;
         if let Some(leaf) = walker.accept(&request, response, |_, key| {
             let Ok(key) = <[u8; 32]>::try_from(key) else {
                 return false;
@@ -335,16 +333,8 @@ where
         {
             break;
         }
-        let request = walker.next_request(|_, prefix| {
-            local
-                .authorization_evidence()
-                .patch()
-                .merkle_node(prefix)
-                .map(|node| {
-                    PatchSummary::new(Some(node.digest()), node.leaf_count())
-                        .expect("a PATCH node is nonempty")
-                })
-        })?;
+        let request = walker
+            .next_request(|_, prefix| local.authorization_evidence().prefix_summary(prefix))?;
         let Some(request) = request else {
             complete = true;
             break;
@@ -354,26 +344,13 @@ where
         send_repair_node_request(send, &request, component).await?;
         let response = recv_repair_node_response(recv, component).await?;
         *response_bytes = response_bytes.saturating_add(node_response_wire_len(&response));
-        validate_response(&request, component, &response, |key, bytes| {
-            let proof = CapabilityProof::from_bytes(bytes)?;
-            proof.verify_signatures()?;
-            if proof.id().raw.as_slice() != key {
-                bail!("authorization proof body does not match its PATCH leaf key");
-            }
-            let evidence = local.authorization_evidence();
-            let relevant = evidence
-                .read_policies()
-                .chain(evidence.write_policies())
-                .any(|policy| {
-                    policy
-                        .roots()
-                        .is_some_and(|roots| roots.contains(&proof.root_key()))
-                });
-            if !relevant {
-                bail!("authorization proof starts outside the collection policy roots");
-            }
-            Ok(())
-        })?;
+        validate_response(
+            &request,
+            component,
+            local.collection(),
+            &response,
+            |key, bytes| validate_authorization_leaf(local, key, bytes),
+        )?;
         if let Some(leaf) = walker.accept(&request, response, |_, key| {
             let Ok(key) = <[u8; 32]>::try_from(key) else {
                 return false;
@@ -392,17 +369,39 @@ where
     Ok((missing, !complete))
 }
 
+fn validate_authorization_leaf(
+    local: &CollectionRepairOverlay,
+    key: &[u8],
+    bytes: &[u8],
+) -> Result<()> {
+    let proof = CapabilityProof::from_bytes(bytes)?;
+    if key.len() != 64 || key[..32] != local.collection().raw || proof.id().raw != key[32..] {
+        bail!("authorization proof body does not match its scoped PATCH leaf key");
+    }
+    local.authorization_evidence().validate_proof(&proof)?;
+    Ok(())
+}
+
 fn validate_response<S>(
     request: &PatchRepairRequest<S>,
     component: CollectionRepairComponent,
+    collection: CollectionHandle,
     response: &PatchNodeResponse<Vec<u8>>,
     validate_leaf: impl FnOnce(&[u8], &[u8]) -> Result<()>,
 ) -> Result<()> {
     match response {
         PatchNodeResponse::Found(node) => {
-            validate_patch_node(request, component.key_len(), &[], node, |key, bytes| {
-                validate_leaf(key, bytes)
-            })
+            let base: &[u8] = match component {
+                CollectionRepairComponent::Record => &[],
+                CollectionRepairComponent::AuthorizationEvidence => &collection.raw,
+            };
+            validate_patch_node(
+                request,
+                base.len() + component.key_len(),
+                base,
+                node,
+                |key, bytes| validate_leaf(key, bytes),
+            )
         }
         PatchNodeResponse::PrefixAbsent => {
             bail!("remote omitted an authenticated collection PATCH prefix")
@@ -425,23 +424,169 @@ async fn require_eof<R: AsyncRead + Unpin>(recv: &mut R) -> Result<()> {
 mod tests {
     use ed25519_dalek::SigningKey;
     use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
-    use triblespace_core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityResource,
-    };
+    use triblespace_core::capability::policy::resource_policy;
+    use triblespace_core::capability::{Capability, CapabilityMode, CapabilityResource};
     use triblespace_core::collection::{
         AdmissionPolicy, CollectionCommit, CollectionData, CollectionPolicy, CollectionRecord,
-        CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, collection_read_policy,
-        collection_write_policy, empty_metadata_handle,
+        CollectionStore, CollectionStoreExt, KIND_COLLECTION_DESCRIPTOR, empty_metadata_handle,
+        read_capability, write_capability,
     };
     use triblespace_core::metadata;
     use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
-    use triblespace_core::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource};
+    use triblespace_core::repo::{
+        BlobStoreList, BlobStorePut, CapabilityProofStore, SnapshotSource, WantRead,
+    };
 
     use crate::collection_activation::collection_repair_overlay;
     use crate::protocol::recv_u8;
 
     use super::*;
+
+    #[tokio::test]
+    async fn custom_capability_repairs_without_definition_blobs_but_never_admits_read() {
+        for open_read in [false, true] {
+            let root = SigningKey::from_bytes(&[80; 32]);
+            let reader = SigningKey::from_bytes(&[81; 32]);
+            let custom = triblespace_core::inline::Inline::new([82; 32]);
+            let mut bindings = AdmissionPolicy::direct(root.verifying_key()).binding(custom);
+            if open_read {
+                bindings += AdmissionPolicy::Open.binding(read_capability());
+            }
+            let descriptor = entity! {
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                resource_policy*: bindings,
+            };
+            let mut store = MemoryRepo::default();
+            let collection = store
+                .put::<SimpleArchive, _>(descriptor.facts().clone())
+                .unwrap();
+            let before = store.snapshot().unwrap();
+            let client = collection_repair_overlay(&before, collection).unwrap();
+            let proof = CapabilityProof::issue_root(
+                &root,
+                CapabilityResource::from(collection),
+                Capability::new(custom, CapabilityMode::Invoke),
+                None,
+                reader.verifying_key(),
+            );
+            store.insert_proof(proof.clone()).unwrap();
+            let after = store.snapshot().unwrap();
+            assert!(
+                !after.contains_blob(custom).unwrap(),
+                "AUTH must not need the capability definition blob"
+            );
+            let server = Arc::new(collection_repair_overlay(&after, collection).unwrap());
+            assert_eq!(server.authorization_evidence().len(), 1);
+            let (server_io, client_io) = tokio::io::duplex(1 << 20);
+            let (mut server_recv, mut server_send) = tokio::io::split(server_io);
+            let (mut client_recv, mut client_send) = tokio::io::split(client_io);
+            let server_task = tokio::spawn(async move {
+                assert_eq!(
+                    recv_u8(&mut server_recv).await.unwrap(),
+                    crate::collection_wire::OP_COLLECTION_REPAIR
+                );
+                let retained = serve_collection_repair(
+                    &mut server_recv,
+                    &mut server_send,
+                    reader.verifying_key(),
+                    |requested| (requested == collection).then_some(server),
+                )
+                .await
+                .unwrap();
+                assert!(retained.is_empty(), "custom evidence is not READ bootstrap");
+            });
+            let result = pull_collection_stream(
+                &mut client_send,
+                &mut client_recv,
+                &client,
+                vec![proof.clone()],
+            )
+            .await;
+            if open_read {
+                let delta = result.unwrap();
+                assert_eq!(delta.authorization_evidence, [proof]);
+                assert!(delta.records.is_empty());
+            } else {
+                assert!(result.unwrap_err().to_string().contains("rejected READ(C)"));
+                let mut remainder = Vec::new();
+                client_recv.read_to_end(&mut remainder).await.unwrap();
+                assert!(
+                    remainder.is_empty(),
+                    "no generic AUTH inventory before READ admission"
+                );
+            }
+            server_task.await.unwrap();
+            assert_eq!(before.blobs().count(), after.blobs().count());
+            assert!(after.wants().unwrap().next().is_none());
+        }
+    }
+
+    #[test]
+    fn received_auth_leaf_rejects_wrong_resource_capability_or_root_even_with_valid_hash() {
+        use triblespace_core::patch::{Blake3Merkle, Entry, IdentitySchema, PATCH};
+        let root = SigningKey::from_bytes(&[83; 32]);
+        let stranger = SigningKey::from_bytes(&[84; 32]);
+        let reader = SigningKey::from_bytes(&[85; 32]);
+        let custom = triblespace_core::inline::Inline::new([86; 32]);
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::Open.binding(read_capability())
+                + AdmissionPolicy::direct(root.verifying_key()).binding(custom),
+        };
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .put::<SimpleArchive, _>(descriptor.facts().clone())
+            .unwrap();
+        let local = collection_repair_overlay(&store.snapshot().unwrap(), collection).unwrap();
+        let proof_for = |issuer: &SigningKey, capability, resource| {
+            CapabilityProof::issue_root(
+                issuer,
+                CapabilityResource::from(resource),
+                Capability::new(capability, CapabilityMode::Invoke),
+                None,
+                reader.verifying_key(),
+            )
+        };
+        let cases = [
+            (true, proof_for(&root, custom, collection)),
+            (false, proof_for(&root, write_capability(), collection)),
+            (
+                false,
+                proof_for(&root, custom, CollectionHandle::new([87; 32])),
+            ),
+            (false, proof_for(&stranger, custom, collection)),
+        ];
+        for (valid, proof) in cases {
+            let mut patch = PATCH::<64, IdentitySchema, CapabilityProof, Blake3Merkle>::new();
+            let mut key = [0; 64];
+            key[..32].copy_from_slice(&collection.raw);
+            key[32..].copy_from_slice(&proof.id().raw);
+            patch.insert(&Entry::with_value(&key, proof));
+            let node = patch.merkle_node(&collection.raw).unwrap();
+            let summary = PatchSummary::new(Some(node.digest()), 1).unwrap();
+            let request = PatchRepairRequest::new(
+                CollectionRepairComponent::AuthorizationEvidence,
+                summary,
+                32,
+                vec![],
+                node.digest(),
+            )
+            .unwrap();
+            let response = patch_node_response(&patch, &collection.raw, &[], |_, proof| {
+                Ok(proof.as_bytes().to_vec())
+            })
+            .unwrap();
+            let accepted = validate_response(
+                &request,
+                CollectionRepairComponent::AuthorizationEvidence,
+                collection,
+                &response,
+                |key, bytes| validate_authorization_leaf(&local, key, bytes),
+            );
+            assert_eq!(accepted.is_ok(), valid);
+        }
+    }
 
     #[tokio::test]
     async fn repair_disclosure_uses_read_alternatives_and_never_open_write() {
@@ -450,15 +595,14 @@ mod tests {
             let root_b = SigningKey::from_bytes(&[21; 32]);
             let reader = SigningKey::from_bytes(&[22; 32]);
             let alternatives = if allowed {
-                AdmissionPolicy::direct(root_a.verifying_key()).fragment()
-                    + AdmissionPolicy::direct(root_b.verifying_key()).fragment()
+                AdmissionPolicy::direct(root_a.verifying_key()).binding(read_capability())
+                    + AdmissionPolicy::direct(root_b.verifying_key()).binding(read_capability())
             } else {
                 triblespace_core::trible::Fragment::empty()
             };
             let descriptor = entity! {
                 metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                collection_read_policy*: alternatives,
-                collection_write_policy*: AdmissionPolicy::Open.fragment(),
+                resource_policy*: alternatives + AdmissionPolicy::Open.binding(write_capability()),
             };
             let mut store = MemoryRepo::default();
             let collection = store
@@ -468,7 +612,7 @@ mod tests {
                 &root_b,
                 CapabilityResource::from(collection),
                 Capability::new(
-                    CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                    triblespace_core::collection::read_capability(),
                     CapabilityMode::Invoke,
                 ),
                 None,
@@ -586,7 +730,7 @@ mod tests {
             &root,
             CapabilityResource::from(server_collection.handle()),
             Capability::new(
-                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                triblespace_core::collection::read_capability(),
                 CapabilityMode::Invoke,
             ),
             None,
@@ -645,7 +789,7 @@ mod tests {
             &root,
             CapabilityResource::from(server_collection.handle()),
             Capability::new(
-                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                triblespace_core::collection::read_capability(),
                 CapabilityMode::Invoke,
             ),
             None,
@@ -655,7 +799,7 @@ mod tests {
             &root,
             CapabilityResource::from(server_collection.handle()),
             Capability::new(
-                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                triblespace_core::collection::read_capability(),
                 CapabilityMode::Invoke,
             ),
             None,

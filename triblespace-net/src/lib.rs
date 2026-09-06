@@ -2,7 +2,7 @@
 //!
 //! [`Peer<S>`](peer::Peer) wraps one store. Periodic per-request authorized
 //! PATCH walks converge one explicitly active collection's records and
-//! collection-scoped native READ/WRITE authorization evidence. A separate
+//! collection-scoped native evidence for descriptor-declared capabilities. A separate
 //! stock-gossip wake plane carries only a signed endpoint origin and opaque
 //! per-collection anti-entropy root; knowing the collection handle is its
 //! discovery capability, while every useful collection byte remains

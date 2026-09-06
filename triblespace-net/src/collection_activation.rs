@@ -4,7 +4,7 @@
 //! sets. A newly arrived proof may activate an old COMMIT or admit a new reader
 //! without changing the record PATCH, so a collection wake commits to both.
 //! The authorization projection contains only structurally relevant
-//! self-contained READ(C) or WRITE(C) proof records.
+//! self-contained proofs for descriptor-declared capabilities over exact C.
 
 use std::collections::BTreeMap;
 use std::convert::Infallible;
@@ -15,14 +15,13 @@ use ed25519_dalek::VerifyingKey;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::blob::{Blob, TryFromBlob};
 use triblespace_core::capability::{
-    CapabilityAction, CapabilityAtom, CapabilityProof, CapabilityProofError, CapabilityProofId,
+    CapabilityAtom, CapabilityHandle, CapabilityProof, CapabilityProofError, CapabilityProofId,
     CapabilityResource,
 };
 use triblespace_core::collection::{
-    ACTION_READ, ACTION_WRITE, AdmissionPolicy, CollectionDescriptorError, CollectionHandle,
-    CollectionPolicy, CollectionRead, CollectionReadAudience, RecordDecodeError,
-    collection_read_audience_by_policy_at, collection_read_policy,
-    collection_reader_is_admitted_by_policy_at, collection_write_policy, descriptor,
+    AdmissionPolicy, CollectionDescriptorError, CollectionHandle, CollectionPolicy, CollectionRead,
+    CollectionReadAudience, RecordDecodeError, collection_read_audience_by_policy_at,
+    collection_reader_is_admitted_by_policy_at, descriptor, read_capability, write_capability,
 };
 use triblespace_core::patch::{Blake3Merkle, Entry as PatchEntry, IdentitySchema, PATCH};
 use triblespace_core::repo::{BlobStoreGet, CapabilityProofRead, StoreSnapshot};
@@ -36,12 +35,22 @@ use crate::patch_repair::PatchSummary;
 const COLLECTION_REPAIR_ROOT_DOMAIN: &[u8] = b"triblespace.collection.repair-overlay\0";
 const COLLECTION_REPAIR_ROOT_VERSION: u32 = 1;
 
-type AuthorizationEvidencePatch = PATCH<32, IdentitySchema, CapabilityProof, Blake3Merkle>;
+type AuthorizationEvidencePatch = PATCH<64, IdentitySchema, CapabilityProof, Blake3Merkle>;
+
+fn evidence_key(collection: CollectionHandle, id: CapabilityProofId) -> [u8; 64] {
+    let mut key = [0; 64];
+    key[..32].copy_from_slice(&collection.raw);
+    key[32..].copy_from_slice(&id.raw);
+    key
+}
 
 /// Canonical collection-scoped set of structurally relevant authorization proofs.
 ///
-/// Keys and values are exact self-contained native proof records. The Merkle
-/// root commits to proof ids, which commit to the complete signed paths.
+/// Keys are resource | proof hash. Values share ownership of the raw proof
+/// bytes; this validated membership index does not copy proof bodies. The
+/// public observation and repair protocol expose only the selected resource
+/// prefix, never the enclosing index. This is currently a per-overlay index,
+/// not a shared global host inventory.
 #[derive(Clone, Debug)]
 pub struct CollectionAuthorizationEvidencePatch {
     collection: CollectionHandle,
@@ -50,25 +59,60 @@ pub struct CollectionAuthorizationEvidencePatch {
 }
 
 impl CollectionAuthorizationEvidencePatch {
-    /// Exact collection whose READ and WRITE atoms shaped this evidence set.
+    /// Exact collection whose declared capabilities shaped this evidence set.
     pub const fn collection(&self) -> CollectionHandle {
         self.collection
     }
 
     /// Inspect one unambiguous scalar policy for diagnostics.
-    /// Ordinary admission queries the action-specific alternatives instead.
+    /// Ordinary admission queries the capability-specific alternatives instead.
     pub fn policy(&self) -> Result<CollectionPolicy, RecordDecodeError> {
         descriptor::policy(&self.descriptor)
     }
 
     /// Explicitly recognized READ policies from the pinned descriptor facts.
     pub fn read_policies(&self) -> impl Iterator<Item = AdmissionPolicy> + '_ {
-        descriptor::admission_policies(&self.descriptor, &collection_read_policy, None)
+        descriptor::admission_policies(&self.descriptor, read_capability(), None)
     }
 
     /// Explicitly recognized WRITE policies from the pinned descriptor facts.
     pub fn write_policies(&self) -> impl Iterator<Item = AdmissionPolicy> + '_ {
-        descriptor::admission_policies(&self.descriptor, &collection_write_policy, None)
+        descriptor::admission_policies(&self.descriptor, write_capability(), None)
+    }
+
+    /// Every supported capability-policy binding declared by the descriptor.
+    pub fn capability_policies(
+        &self,
+    ) -> impl Iterator<Item = (CapabilityHandle, AdmissionPolicy)> + '_ {
+        descriptor::capability_policies(&self.descriptor, None)
+    }
+
+    /// Validate exact resource, declared capability, and configured root.
+    /// Modes and validity are structural here, not admission at the current time.
+    pub fn validate_proof(
+        &self,
+        proof: &CapabilityProof,
+    ) -> Result<(), CollectionAuthorizationEvidenceError> {
+        let capability = proof
+            .capabilities()
+            .next()
+            .expect("canonical proof is nonempty")
+            .handle();
+        let policies = descriptor::admission_policies(&self.descriptor, capability, None)
+            .map(|policy| (capability, policy));
+        validate_evidence_for_capabilities(self.collection, policies, proof)
+    }
+
+    pub(crate) fn validate_read_proof(
+        &self,
+        proof: &CapabilityProof,
+    ) -> Result<(), CollectionAuthorizationEvidenceError> {
+        validate_evidence_for_capabilities(
+            self.collection,
+            self.read_policies()
+                .map(|policy| (read_capability(), policy)),
+            proof,
+        )
     }
 
     pub(crate) fn reader_is_admitted_by_at(
@@ -90,35 +134,52 @@ impl CollectionAuthorizationEvidencePatch {
 
     /// Root and count of the immutable native-proof PATCH.
     pub fn summary(&self) -> PatchSummary {
-        PatchSummary::from_patch(&self.proofs)
+        self.prefix_summary(&[]).unwrap_or_else(|| {
+            PatchSummary::new(None, 0).expect("empty authorization prefix is canonical")
+        })
     }
 
     /// Number of distinct self-contained native proofs.
     pub fn len(&self) -> u64 {
-        self.proofs.len()
+        self.summary().leaf_count()
     }
 
     /// Whether the projection contains no proof evidence.
     pub fn is_empty(&self) -> bool {
-        self.proofs.is_empty()
+        self.len() == 0
     }
 
     /// Look up one exact native proof by identity.
     pub fn get(&self, id: CapabilityProofId) -> Option<&CapabilityProof> {
-        self.proofs.get(&id.raw)
+        self.proofs.get(&evidence_key(self.collection, id))
     }
 
     /// Enumerate every retained native proof in proof-id order.
     pub fn proofs(&self) -> impl Iterator<Item = &CapabilityProof> {
-        self.proofs.iter_ordered().map(|id| {
-            self.proofs
-                .get(id)
-                .expect("an ordered authorization-evidence key retains its proof")
-        })
+        self.proofs
+            .iter_ordered()
+            .filter(|key| key.starts_with(&self.collection.raw))
+            .map(|key| {
+                self.proofs
+                    .get(key)
+                    .expect("an ordered authorization-evidence key retains its proof")
+            })
     }
 
     pub(crate) const fn patch(&self) -> &AuthorizationEvidencePatch {
         &self.proofs
+    }
+
+    pub(crate) fn prefix_summary(&self, prefix: &[u8]) -> Option<PatchSummary> {
+        if prefix.len() > 32 {
+            return None;
+        }
+        let mut absolute = self.collection.raw.to_vec();
+        absolute.extend_from_slice(prefix);
+        self.proofs.merkle_node(&absolute).map(|node| {
+            PatchSummary::new(Some(node.digest()), node.leaf_count())
+                .expect("a retained authorization prefix is nonempty")
+        })
     }
 
     /// Derive the finite READ(C)-authorized audience at one exact instant.
@@ -175,7 +236,7 @@ impl CollectionRepairOverlay {
         &self.records
     }
 
-    /// Structurally relevant self-contained READ(C) or WRITE(C) proof projection.
+    /// Structurally relevant proofs for descriptor-declared capabilities over C.
     pub const fn authorization_evidence(&self) -> &CollectionAuthorizationEvidencePatch {
         &self.authorization_evidence
     }
@@ -215,7 +276,9 @@ fn update_summary(hasher: &mut blake3::Hasher, summary: PatchSummary) {
 pub enum CollectionAuthorizationEvidenceError {
     /// Both collection policies are open and need no proof evidence.
     OpenPolicies,
-    /// The proof starts outside both descriptor-local root sets.
+    /// No supported descriptor binding names the proof's exact capability.
+    UndeclaredCapability,
+    /// The proof starts outside the exact capability's descriptor-local roots.
     WrongRoot,
     /// Signature, path attenuation, or exact atom is invalid or irrelevant.
     Invalid(CapabilityProofError),
@@ -231,6 +294,9 @@ impl fmt::Display for CollectionAuthorizationEvidenceError {
             }
             Self::WrongRoot => {
                 formatter.write_str("capability proof starts outside the collection policy roots")
+            }
+            Self::UndeclaredCapability => {
+                formatter.write_str("capability proof names no supported collection policy binding")
             }
             Self::Invalid(source) => {
                 write!(
@@ -401,7 +467,7 @@ where
 }
 
 /// Freeze exact collection records and the structurally relevant
-/// READ(C)/WRITE(C) proof PATCH for `C`.
+/// descriptor-declared capability proof PATCH for `C`.
 ///
 /// Missing descriptor bytes or invalid archives fail closed. Unknown policy
 /// rows are inert; no recognized READ alternative means no reader is admitted.
@@ -456,8 +522,8 @@ where
     })
 }
 
-/// Freeze all structurally relevant self-contained native READ(C) and WRITE(C)
-/// proofs from one coherent store observation.
+/// Freeze all structurally relevant proofs for the descriptor's declared
+/// capability handles over exact C, from one coherent store observation.
 pub fn collection_authorization_evidence<R>(
     snapshot: &R,
     collection: CollectionHandle,
@@ -522,7 +588,7 @@ where
         return Ok(Vec::new());
     }
 
-    let atom = collection_atom(ACTION_READ, collection);
+    let atom = collection_atom(read_capability(), collection);
     let mut selected = evidence
         .proofs()
         .filter(|proof| {
@@ -563,13 +629,8 @@ fn collection_authorization_evidence_patch_for_descriptor<R>(
 where
     R: CapabilityProofRead,
 {
-    let has_roots = descriptor::admission_policies(&descriptor, &collection_read_policy, None)
-        .chain(descriptor::admission_policies(
-            &descriptor,
-            &collection_write_policy,
-            None,
-        ))
-        .any(|policy| policy.roots().is_some());
+    let has_roots = descriptor::capability_policies(&descriptor, None)
+        .any(|(_, policy)| policy.roots().is_some());
     if !has_roots {
         return Ok(CollectionAuthorizationEvidencePatch {
             collection,
@@ -584,12 +645,15 @@ where
     let mut candidates = Vec::new();
     for proof in proofs {
         let proof = proof.map_err(AuthorizationEvidenceBuildError::Proofs)?;
-        if !descriptor::admission_policies(&descriptor, &collection_read_policy, None)
-            .chain(descriptor::admission_policies(
-                &descriptor,
-                &collection_write_policy,
-                None,
-            ))
+        if proof.resource() != CapabilityResource::from(collection) {
+            continue;
+        }
+        let capability = proof
+            .capabilities()
+            .next()
+            .expect("canonical proof is nonempty")
+            .handle();
+        if !descriptor::admission_policies(&descriptor, capability, None)
             .any(|policy| root_is_relevant(&policy, proof.root_key()))
         {
             continue;
@@ -605,31 +669,26 @@ fn canonical_authorization_evidence(
     descriptor: TribleSet,
     candidates: impl IntoIterator<Item = CapabilityProof>,
 ) -> Result<CollectionAuthorizationEvidencePatch, CollectionAuthorizationEvidenceError> {
-    let mut proofs = AuthorizationEvidencePatch::new();
+    let mut evidence = CollectionAuthorizationEvidencePatch {
+        collection,
+        descriptor,
+        proofs: AuthorizationEvidencePatch::new(),
+    };
     for proof in candidates {
-        let policies = descriptor::admission_policies(&descriptor, &collection_read_policy, None)
-            .map(|policy| (policy, ACTION_READ))
-            .chain(
-                descriptor::admission_policies(&descriptor, &collection_write_policy, None)
-                    .map(|policy| (policy, ACTION_WRITE)),
-            );
-        if validate_evidence_for_actions(collection, policies, &proof).is_err() {
+        if evidence.validate_proof(&proof).is_err() {
             continue;
         }
         let id = proof.id();
-        if let Some(existing) = proofs.get(&id.raw) {
+        let key = evidence_key(collection, id);
+        if let Some(existing) = evidence.proofs.get(&key) {
             if existing != &proof {
                 return Err(CollectionAuthorizationEvidenceError::ProofIdCollision(id));
             }
             continue;
         }
-        proofs.insert(&PatchEntry::with_value(&id.raw, proof));
+        evidence.proofs.insert(&PatchEntry::with_value(&key, proof));
     }
-    Ok(CollectionAuthorizationEvidencePatch {
-        collection,
-        descriptor,
-        proofs,
-    })
+    Ok(evidence)
 }
 
 fn root_is_relevant(policy: &AdmissionPolicy, root: ed25519_dalek::VerifyingKey) -> bool {
@@ -640,19 +699,13 @@ fn root_is_relevant(policy: &AdmissionPolicy, root: ed25519_dalek::VerifyingKey)
     })
 }
 
-fn collection_atom(
-    action: triblespace_core::id::Id,
-    collection: CollectionHandle,
-) -> CapabilityAtom {
-    CapabilityAtom::new(
-        CapabilityAction::new(action),
-        CapabilityResource::from(collection),
-    )
+fn collection_atom(capability: CapabilityHandle, collection: CollectionHandle) -> CapabilityAtom {
+    CapabilityAtom::new(capability, CapabilityResource::from(collection))
 }
 
 #[cfg(test)]
 fn write_atom(collection: CollectionHandle) -> CapabilityAtom {
-    collection_atom(ACTION_WRITE, collection)
+    collection_atom(write_capability(), collection)
 }
 
 /// Strictly validate one self-contained proof as exact READ(C) or WRITE(C) evidence.
@@ -666,36 +719,50 @@ pub fn validate_authorization_evidence_proof(
     {
         return Err(CollectionAuthorizationEvidenceError::OpenPolicies);
     }
-    validate_evidence_for_actions(
+    validate_evidence_for_capabilities(
         collection,
         [
-            (policy.read().clone(), ACTION_READ),
-            (policy.write().clone(), ACTION_WRITE),
+            (read_capability(), policy.read().clone()),
+            (write_capability(), policy.write().clone()),
         ],
         proof,
     )
 }
 
-fn validate_evidence_for_actions(
+fn validate_evidence_for_capabilities(
     collection: CollectionHandle,
-    policies: impl IntoIterator<Item = (AdmissionPolicy, triblespace_core::id::Id)>,
+    policies: impl IntoIterator<Item = (CapabilityHandle, AdmissionPolicy)>,
     proof: &CapabilityProof,
 ) -> Result<(), CollectionAuthorizationEvidenceError> {
-    let root = proof.root_key();
-    let mut invalid = None;
-    for (candidate_policy, action) in policies {
-        if !root_is_relevant(&candidate_policy, root) {
-            continue;
-        }
-        match proof.validate_structure_for_atom(collection_atom(action, collection)) {
-            Ok(()) => return Ok(()),
-            Err(error) => invalid = Some(error),
-        }
+    // Header and first-edge selection are cheap and do not assign authority.
+    // Full validation below checks every edge and signature exactly once.
+    let capability = proof
+        .capabilities()
+        .next()
+        .expect("canonical proof is nonempty")
+        .handle();
+    let expected = collection_atom(capability, collection);
+    if proof.resource() != expected.resource() {
+        return Err(CollectionAuthorizationEvidenceError::Invalid(
+            CapabilityProofError::WrongAtom {
+                expected,
+                actual: CapabilityAtom::new(capability, proof.resource()),
+            },
+        ));
     }
-    match invalid {
-        Some(error) => Err(CollectionAuthorizationEvidenceError::Invalid(error)),
-        None => Err(CollectionAuthorizationEvidenceError::WrongRoot),
+    let mut matching = policies
+        .into_iter()
+        .filter(|(handle, _)| *handle == capability)
+        .peekable();
+    if matching.peek().is_none() {
+        return Err(CollectionAuthorizationEvidenceError::UndeclaredCapability);
     }
+    if !matching.any(|(_, policy)| root_is_relevant(&policy, proof.root_key())) {
+        return Err(CollectionAuthorizationEvidenceError::WrongRoot);
+    }
+    proof
+        .validate_structure_for_atom(expected)
+        .map_err(CollectionAuthorizationEvidenceError::Invalid)
 }
 
 #[cfg(test)]
@@ -704,6 +771,7 @@ mod tests {
 
     use ed25519_dalek::SigningKey;
     use hifitime::Epoch;
+    use triblespace_core::capability::policy::{capability_handle, resource_policy};
     use triblespace_core::capability::{
         Capability, CapabilityMode, CapabilityRequest, CapabilityValidity,
         capability_quorum_authorizes,
@@ -740,8 +808,8 @@ mod tests {
     fn policy_facts(policy: CollectionPolicy) -> TribleSet {
         entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: policy.read().fragment(),
-            collection_write_policy*: policy.write().fragment(),
+            resource_policy*: policy.read().binding(read_capability())
+                + policy.write().binding(write_capability()),
         }
         .facts()
         .clone()
@@ -757,7 +825,7 @@ mod tests {
         CapabilityProof::issue_root(
             root,
             atom.resource(),
-            Capability::new(atom.action(), mode),
+            Capability::new(atom.capability(), mode),
             validity,
             subject.verifying_key(),
         )
@@ -768,6 +836,179 @@ mod tests {
     }
 
     #[test]
+    fn custom_capability_membership_requires_exact_resource_handle_and_root() {
+        let root = key(60);
+        let subject = key(61);
+        let custom = Inline::new([62; 32]);
+        let collection = Inline::new([63; 32]);
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: AdmissionPolicy::direct(root.verifying_key()).binding(custom),
+        };
+        let proof_for = |issuer: &SigningKey, capability, resource| {
+            root_proof(
+                issuer,
+                &subject,
+                collection_atom(capability, resource),
+                CapabilityMode::Invoke,
+                None,
+            )
+        };
+        let valid = proof_for(&root, custom, collection);
+        let invalid = [
+            proof_for(&root, custom, Inline::new([64; 32])),
+            proof_for(&root, Inline::new([65; 32]), collection),
+            proof_for(&key(66), custom, collection),
+        ];
+        let evidence = canonical_authorization_evidence(
+            collection,
+            descriptor.facts().clone(),
+            std::iter::once(valid.clone()).chain(invalid.iter().cloned()),
+        )
+        .unwrap();
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence.get(valid.id()), Some(&valid));
+        for proof in invalid {
+            assert!(evidence.validate_proof(&proof).is_err());
+            assert!(evidence.get(proof.id()).is_none());
+        }
+        assert!(!evidence.reader_is_admitted_by_at(
+            subject.verifying_key(),
+            &[valid],
+            Epoch::from_tai_seconds(0.0)
+        ));
+    }
+
+    #[test]
+    fn generic_inventory_keeps_shares_without_combining_capability_quorums() {
+        let a = key(67);
+        let b = key(68);
+        let subject = key(69);
+        let collection = Inline::new([70; 32]);
+        let first = Inline::new([71; 32]);
+        let second = Inline::new([72; 32]);
+        let roots = [a.verifying_key(), b.verifying_key()];
+        let quorum = AdmissionPolicy::quorum(roots, 2, None).unwrap();
+        let descriptor = entity! {
+            metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+            resource_policy*: quorum.binding(first) + quorum.binding(second),
+        };
+        let first_share = root_proof(
+            &a,
+            &subject,
+            collection_atom(first, collection),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let second_share = root_proof(
+            &b,
+            &subject,
+            collection_atom(second, collection),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let evidence = canonical_authorization_evidence(
+            collection,
+            descriptor.facts().clone(),
+            [first_share, second_share],
+        )
+        .unwrap();
+        assert_eq!(
+            evidence.len(),
+            2,
+            "incomplete quorum shares remain repairable evidence"
+        );
+        for capability in [first, second] {
+            assert!(!capability_quorum_authorizes(
+                evidence.proofs(),
+                roots,
+                Epoch::from_tai_seconds(0.0),
+                subject.verifying_key(),
+                CapabilityRequest::new(
+                    collection_atom(capability, collection),
+                    CapabilityMode::Invoke
+                ),
+                NonZeroUsize::new(2).unwrap(),
+            ));
+        }
+    }
+
+    #[test]
+    fn resource_prefix_hides_other_members_and_keeps_its_summary_stable() {
+        let root = key(73);
+        let subject = key(74);
+        let collection = Inline::new([75; 32]);
+        let other = Inline::new([76; 32]);
+        let valid = root_proof(
+            &root,
+            &subject,
+            write_atom(collection),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let unrelated = root_proof(
+            &root,
+            &subject,
+            write_atom(other),
+            CapabilityMode::Invoke,
+            None,
+        );
+        let mut evidence = canonical_authorization_evidence(
+            collection,
+            policy_facts(CollectionPolicy::new(
+                AdmissionPolicy::Open,
+                AdmissionPolicy::direct(root.verifying_key()),
+            )),
+            [valid.clone()],
+        )
+        .unwrap();
+        let before = evidence.summary();
+        // Exercise a future shared physical index without disclosing its outer root.
+        evidence.proofs.insert(&PatchEntry::with_value(
+            &evidence_key(other, unrelated.id()),
+            unrelated.clone(),
+        ));
+        assert_eq!(evidence.summary(), before);
+        assert_eq!(evidence.len(), 1);
+        assert_eq!(evidence.proofs().collect::<Vec<_>>(), [&valid]);
+        assert!(evidence.get(unrelated.id()).is_none());
+        let response = crate::patch_repair::patch_node_response(
+            evidence.patch(),
+            &collection.raw,
+            &[],
+            |_, proof| Ok(proof.clone()),
+        )
+        .unwrap();
+        let crate::patch_repair::PatchNodeResponse::Found(node) = response else {
+            panic!("selected resource exists")
+        };
+        let request = crate::patch_repair::PatchRepairRequest::new(
+            (),
+            before,
+            32,
+            vec![],
+            before.root().unwrap(),
+        )
+        .unwrap();
+        crate::patch_repair::validate_patch_node(
+            &request,
+            64,
+            &collection.raw,
+            &node,
+            |key, proof| {
+                assert_eq!(&key[..32], &collection.raw);
+                assert_eq!(proof, &valid);
+                Ok(())
+            },
+        )
+        .unwrap();
+        let crate::patch_repair::PatchNode::Leaf { leaf, .. } = node else {
+            panic!("one scoped proof")
+        };
+        assert_eq!(leaf.key, valid.id().raw);
+    }
+
+    #[test]
     fn read_policy_alternatives_shape_evidence_and_bootstrap_independently_of_write() {
         let root_a = key(40);
         let root_b = key(41);
@@ -775,9 +1016,12 @@ mod tests {
         let reader_b = key(43);
         let descriptor = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: AdmissionPolicy::direct(root_a.verifying_key()).fragment()
-                + AdmissionPolicy::direct(root_b.verifying_key()).fragment(),
-            collection_write_policy*: entity! { metadata::tag: metadata::KIND_BLOB_ENCODING },
+            resource_policy*: AdmissionPolicy::direct(root_a.verifying_key()).binding(read_capability())
+                + AdmissionPolicy::direct(root_b.verifying_key()).binding(read_capability())
+                + entity! {
+                    capability_handle: write_capability(),
+                    metadata::tag: metadata::KIND_BLOB_ENCODING,
+                },
         };
         let mut store = MemoryRepo::default();
         let collection = store
@@ -786,14 +1030,14 @@ mod tests {
         let proof_a = root_proof(
             &root_a,
             &reader_a,
-            collection_atom(ACTION_READ, collection),
+            collection_atom(read_capability(), collection),
             CapabilityMode::Invoke,
             None,
         );
         let proof_b = root_proof(
             &root_b,
             &reader_b,
-            collection_atom(ACTION_READ, collection),
+            collection_atom(read_capability(), collection),
             CapabilityMode::Invoke,
             None,
         );
@@ -849,16 +1093,18 @@ mod tests {
     fn absent_or_unknown_read_policy_never_borrows_open_write_or_unrelated_read() {
         let absent = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_write_policy*: AdmissionPolicy::Open.fragment(),
+            resource_policy*: AdmissionPolicy::Open.binding(write_capability()),
         };
         let unknown = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: entity! { metadata::tag: metadata::KIND_BLOB_ENCODING },
-            collection_write_policy*: AdmissionPolicy::Open.fragment(),
+            resource_policy*: entity! {
+                    capability_handle: read_capability(),
+                    metadata::tag: metadata::KIND_BLOB_ENCODING,
+                } + AdmissionPolicy::Open.binding(write_capability()),
         };
         for mut descriptor in [absent, unknown] {
             descriptor += entity! {
-                collection_read_policy*: AdmissionPolicy::Open.fragment(),
+                resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
             };
             let mut store = MemoryRepo::default();
             let collection = store
@@ -898,7 +1144,7 @@ mod tests {
     fn explicit_open_read_does_not_require_a_write_policy() {
         let descriptor = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: AdmissionPolicy::Open.fragment(),
+            resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
         };
         let mut store = MemoryRepo::default();
         let collection = store
@@ -1040,7 +1286,7 @@ mod tests {
             root_proof(
                 &root,
                 &reader,
-                collection_atom(ACTION_READ, collection.handle()),
+                collection_atom(read_capability(), collection.handle()),
                 CapabilityMode::Invoke,
                 None,
             ),
@@ -1178,7 +1424,7 @@ mod tests {
         let proof = root_proof(
             &root,
             &reader,
-            collection_atom(ACTION_READ, collection.handle()),
+            collection_atom(read_capability(), collection.handle()),
             CapabilityMode::Invoke,
             None,
         );
@@ -1197,7 +1443,7 @@ mod tests {
         let delegate_only = key(37);
         let future = key(38);
         let collection = Inline::new([39; 32]);
-        let atom = collection_atom(ACTION_READ, collection);
+        let atom = collection_atom(read_capability(), collection);
         let parent = root_proof(
             &root,
             &intermediate,
@@ -1216,7 +1462,7 @@ mod tests {
         let child = verified
             .delegate(
                 &intermediate,
-                Capability::new(atom.action(), CapabilityMode::Invoke),
+                Capability::new(atom.capability(), CapabilityMode::Invoke),
                 None,
                 leaf.verifying_key(),
             )
@@ -1286,18 +1532,13 @@ mod tests {
         let wrong_action = root_proof(
             &root,
             &writer,
-            CapabilityAtom::new(
-                CapabilityAction::new(triblespace_core::id::Id::new([12; 16]).unwrap()),
-                CapabilityResource::from(collection),
-            ),
+            CapabilityAtom::new(Inline::new([12; 32]), CapabilityResource::from(collection)),
             CapabilityMode::Invoke,
             None,
         );
         assert!(matches!(
             validate_authorization_evidence_proof(collection, &policy, &wrong_action),
-            Err(CollectionAuthorizationEvidenceError::Invalid(
-                CapabilityProofError::WrongAtom { .. }
-            ))
+            Err(CollectionAuthorizationEvidenceError::UndeclaredCapability)
         ));
         let wrong_root = root_proof(
             &other_root,
@@ -1348,7 +1589,7 @@ mod tests {
         let read = root_proof(
             &root,
             &b,
-            collection_atom(ACTION_READ, collection),
+            collection_atom(read_capability(), collection),
             CapabilityMode::Invoke,
             None,
         );
@@ -1409,7 +1650,7 @@ mod tests {
             verified
                 .delegate(
                     &bridge,
-                    Capability::new(atom.action(), CapabilityMode::Invoke),
+                    Capability::new(atom.capability(), CapabilityMode::Invoke),
                     None,
                     writer.verifying_key(),
                 )
@@ -1462,7 +1703,7 @@ mod tests {
         let relevant = root_proof(
             &root,
             &reader,
-            collection_atom(ACTION_READ, collection.handle()),
+            collection_atom(read_capability(), collection.handle()),
             CapabilityMode::Invoke,
             None,
         );
@@ -1476,14 +1717,14 @@ mod tests {
         let wrong_root = root_proof(
             &other_root,
             &reader,
-            collection_atom(ACTION_READ, collection.handle()),
+            collection_atom(read_capability(), collection.handle()),
             CapabilityMode::Invoke,
             None,
         );
         let unrelated_reader = root_proof(
             &root,
             &key(28),
-            collection_atom(ACTION_READ, collection.handle()),
+            collection_atom(read_capability(), collection.handle()),
             CapabilityMode::Invoke,
             None,
         );

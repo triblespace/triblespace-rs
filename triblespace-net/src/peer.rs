@@ -808,7 +808,7 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use iroh_base::EndpointId;
     use triblespace_core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+        Capability, CapabilityMode, CapabilityProof, CapabilityResource,
     };
     use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
     use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -1198,7 +1198,7 @@ mod tests {
             &key,
             CapabilityResource::new([95; 32]),
             Capability::new(
-                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                triblespace_core::collection::read_capability(),
                 CapabilityMode::Invoke,
             ),
             None,

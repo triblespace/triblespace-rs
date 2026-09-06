@@ -671,12 +671,11 @@ mod tests {
     use hifitime::Epoch;
     use triblespace_core::blob::encodings::UnknownBlob;
     use triblespace_core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-        CapabilityValidity,
+        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
     };
     use triblespace_core::collection::{
-        ACTION_WRITE, AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle,
-        CollectionPolicy, CollectionRecord, CollectionStore, CollectionStoreExt,
+        AdmissionPolicy, CollectionCommit, CollectionData, CollectionHandle, CollectionPolicy,
+        CollectionRecord, CollectionStore, CollectionStoreExt, write_capability,
     };
     use triblespace_core::inline::Inline;
     use triblespace_core::inline::encodings::hash::Handle;
@@ -868,7 +867,7 @@ mod tests {
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::from(collection.handle()),
-            Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke),
+            Capability::new(write_capability(), CapabilityMode::Invoke),
             Some(validity),
             writer.verifying_key(),
         );

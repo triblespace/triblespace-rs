@@ -1967,12 +1967,11 @@ mod tests {
 
         use hifitime::Epoch;
         use triblespace_core::capability::{
-            Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-            CapabilityValidity,
+            Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
         };
         use triblespace_core::collection::{
-            ACTION_READ, AdmissionPolicy, CollectionPolicy, CollectionStoreExt,
-            next_authorization_change,
+            AdmissionPolicy, CollectionPolicy, CollectionStoreExt, next_authorization_change,
+            read_capability,
         };
         use triblespace_core::repo::memoryrepo::MemoryRepo;
         use triblespace_core::repo::{
@@ -1994,7 +1993,7 @@ mod tests {
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::from(collection.handle()),
-            Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+            Capability::new(read_capability(), CapabilityMode::Invoke),
             Some(
                 CapabilityValidity::new(
                     Epoch::from_tai_seconds(10.0),

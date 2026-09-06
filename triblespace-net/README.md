@@ -4,7 +4,7 @@ Collection-scoped anti-entropy for TribleSpace over
 [iroh](https://www.iroh.computer). A peer retains an immutable semantic repair
 overlay for each explicitly active collection. One repair stream reconciles
 the exact product of two grow-only PATCHes: signature-valid exact-C COMMITs and
-collection-scoped native READ(C)/WRITE(C) authorization proofs. It transfers
+collection-scoped native proofs for descriptor-declared capability handles. It transfers
 no blob bytes. Record inclusion is independent of WRITE admission; each
 receiver derives its active view locally after records and proofs arrive in
 either order.
@@ -68,6 +68,21 @@ manifest or PATCH leaf; the publisher itself needs no READ(C). Proofs are
 non-secret authorization certificates. A caller without READ(C) receives no
 collection manifest, PATCH leaf, record, authorization evidence, or root;
 merely knowing C grants no disclosure.
+
+The AUTH inventory recognizes every supported capability-policy binding in the
+descriptor, not just READ and WRITE. Projection and receipt require the exact
+resource, capability handle, and configured root together. A custom capability
+proof never substitutes for READ(C), and quorum shares never combine across
+different capabilities. Capability definition blobs are not fetched by repair;
+the proof's signatures and structural attenuation are byte-local checks.
+
+Each overlay currently owns a resource | proof-hash PATCH whose proof values
+share the raw record's byte ownership. This is a validated membership projection,
+not validation during Pile replay and not a shared global host index. Summaries
+and repair nodes expose only C's fixed prefix; hashes bind the full keys while
+wire keys and compressed paths omit that prefix. The changed proof grammar and
+AUTH key hashing use `/triblespace/pile-sync/24`. No AUTH or collection-repair
+operation requests blobs or creates WANT; exact H remains the blob read capability.
 
 DHT `FIND_NODE` and provider-directory operations use two independent opaque
 namespaces. KDF(C) locates participants for READ(C)-authorized collection

@@ -11,12 +11,13 @@ use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
 use triblespace_core::capability::{
-    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
+    Capability, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityResource,
 };
 use triblespace_core::clock::{self, VirtualClock};
 use triblespace_core::collection::{
-    ACTION_READ, ACTION_WRITE, AdmissionPolicy, Collection, CollectionCommit, CollectionHandle,
-    CollectionPolicy, CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt,
+    AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
+    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, read_capability,
+    write_capability,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
@@ -58,7 +59,7 @@ fn test_guard() -> std::sync::MutexGuard<'static, ()> {
 fn proof(
     root: &SigningKey,
     leaf: &SigningKey,
-    action: CapabilityAction,
+    action: CapabilityHandle,
     collection: CollectionHandle,
 ) -> CapabilityProof {
     CapabilityProof::issue_root(
@@ -188,7 +189,7 @@ fn issuer_held_read_proof_bootstraps_a_handle_only_recipient() {
         let read_proof = proof(
             &issuer_key,
             &recipient_key,
-            CapabilityAction::new(ACTION_READ),
+            read_capability(),
             collection.handle(),
         );
         issuer_store.insert_proof(read_proof.clone()).unwrap();
@@ -335,7 +336,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
         let write = proof(
             &write_root,
             &writer,
-            CapabilityAction::new(ACTION_WRITE),
+            write_capability(),
             collection.handle(),
         );
 
@@ -346,7 +347,7 @@ fn write_proof_later_activates_repaired_commit_without_reaching_publisher() {
             .insert_proof(proof(
                 &read_root,
                 &reader_key,
-                CapabilityAction::new(ACTION_READ),
+                read_capability(),
                 collection.handle(),
             ))
             .unwrap();
@@ -448,7 +449,7 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
         let write = proof(
             &write_root,
             &writer_key,
-            CapabilityAction::new(ACTION_WRITE),
+            write_capability(),
             collection.handle(),
         );
         server_store.insert_proof(write.clone()).unwrap();
@@ -469,7 +470,7 @@ fn native_read_proof_bootstraps_on_retry_and_rejects_writer_only_peer() {
             .insert_proof(proof(
                 &read_root,
                 &reader_key,
-                CapabilityAction::new(ACTION_READ),
+                read_capability(),
                 collection.handle(),
             ))
             .unwrap();

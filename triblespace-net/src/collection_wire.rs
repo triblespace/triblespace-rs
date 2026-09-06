@@ -478,9 +478,7 @@ pub(crate) async fn recv_repair_node_response<R: AsyncRead + Unpin>(
 #[cfg(test)]
 mod tests {
     use ed25519_dalek::SigningKey;
-    use triblespace_core::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityResource,
-    };
+    use triblespace_core::capability::{Capability, CapabilityMode, CapabilityResource};
 
     use super::*;
 
@@ -489,7 +487,7 @@ mod tests {
             &SigningKey::from_bytes(&[1; 32]),
             CapabilityResource::new([2; 32]),
             Capability::new(
-                CapabilityAction::new(triblespace_core::collection::ACTION_READ),
+                triblespace_core::collection::read_capability(),
                 CapabilityMode::Invoke,
             ),
             None,
