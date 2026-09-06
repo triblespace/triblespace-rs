@@ -241,8 +241,8 @@ collection commits or publishing anything.
 
 ## Known-prefix snapshots and covers
 
-`store.snapshot()` freezes one immutable observation containing blob bytes,
-collection records, and capability proofs from the same known prefix, together
+`store.snapshot()` freezes one immutable observation containing a resident blob
+index, collection records, and capability proofs from the same known prefix, together
 with one authorization instant. The
 snapshot, rather than a source frontier or a later materialization, is the
 watermark. Ask it what representation is actually readable at that instant:
@@ -293,8 +293,32 @@ Raw record readers still expose dangling native collection records and stored
 proof records for repair. A `COMMIT`, `MERGE`, or `DERIVE` is semantically
 invisible until all of its direct blob references are resident in that exact
 frozen snapshot. A capability proof's signatures and attenuation are already
-self-contained and have no definition-blob residency gate. Snapshot operations never acquire, wait, write, or emit
-`WANT`. Record retention is a separate lifetime rule: a retained non-blob
+self-contained and have no definition-blob residency gate. These passive
+observations never acquire, wait, write, or emit `WANT`.
+
+Exact immutable payload reads are a separate capability of network-backed
+snapshots:
+
+```rust,ignore
+let snapshot = peer.snapshot()?;
+let observed = snapshot.collection(collection)?;
+// A queried attachment handle is sufficient; no collection authorization
+// argument or mutable writer borrow is needed for this exact byte read.
+let bytes: Bytes = snapshot.get(attachment_handle).await?;
+```
+
+`PeerSnapshot::get` and `ObjectStoreSnapshot`'s asynchronous `get` can fetch
+bytes which arrived after the snapshot. That cache operation changes neither
+the captured records/proofs, the authorization instant, the frozen residency
+index, nor `observed.cover()`. Passive collection selection still uses the
+captured resident prefix; reading a newly acquired collection member requires
+another store snapshot. A synchronous consumer can use one `Blocking` adapter
+at its outer runtime boundary to decode payloads without threading a mutable
+writer through its domain queries. It must not nest that boundary inside an
+already running async task. Closing a peer ends live acquisition, while bytes
+already captured in its snapshots remain readable.
+
+Record retention is a separate lifetime rule: a retained non-blob
 record strongly retains every directly referenced blob which is resident, but
 does not fetch an absent one; proofs reference stable capability definitions,
 not the opaque resource. A `WANT`

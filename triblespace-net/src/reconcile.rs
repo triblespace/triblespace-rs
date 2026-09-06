@@ -159,9 +159,11 @@ impl Reconciler {
             .iter()
             .copied()
             .filter(|handle| {
-                snapshot
-                    .get::<Bytes, UnknownBlob>(triblespace_core::inline::Inline::new(*handle))
-                    .is_ok()
+                BlobStoreGet::get::<Bytes, UnknownBlob>(
+                    &snapshot,
+                    triblespace_core::inline::Inline::new(*handle),
+                )
+                .is_ok()
             })
             .collect();
 

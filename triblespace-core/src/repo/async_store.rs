@@ -5,10 +5,10 @@
 //! `Pile`-over-mmap are genuinely synchronous, and a sync `get` that
 //! returns a `Result` is the truth. But genuinely *remote* backends —
 //! `ObjectStore` (cloud object storage) and a networked `Peer` — are
-//! async at their core. Today they fake sync by owning a private tokio
-//! `Runtime` and `block_on`-ing every call, which is both wasteful and
-//! actively broken (`block_on` inside an existing runtime panics, so a
-//! sync-faked remote store can't be used from async code at all).
+//! async at their core. Hiding that I/O behind a private tokio runtime and
+//! `block_on` on every call would prevent composition with existing async
+//! callers. Remote reads instead expose futures, with blocking adaptation
+//! reserved for a synchronous application's outer boundary.
 //!
 //! This module gives those backends an honest home: an async mirror of
 //! the blob-store traits, written in the same explicit
@@ -55,10 +55,12 @@ use crate::repo::{BlobChildren, StorageClose};
 /// `get` returns a `Send` future so it can be driven on a multi-thread
 /// runtime. The output `T` need not be `Send` — it is produced at
 /// completion, not held across an await — so this mirrors the sync
-/// signature's bounds exactly. This is an immutable snapshot read: it may use
-/// asynchronous I/O to read bytes which belong to the frozen observation, but
-/// it must not fetch missing content, wait for later content, mutate storage,
-/// or record durable demand.
+/// signature's bounds exactly. Content-addressed bytes are independent of the
+/// snapshot's frozen record and authorization observation. A reader may fetch
+/// and cache the exact immutable bytes named by `handle`, including bytes which
+/// were not resident when the snapshot was taken. This must not advance the
+/// snapshot's records, authorization instant, or a previously selected cover,
+/// and must not implicitly record durable WANTs.
 pub trait AsyncBlobStoreGet {
     /// Error type for get operations, parameterised by the
     /// deserialization error (mirrors the sync GAT).
@@ -85,7 +87,7 @@ pub trait AsyncBlobStoreGet {
 
 /// Live exact-handle acquisition into a mutable store.
 ///
-/// Unlike snapshot [`AsyncBlobStoreGet`], this operation may fetch and cache
+/// Like snapshot [`AsyncBlobStoreGet`], this operation may fetch and cache
 /// immutable content-addressed bytes. It must validate fetched bytes through
 /// the store's checked insertion path and must not implicitly record a WANT.
 /// `Ok(None)` means that no provider supplied the named bytes.

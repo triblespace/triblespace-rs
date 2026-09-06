@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Let peer snapshots fetch and cache exact immutable blobs with shared async
+  `get`, without advancing frozen records, proofs, authorization time, or
+  selected covers. Keep passive residency/collection reads local, never emit
+  implicit WANTs, and allow explicit close with retained snapshots. Apply the
+  same separation to object-store snapshot GETs.
 - Let foreground exact-H DHT acquisition use its existing end-to-end deadline
   instead of cancelling cold bootstrap connections at the background lookup's
   three-second cap. Retain short background lookup bounds and distinguish

@@ -14,7 +14,7 @@ use triblespace_core::collection::{
     CollectionRecord, CollectionStore, CollectionStoreExt, empty_metadata_handle,
 };
 use triblespace_core::repo::memoryrepo::MemoryRepo;
-use triblespace_core::repo::{BlobStoreGet, BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
+use triblespace_core::repo::{BlobStoreList, BlobStorePut, SnapshotSource, WantRead};
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::ReconcileQos;
 use triblespace_net::peer::Peer;
@@ -171,11 +171,7 @@ async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() 
     reader.refresh();
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    let acquired = reader
-        .acquire(selected)
-        .await
-        .unwrap()
-        .expect("DHT-located payload");
+    let acquired: Bytes = before.get(selected).await.expect("DHT-located payload");
     assert_eq!(acquired.as_ref(), payload.as_ref());
     let after = reader.snapshot().unwrap();
     assert!(!before.contains_blob(selected).unwrap());
@@ -195,7 +191,7 @@ async fn exact_acquisition_finds_a_provider_through_a_directory_without_wants() 
     drop(server.into_store());
     let cached = reader.acquire(selected).await.unwrap().unwrap();
     assert_eq!(cached.as_ref(), payload.as_ref());
-    let bytes: Bytes = after.get(selected).unwrap();
+    let bytes: Bytes = after.get(selected).await.unwrap();
     assert_eq!(bytes.as_ref(), payload.as_ref());
     drop((directory.into_store(), reader.into_store()));
 }

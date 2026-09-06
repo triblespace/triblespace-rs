@@ -3,11 +3,12 @@
 //! The host runtime repairs immutable per-collection semantic overlays. This
 //! side owns the only mutable store boundary: authenticated leaves are deduplicated,
 //! inserted monotonically, flushed once per drain, and only then exposed in a
-//! replacement serving snapshot. Explicit live blob acquisition is separate
-//! from both frozen snapshot reads and durable WANT delegation.
+//! replacement serving snapshot. Snapshot-backed blob acquisition is separate
+//! from frozen record reads and durable WANT delegation.
 
 use std::error::Error;
 use std::fmt;
+use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use anybytes::Bytes;
@@ -22,9 +23,9 @@ use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::patch::{Entry as PatchEntry, PATCH};
 use triblespace_core::repo::async_store::AsyncBlobStoreAcquire;
 use triblespace_core::repo::{
-    BlobChildren, BlobStore, BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofStore,
-    SnapshotSource, StorageClose, StorageFlush, StoreChanges, StoreRead,
-    StoreSnapshot as CoreStoreSnapshot, WantStore,
+    BlobChildren, BlobStore, BlobStoreGet, BlobStorePut, CapabilityProofStore, SnapshotSource,
+    StorageClose, StorageFlush, StoreChanges, StoreRead, StoreSnapshot as CoreStoreSnapshot,
+    WantStore,
 };
 
 use crate::channel::{MAX_ADMISSION_BRIDGE_BATCHES, NetEvent};
@@ -35,6 +36,9 @@ use crate::wake::CollectionWakePlane;
 
 pub use crate::host::PeerConfig;
 pub use crate::inventory::{ReconcileDirection, ReconcileQos};
+
+mod snapshot;
+pub use snapshot::{PeerGetError, PeerSnapshot};
 
 /// Failure while starting a production network host.
 #[derive(Debug)]
@@ -111,6 +115,64 @@ enum HostState {
     Running,
     /// Startup is attempted once per peer. Local operations remain available.
     Failed(String),
+    Closed,
+}
+
+/// One lazy endpoint shared by the writer and its snapshot blob readers.
+struct SharedHost {
+    state: HostState,
+    sender: NetSender,
+    wake_plane: Option<CollectionWakePlane>,
+}
+
+impl SharedHost {
+    fn start(&mut self) -> Result<(), PeerOpenError> {
+        match &self.state {
+            HostState::Running => return Ok(()),
+            HostState::Failed(error) => {
+                return Err(PeerOpenError::HostStartup(anyhow::anyhow!(error.clone())));
+            }
+            HostState::Closed => {
+                return Err(PeerOpenError::HostStartup(anyhow::anyhow!(
+                    "peer is closed"
+                )));
+            }
+            HostState::Dormant(_) => {}
+        }
+        let HostState::Dormant(start) = std::mem::replace(&mut self.state, HostState::Running)
+        else {
+            unreachable!("only a dormant host reaches startup")
+        };
+        match start() {
+            Ok(wake_plane) => {
+                self.wake_plane = wake_plane;
+                Ok(())
+            }
+            Err(error) => {
+                let PeerOpenError::HostStartup(cause) = &error;
+                self.state = HostState::Failed(cause.to_string());
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The writer owns the backend until explicit close/extraction. Snapshot blob
+/// readers share access, not ownership of the right to keep it open.
+struct StoreGuard<'a, S>(MutexGuard<'a, Option<S>>);
+
+impl<S> Deref for StoreGuard<'_, S> {
+    type Target = S;
+
+    fn deref(&self) -> &S {
+        self.0.as_ref().expect("a live Peer owns its backend")
+    }
+}
+
+impl<S> DerefMut for StoreGuard<'_, S> {
+    fn deref_mut(&mut self) -> &mut S {
+        self.0.as_mut().expect("a live Peer owns its backend")
+    }
 }
 
 /// A store with an eager or acquisition-triggered collection network host.
@@ -125,11 +187,10 @@ where
         + 'static,
     S::Snapshot: StoreRead + BlobChildren,
 {
-    store: Arc<Mutex<S>>,
+    store: Arc<Mutex<Option<S>>>,
     sender: NetSender,
     receiver: NetReceiver,
-    host: HostState,
-    wake_plane: Option<CollectionWakePlane>,
+    host: Arc<Mutex<SharedHost>>,
     qos: ReconcileQos,
     active: ActiveCollections,
     active_dirty: bool,
@@ -225,11 +286,14 @@ where
         host: HostState,
     ) -> Self {
         let mut peer = Self {
-            store: Arc::new(Mutex::new(store)),
+            store: Arc::new(Mutex::new(Some(store))),
+            host: Arc::new(Mutex::new(SharedHost {
+                state: host,
+                sender: sender.clone(),
+                wake_plane,
+            })),
             sender,
             receiver,
-            host,
-            wake_plane,
             qos,
             active: PATCH::new(),
             active_dirty: true,
@@ -242,35 +306,21 @@ where
             #[cfg(test)]
             serving_snapshot_rebuilds: 0,
         };
-        if matches!(peer.host, HostState::Running) {
+        if peer.host_is_running() {
             peer.refresh();
         }
         peer
     }
 
     fn start_host(&mut self) -> Result<(), PeerOpenError> {
-        match &self.host {
-            HostState::Running => return Ok(()),
-            HostState::Failed(error) => {
-                return Err(PeerOpenError::HostStartup(anyhow::anyhow!(error.clone())));
-            }
-            HostState::Dormant(_) => {}
-        }
-        let HostState::Dormant(start) = std::mem::replace(&mut self.host, HostState::Running)
-        else {
-            unreachable!("only a dormant host reaches startup")
-        };
-        match start() {
-            Ok(wake_plane) => {
-                self.wake_plane = wake_plane;
-                Ok(())
-            }
-            Err(error) => {
-                let PeerOpenError::HostStartup(source) = &error;
-                self.host = HostState::Failed(source.to_string());
-                Err(error)
-            }
-        }
+        self.host.lock().expect("host mutex").start()
+    }
+
+    fn host_is_running(&self) -> bool {
+        matches!(
+            self.host.lock().expect("host mutex").state,
+            HostState::Running
+        )
     }
 
     pub fn id(&self) -> EndpointId {
@@ -284,7 +334,7 @@ where
     /// Collection possession is enough to join a production topic; following a
     /// wake into anti-entropy remains separately authorized.
     pub fn wake_plane(&self) -> Option<CollectionWakePlane> {
-        self.wake_plane.clone()
+        self.host.lock().expect("host mutex").wake_plane.clone()
     }
 
     pub const fn qos(&self) -> ReconcileQos {
@@ -368,7 +418,7 @@ where
     ) -> Result<(), PeerSnapshotError<S::SnapshotError>> {
         // A local observation must not start networking, build bearer indexes,
         // or enqueue serving/provider notices for a dormant host.
-        if !matches!(self.host, HostState::Running) {
+        if !self.host_is_running() {
             return Ok(());
         }
         let result = self.refresh_checked(instant);
@@ -397,7 +447,8 @@ where
 
         let received_batches = incoming.len();
         let received = incoming.iter().map(|batch| batch.len()).sum::<usize>();
-        let mut store = self.store.lock().expect("store mutex");
+        let mut guard = self.store.lock().expect("store mutex");
+        let store = guard.as_mut().expect("a live Peer owns its backend");
         for batch in incoming {
             for event in batch.into_events() {
                 match event {
@@ -568,8 +619,8 @@ where
 
     /// Borrow the local backend without starting the host.
     /// Drop this guard before calling another peer operation or awaiting I/O.
-    pub fn store(&self) -> MutexGuard<'_, S> {
-        self.store.lock().expect("store mutex")
+    pub fn store(&self) -> impl DerefMut<Target = S> + '_ {
+        StoreGuard(self.store.lock().expect("store mutex"))
     }
 
     /// Withdraw serving snapshots and release host ownership before returning
@@ -577,26 +628,22 @@ where
     pub fn into_store(mut self) -> S {
         self.sender.clear_snapshot();
         self.last_store_snapshot = None;
-        let Self {
-            store,
-            sender,
-            receiver,
-            host,
-            wake_plane,
-            ..
-        } = self;
-        drop((sender, receiver, host, wake_plane));
-        Arc::try_unwrap(store)
-            .unwrap_or_else(|_| panic!("Peer::into_store: store still has an outstanding owner"))
-            .into_inner()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
+        {
+            let mut host = self.host.lock().expect("host mutex");
+            host.state = HostState::Closed;
+            host.wake_plane = None;
+        }
+        let store = self
+            .store
+            .lock()
+            .expect("store mutex")
+            .take()
+            .expect("a live Peer owns its backend");
+        store
     }
 
     pub fn try_local(&mut self, hash: RawHash) -> Option<Bytes> {
-        self.snapshot()
-            .ok()?
-            .get::<Bytes, UnknownBlob>(Inline::new(hash))
-            .ok()
+        BlobStoreGet::get::<Bytes, UnknownBlob>(&self.snapshot().ok()?, Inline::new(hash)).ok()
     }
 
     /// Read an exact handle locally or acquire it from the network.
@@ -608,48 +655,16 @@ where
         &mut self,
         handle: Inline<Handle<UnknownBlob>>,
     ) -> Result<Option<Bytes>, PeerAcquireError> {
-        let hash = handle.raw;
-        {
-            let snapshot = self.snapshot().map_err(|error| {
-                PeerAcquireError(format!("cannot observe resident blob: {error}"))
-            })?;
-            let resident = snapshot.contains_blob(handle).map_err(|error| {
-                PeerAcquireError(format!("cannot check blob residency: {error}"))
-            })?;
-            if resident {
-                return snapshot
-                    .get::<Bytes, UnknownBlob>(handle)
-                    .map(Some)
-                    .map_err(|error| {
-                        PeerAcquireError(format!("cannot read resident blob: {error}"))
-                    });
-            }
-        }
-        self.start_host()
-            .map_err(|error| PeerAcquireError(error.to_string()))?;
-        let Some(raw) = self.fetch_blob(hash).await else {
+        let snapshot = self
+            .snapshot()
+            .map_err(|error| PeerAcquireError(format!("cannot observe resident blob: {error}")))?;
+        let Some(reader) = snapshot.acquire_reader(handle).await? else {
             return Ok(None);
         };
-        {
-            let mut store = self.store.lock().expect("store mutex");
-            let stored = store.put::<UnknownBlob, Bytes>(raw).map_err(|error| {
-                PeerAcquireError(format!("cannot cache acquired blob: {error}"))
-            })?;
-            if stored.raw != hash {
-                return Err(PeerAcquireError(
-                    "peer returned bytes for a different content hash".into(),
-                ));
-            }
-        }
-        let snapshot = self.snapshot().map_err(|error| {
-            PeerAcquireError(format!("cannot refresh after acquisition: {error}"))
-        })?;
-        let bytes = snapshot
-            .get::<Bytes, UnknownBlob>(Inline::new(hash))
-            .map_err(|error| {
-                PeerAcquireError(format!("cached blob absent from fresh snapshot: {error}"))
-            })?;
-        Ok(Some(bytes))
+        reader
+            .get(handle)
+            .map(Some)
+            .map_err(|error| PeerAcquireError(format!("cannot read acquired blob: {error}")))
     }
 }
 
@@ -691,7 +706,7 @@ where
         &mut self,
         record: triblespace_core::collection::CollectionRecord,
     ) -> Result<(), Self::InsertError> {
-        self.store.lock().expect("store mutex").insert(record)
+        self.store().insert(record)
     }
 }
 
@@ -712,7 +727,7 @@ where
         &mut self,
         proof: triblespace_core::capability::CapabilityProof,
     ) -> Result<(), Self::InsertError> {
-        self.store.lock().expect("store mutex").insert_proof(proof)
+        self.store().insert_proof(proof)
     }
 }
 
@@ -735,8 +750,7 @@ where
         T: IntoBlob<Sch>,
         Handle<Sch>: InlineEncoding,
     {
-        let mut store = self.store.lock().expect("store mutex");
-        store.put(item)
+        self.store().put(item)
     }
 }
 
@@ -751,7 +765,7 @@ where
         + 'static,
     S::Snapshot: StoreRead + BlobChildren,
 {
-    type Snapshot = S::Snapshot;
+    type Snapshot = PeerSnapshot<S>;
     type SnapshotError = PeerSnapshotError<S::SnapshotError>;
 
     fn snapshot_at(
@@ -759,8 +773,15 @@ where
         instant: hifitime::Epoch,
     ) -> Result<Self::Snapshot, Self::SnapshotError> {
         self.try_refresh_at(instant)?;
-        let mut store = self.store.lock().expect("store mutex");
-        store.snapshot_at(instant).map_err(PeerSnapshotError::Store)
+        let frozen = self
+            .store()
+            .snapshot_at(instant)
+            .map_err(PeerSnapshotError::Store)?;
+        Ok(PeerSnapshot {
+            frozen,
+            store: self.store.clone(),
+            host: Arc::downgrade(&self.host),
+        })
     }
 }
 
@@ -778,7 +799,7 @@ where
     type Error = <S as StorageFlush>::Error;
 
     fn flush(&mut self) -> Result<(), Self::Error> {
-        self.store.lock().expect("store mutex").flush()
+        self.store().flush()
     }
 }
 
@@ -810,10 +831,15 @@ mod tests {
     use triblespace_core::capability::{
         Capability, CapabilityMode, CapabilityProof, CapabilityResource,
     };
-    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+    use triblespace_core::collection::{
+        AdmissionPolicy, CollectionPolicy, CollectionRead, CollectionSnapshotExt,
+        CollectionStoreExt,
+    };
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::entity;
     use triblespace_core::repo::memoryrepo::MemoryRepo;
     use triblespace_core::repo::pile::Pile;
-    use triblespace_core::repo::{CapabilityProofRead, Store, WantRead};
+    use triblespace_core::repo::{BlobStoreList, CapabilityProofRead, Store, WantRead};
 
     use crate::channel::NetEventBatch;
 
@@ -878,7 +904,10 @@ mod tests {
         assert!(!before.contains_blob(later).unwrap());
         assert!(after.contains_blob(later).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
-        assert!(matches!(peer.host, HostState::Dormant(_)));
+        assert!(matches!(
+            peer.host.lock().unwrap().state,
+            HostState::Dormant(_)
+        ));
         assert!(peer.wake_plane().is_none());
         assert!(peer.sender.current_snapshot().is_none());
         assert!(peer.last_store_snapshot.is_none());
@@ -925,11 +954,222 @@ mod tests {
         assert_eq!(starts.load(Ordering::SeqCst), 1);
         assert_eq!(requests.load(Ordering::SeqCst), 2);
         assert!(!before.contains_blob(handle).unwrap());
-        assert!(before.get::<Bytes, UnknownBlob>(handle).is_err());
+        assert!(BlobStoreGet::get::<Bytes, UnknownBlob>(&before, handle).is_err());
         let after = peer.snapshot().unwrap();
         assert!(after.contains_blob(handle).unwrap());
         assert_eq!(after.wants().unwrap().count(), 0);
-        assert!(matches!(peer.host, HostState::Running));
+        assert!(peer.host_is_running());
+        peer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_get_fetches_once_without_advancing_records_proofs_or_cover() {
+        let key = SigningKey::from_bytes(&[70; 32]);
+        let mut store = MemoryRepo::default();
+        let collection = store
+            .collection(
+                "snapshot-get",
+                CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+            )
+            .unwrap();
+        store
+            .commit(collection, &key, entity! { metadata::name: "before" })
+            .unwrap();
+        let bytes = Bytes::from_source(b"remote snapshot payload".to_vec());
+        let mut source = MemoryRepo::default();
+        let handle = source.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let capability = Arc::new(ExactBlob {
+            hash: handle.raw,
+            bytes: bytes.clone(),
+            requests: requests.clone(),
+        });
+        let mut peer = Peer::assemble(
+            store,
+            foreground_config().qos,
+            sender,
+            receiver,
+            None,
+            HostState::Dormant(Box::new(move || {
+                wiring.install_test_capability(capability);
+                Ok(None)
+            })),
+        );
+        let instant = hifitime::Epoch::from_tai_seconds(20.0);
+        let snapshot = peer.snapshot_at(instant).unwrap();
+        let observed = snapshot.collection(collection).unwrap();
+        let cover = observed.cover().clone();
+
+        peer.commit(collection, &key, entity! { metadata::name: "after" })
+            .unwrap();
+        let proof = CapabilityProof::issue_root(
+            &key,
+            CapabilityResource::from(collection.handle()),
+            Capability::new(
+                triblespace_core::collection::read_capability(),
+                CapabilityMode::Invoke,
+            ),
+            None,
+            SigningKey::from_bytes(&[71; 32]).verifying_key(),
+        );
+        peer.insert_proof(proof).unwrap();
+
+        let fetched: Bytes = snapshot.get(handle).await.unwrap();
+        assert_eq!(fetched, bytes);
+        assert_eq!(
+            snapshot
+                .clone()
+                .get::<Bytes, UnknownBlob>(handle)
+                .await
+                .unwrap(),
+            bytes
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert!(!snapshot.contains_blob(handle).unwrap());
+        assert_eq!(snapshot.instant(), instant);
+        assert_eq!(snapshot.records().unwrap().count(), 1);
+        assert_eq!(snapshot.proofs().unwrap().count(), 0);
+        assert_eq!(snapshot.collection(collection).unwrap().cover(), &cover);
+        assert_eq!(observed.cover(), &cover);
+        let after = peer.snapshot().unwrap();
+        assert_eq!(after.records().unwrap().count(), 2);
+        assert_eq!(after.proofs().unwrap().count(), 1);
+        assert!(after.contains_blob(handle).unwrap());
+        assert_eq!(after.wants().unwrap().count(), 0);
+        peer.close().unwrap();
+    }
+
+    #[test]
+    fn snapshot_get_sees_later_local_bytes_without_starting_a_host() {
+        let mut peer = Peer::lazy(
+            MemoryRepo::default(),
+            SigningKey::from_bytes(&[72; 32]),
+            foreground_config(),
+        );
+        let snapshot = peer.snapshot().unwrap();
+        let bytes = Bytes::from_source(b"later local bytes".to_vec());
+        let handle = peer.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        assert_eq!(
+            futures::executor::block_on(snapshot.get::<Bytes, UnknownBlob>(handle)).unwrap(),
+            bytes
+        );
+        assert!(!snapshot.contains_blob(handle).unwrap());
+        assert!(!peer.host_is_running());
+        assert!(peer.sender.current_snapshot().is_none());
+        assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
+        peer.close().unwrap();
+    }
+
+    #[tokio::test]
+    async fn snapshot_fetch_releases_locks_and_handles_close_during_io() {
+        struct GatedBlob {
+            started: Arc<tokio::sync::Notify>,
+            finish: Arc<tokio::sync::Notify>,
+            bytes: Bytes,
+        }
+        impl host::NetCapability for GatedBlob {
+            fn fetch_blob(
+                &self,
+                _hash: RawHash,
+            ) -> futures::future::BoxFuture<'static, Option<Bytes>> {
+                let started = self.started.clone();
+                let finish = self.finish.clone();
+                let bytes = self.bytes.clone();
+                Box::pin(async move {
+                    started.notify_one();
+                    finish.notified().await;
+                    Some(bytes)
+                })
+            }
+        }
+        let key = SigningKey::from_bytes(&[73; 32]);
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let bytes = Bytes::from_source(b"in flight during close".to_vec());
+        let mut source = MemoryRepo::default();
+        let handle = source.put::<UnknownBlob, _>(bytes.clone()).unwrap();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let finish = Arc::new(tokio::sync::Notify::new());
+        wiring.install_test_capability(Arc::new(GatedBlob {
+            started: started.clone(),
+            finish: finish.clone(),
+            bytes,
+        }));
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            foreground_config().qos,
+            sender,
+            receiver,
+        );
+        let resident = peer
+            .put::<UnknownBlob, _>(Bytes::from_source(b"captured".to_vec()))
+            .unwrap();
+        let snapshot = peer.snapshot().unwrap();
+        let reader = snapshot.clone();
+        let fetching = tokio::spawn(async move { reader.get::<Bytes, UnknownBlob>(handle).await });
+        started.notified().await;
+
+        // Both calls need the backend lock while the network future is pending.
+        peer.put::<UnknownBlob, _>(Bytes::from_source(b"concurrent writer".to_vec()))
+            .unwrap();
+        peer.close().unwrap();
+        finish.notify_one();
+        assert!(
+            fetching
+                .await
+                .unwrap()
+                .unwrap_err()
+                .to_string()
+                .contains("closed")
+        );
+        assert_eq!(
+            snapshot
+                .get::<Bytes, UnknownBlob>(resident)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"captured"
+        );
+        assert!(
+            snapshot
+                .get::<Bytes, UnknownBlob>(handle)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("closed")
+        );
+    }
+
+    #[tokio::test]
+    async fn snapshot_rejects_network_bytes_for_a_different_handle() {
+        let key = SigningKey::from_bytes(&[74; 32]);
+        let (sender, receiver, wiring) =
+            host::wire(crate::identity::iroh_secret(&key).public().into());
+        let requested = Inline::<Handle<UnknownBlob>>::new([0x5e; 32]);
+        wiring.install_test_capability(Arc::new(ExactBlob {
+            hash: requested.raw,
+            bytes: Bytes::from_source(b"not the requested content".to_vec()),
+            requests: Arc::new(AtomicUsize::new(0)),
+        }));
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            foreground_config().qos,
+            sender,
+            receiver,
+        );
+        let snapshot = peer.snapshot().unwrap();
+        assert!(
+            snapshot
+                .get::<Bytes, UnknownBlob>(requested)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("different content hash")
+        );
+        assert!(!peer.snapshot().unwrap().contains_blob(requested).unwrap());
+        assert_eq!(peer.snapshot().unwrap().wants().unwrap().count(), 0);
         peer.close().unwrap();
     }
 
@@ -997,7 +1237,10 @@ mod tests {
         let error = futures::executor::block_on(peer.acquire(handle)).unwrap_err();
 
         assert!(error.to_string().contains("cannot observe resident blob"));
-        assert!(matches!(peer.host, HostState::Dormant(_)));
+        assert!(matches!(
+            peer.host.lock().unwrap().state,
+            HostState::Dormant(_)
+        ));
         assert!(peer.sender.current_snapshot().is_none());
         assert_eq!(peer.serving_snapshot_rebuilds, 0);
         peer.close().unwrap();
@@ -1069,7 +1312,10 @@ mod tests {
         peer.close().unwrap();
 
         assert!(observer.current_snapshot().is_none());
-        assert_eq!(frozen.get::<Bytes, UnknownBlob>(handle).unwrap(), bytes);
+        assert_eq!(
+            futures::executor::block_on(frozen.get::<Bytes, UnknownBlob>(handle)).unwrap(),
+            bytes
+        );
         let mut reopened = Pile::open(path.path()).unwrap();
         assert_eq!(
             reopened

@@ -12,7 +12,9 @@
 //! endpoint proves H before the requester proves H, both proofs bind their
 //! authenticated endpoint identities, and returned bytes must hash to H.
 //!
-//! All store traits stay sync. Async is jailed inside the network thread.
+//! Semantic snapshots and local writes remain synchronous. Explicit exact-blob
+//! reads through [`PeerSnapshot`](peer::PeerSnapshot) await acquisition while
+//! keeping the captured collection and authorization observation unchanged.
 
 pub(crate) mod bearer;
 mod channel;

@@ -89,8 +89,9 @@ impl fmt::Debug for ObjectStoreSnapshot {
 /// Remote object stores generally cannot provide an atomic cross-prefix read
 /// transaction. Snapshot construction therefore observes both immutable
 /// namespaces once, validates every observed entry, and freezes their
-/// membership together. Reads are gated by this frozen membership: objects
-/// inserted after the observation cannot leak into it through a later GET.
+/// membership together. Record enumeration and residency observations stay
+/// frozen. An explicit exact-handle GET can retrieve bytes added later without
+/// changing those observations.
 #[derive(Clone)]
 pub struct ObjectStoreSnapshot {
     instant: hifitime::Epoch,
@@ -338,11 +339,6 @@ impl AsyncBlobStoreGet for ObjectStoreSnapshot {
     {
         let raw = handle.raw;
         async move {
-            if !self.blobs.contains_key(&raw) {
-                return Err(GetBlobErr::NotInSnapshot {
-                    handle: Inline::new(raw),
-                });
-            }
             let path = self.blob_path(hex::encode(raw));
             let object = self.store.get(&path).await?;
             let bytes = object.bytes().await?;
@@ -636,11 +632,6 @@ impl Error for PutBlobErr {
 /// Error returned when retrieving a blob from the object store.
 #[derive(Debug)]
 pub enum GetBlobErr<E: Error> {
-    /// The requested handle was not a member of this frozen observation.
-    NotInSnapshot {
-        /// Content address rejected by the snapshot membership gate.
-        handle: Inline<Hash<Blake3>>,
-    },
     /// The underlying object store operation failed.
     Store(object_store::Error),
     /// The fetched object's bytes did not hash to the requested content address.
@@ -657,11 +648,6 @@ pub enum GetBlobErr<E: Error> {
 impl<E: Error> fmt::Display for GetBlobErr<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotInSnapshot { handle } => write!(
-                f,
-                "blob {} was not present in this snapshot",
-                Hash::<Blake3>::to_hex(handle)
-            ),
             Self::Store(e) => write!(f, "object store error: {e}"),
             Self::HashMismatch { expected, actual } => write!(
                 f,
@@ -678,7 +664,7 @@ impl<E: Error> Error for GetBlobErr<E> {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
             Self::Store(e) => Some(e),
-            Self::NotInSnapshot { .. } | Self::HashMismatch { .. } | Self::Conversion(_) => None,
+            Self::HashMismatch { .. } | Self::Conversion(_) => None,
         }
     }
 }
@@ -833,7 +819,7 @@ mod tests {
     }
 
     #[test]
-    fn blob_get_is_gated_by_frozen_snapshot_membership() {
+    fn blob_get_can_fetch_later_bytes_without_advancing_the_snapshot() {
         block_on(async {
             let mut store = remote();
             let instant = hifitime::Epoch::from_tai_seconds(10.0);
@@ -851,13 +837,20 @@ mod tests {
             let handle = AsyncBlobStorePut::put::<RawBytes, _>(&mut store, bytes.clone())
                 .await
                 .unwrap();
+            AsyncCollectionStore::insert(&mut store, record(1))
+                .await
+                .unwrap();
 
             assert!(AsyncBlobStoreList::blobs(&before).await.is_empty());
-            assert!(matches!(
-                AsyncBlobStoreGet::get::<Blob<RawBytes>, RawBytes>(&before, handle).await,
-                Err(GetBlobErr::NotInSnapshot { handle: rejected })
-                    if rejected.raw == handle.raw
-            ));
+            let fetched: Blob<RawBytes> = AsyncBlobStoreGet::get(&before, handle).await.unwrap();
+            assert_eq!(fetched.bytes, bytes);
+            assert_eq!(fetched.get_handle(), handle);
+            assert_eq!(before.instant(), instant);
+            assert!(AsyncCollectionRead::records(&before)
+                .await
+                .unwrap()
+                .is_empty());
+            assert!(AsyncBlobStoreList::blobs(&before).await.is_empty());
 
             let after = AsyncSnapshotSource::snapshot(&mut store).await.unwrap();
             let fetched: Blob<RawBytes> = AsyncBlobStoreGet::get(&after, handle).await.unwrap();
@@ -865,7 +858,7 @@ mod tests {
             assert_eq!(AsyncBlobStoreList::blobs(&after).await.len(), 1);
             let changes = after.changes_since(&before);
             assert!(changes.contains(StoreChanges::BLOBS));
-            assert!(!changes.contains(StoreChanges::COLLECTION_RECORDS));
+            assert!(changes.contains(StoreChanges::COLLECTION_RECORDS));
         });
     }
 

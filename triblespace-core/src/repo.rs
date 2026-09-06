@@ -129,10 +129,11 @@ impl StoreChanges {
 /// needed to interpret the prefix it observed, and compares directly with an
 /// earlier snapshot from the same store lineage. Its authorization instant is
 /// frozen with that observation and remains unchanged by cloning or reading.
-/// Snapshot reads are frozen, resident-only observations: they never fetch,
-/// wait, mutate storage, or record durable demand. The default change
-/// classification is deliberately conservative for backends that cannot
-/// classify changes cheaply.
+/// Record reads and residency observations are frozen and never perform work.
+/// A snapshot may additionally carry an asynchronous blob reader which fetches
+/// and caches exact immutable content without advancing these observations or
+/// recording durable demand. The default change classification is deliberately
+/// conservative for backends that cannot classify changes cheaply.
 pub trait StoreSnapshot: Clone + Send + Sync + 'static {
     /// The frozen instant used for every authorization decision in this observation.
     ///
@@ -157,9 +158,9 @@ pub trait StoreSnapshot: Clone + Send + Sync + 'static {
 /// A mutable store which can freeze one immutable read observation.
 ///
 /// Every semantic read capability implemented by a store shares this one
-/// associated snapshot. This prevents blob bytes, collection records, and
-/// capability proofs from being sampled at subtly different prefixes. Active
-/// acquisition belongs on the mutable store and produces a later snapshot.
+/// associated snapshot. Records, proof evidence, and authorization time are
+/// frozen together. An attached asynchronous blob reader may resolve exact
+/// immutable handles later; that does not select a newer semantic observation.
 pub trait SnapshotSource {
     /// Immutable observation returned by this store.
     type Snapshot: StoreSnapshot;
