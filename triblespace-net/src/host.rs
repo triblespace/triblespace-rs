@@ -1592,7 +1592,9 @@ impl<T: Transport> ProviderClient<T> {
                 Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
                     Ok(reply) => reply,
                     Err(_) => {
-                        debug!("DHT replica lookup routing window exhausted");
+                        let timed_out =
+                            lookup.record_timeouts(&mut self.candidates.lock().unwrap());
+                        debug!(timed_out, "DHT replica lookup routing window exhausted");
                         break;
                     }
                 },

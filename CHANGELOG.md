@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Retire issued, unanswered learned DHT routes when a bounded routing window
+  cancels them, so stale close candidates cannot monopolize repeated background
+  publication attempts. Preserve configured routes, unissued candidates, partial
+  authenticated responders, and existing lookup deadlines; cover the remaining
+  configured-only cold-start limit explicitly.
 - Isolate exact-blob receiver unit tests that otherwise shared one process-wide
   receive permit across independent paused Tokio clocks. Cover same-runtime
   receive contention within the unchanged ten-second foreground deadline;

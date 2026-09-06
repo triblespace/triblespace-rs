@@ -1,8 +1,8 @@
 //! Exact-H acquisition through the production DHT and bearer RPC handlers.
 //!
-//! Only connection latency and the caller deadline advance in these tests.
-//! Preinstalled, unexpired directory leases isolate acquisition from the
-//! independent publication scheduler and require no global virtual clock.
+//! Connection latency and caller deadlines use a paused Tokio timeline.
+//! Directory leases remain unexpired; publication retries receive explicit
+//! monotonic instants and require no global virtual clock.
 //! The shared unit-test guard excludes body receivers on other test runtimes,
 //! whose independent clocks cannot make progress on this paused timeline.
 
@@ -170,8 +170,18 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
     let stalled = stalled_key.verifying_key().to_bytes();
     let _stalled_harness = fixture.net.join(&stalled_key);
     fixture.net.stall_dials(stalled);
+    let learned_key = SigningKey::from_bytes(&[94; 32]);
+    let learned = learned_key.verifying_key().to_bytes();
+    let _learned_harness = fixture.net.join(&learned_key);
+    fixture.net.stall_dials(learned);
     *fixture.client.candidates.lock().unwrap() =
         RoutingTable::new(fixture.client.my_id, [fixture.provider, stalled]);
+    fixture
+        .client
+        .candidates
+        .lock()
+        .unwrap()
+        .promote_authenticated(learned);
 
     let started = tokio::time::Instant::now();
     assert_eq!(
@@ -182,21 +192,139 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
         Some(fixture.bytes.clone()),
     );
     assert_eq!(started.elapsed(), Duration::from_secs(7));
+    {
+        let routes = fixture.client.candidates.lock().unwrap();
+        assert_eq!(
+            routes.state(fixture.provider),
+            Some(crate::routing::RouteState::Verified)
+        );
+        assert_eq!(
+            routes.state(stalled),
+            Some(crate::routing::RouteState::Candidate)
+        );
+        assert_eq!(routes.state(learned), None);
+    }
     fixture.assert_no_control_effects();
 }
 
 #[tokio::test(start_paused = true)]
-async fn background_lookup_keeps_its_short_bound() {
+async fn configured_only_cold_background_lookup_keeps_its_short_bound() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
-    let started = tokio::time::Instant::now();
-    let error = fixture
+    // A configured-only four-second cold dial still cannot complete within
+    // the unchanged three-second background window. Failure must retain the
+    // configured route, but does not itself warm a cancelled SimNet dial.
+    for attempt in 1..=3 {
+        let started = tokio::time::Instant::now();
+        let error = fixture
+            .client
+            .fetch_blob(fixture.hash, Some(BACKGROUND_LOOKUP_DEADLINE))
+            .await
+            .unwrap_err();
+        assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
+        assert!(error.to_string().contains("no remote replica"));
+        assert_eq!(
+            fixture
+                .client
+                .candidates
+                .lock()
+                .unwrap()
+                .closest(fixture.hash, K),
+            vec![fixture.provider]
+        );
+        assert_eq!(
+            fixture
+                .net
+                .dial_count(fixture.client.my_id, fixture.provider),
+            attempt
+        );
+    }
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn background_publication_retries_past_a_stale_issued_batch() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let key = blob_locator(fixture.hash);
+    // The configured sibling is already responsive. Three learned stale
+    // identities closer to this exact locator occupy the whole first batch.
+    fixture
         .client
-        .fetch_blob(fixture.hash, Some(BACKGROUND_LOOKUP_DEADLINE))
+        .find_node(fixture.provider, key)
         .await
-        .unwrap_err();
+        .unwrap();
+    let stale_keys: Vec<_> = (0u8..=255)
+        .map(|byte| SigningKey::from_bytes(&[byte; 32]))
+        .filter(|signer| {
+            let peer = signer.verifying_key().to_bytes();
+            peer != fixture.client.my_id
+                && crate::routing::distance_cmp(key, peer, fixture.provider).is_lt()
+        })
+        .take(ALPHA)
+        .collect();
+    assert_eq!(stale_keys.len(), ALPHA);
+    let stale: Vec<_> = stale_keys
+        .iter()
+        .map(|signer| signer.verifying_key().to_bytes())
+        .collect();
+    let _stale_harnesses: Vec<_> = stale_keys
+        .iter()
+        .map(|signer| fixture.net.join(signer))
+        .collect();
+    for peer in &stale {
+        fixture.net.stall_dials(*peer);
+        assert!(
+            fixture
+                .client
+                .candidates
+                .lock()
+                .unwrap()
+                .promote_authenticated(*peer)
+        );
+    }
+    assert_eq!(
+        fixture.client.candidates.lock().unwrap().closest(key, K)[ALPHA],
+        fixture.provider
+    );
+
+    let now = crate::clock::mono_now();
+    let locators = locator_index(&fixture.store.snapshot().unwrap()).unwrap();
+    let mut publisher = ProviderPublisher::new(now);
+    publisher.install(
+        ProviderObservation::from_locators([], false, &locators).into_set(),
+        now,
+    );
+    assert_eq!(publisher.next(now), Some((key, fixture.hash)));
+    let token = blob_provider_token(fixture.hash, fixture.client.my_id);
+    let started = tokio::time::Instant::now();
+    let result = fixture.client.announce_key(key, token).await;
     assert_eq!(started.elapsed(), BACKGROUND_LOOKUP_DEADLINE);
-    assert!(error.to_string().contains("no remote replica"));
+    assert_eq!(result, PublicationResult::NoAuthenticatedRemoteReplica);
+    let completed = now + started.elapsed();
+    assert!(
+        publisher
+            .complete(key, result, completed)
+            .topology_outage_started
+    );
+    assert_eq!(publisher.next(completed), None);
+
+    let retry_at = completed + crate::RETRY_BACKOFF_BASE;
+    assert_eq!(publisher.next(retry_at), Some((key, fixture.hash)));
+    let retry_started = tokio::time::Instant::now();
+    let result = fixture.client.announce_key(key, token).await;
+    assert_eq!(result, PublicationResult::Published);
+    assert_eq!(retry_started.elapsed(), Duration::ZERO);
+    assert!(publisher.complete(key, result, retry_at).topology_recovered);
+    assert_eq!(publisher.next(retry_at), None);
+    assert_eq!(
+        fixture.client.get(fixture.provider, key).await.unwrap(),
+        vec![(fixture.client.my_id, token)]
+    );
+    for peer in stale {
+        assert_eq!(fixture.client.candidates.lock().unwrap().state(peer), None);
+        assert_eq!(fixture.net.dial_count(fixture.client.my_id, peer), 1);
+    }
     fixture.assert_no_control_effects();
 }
 
