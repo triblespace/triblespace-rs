@@ -34,12 +34,15 @@ use crate::inline::encodings::genid::GenId;
 #[cfg(test)]
 use crate::inline::encodings::genid::IdParseError;
 use crate::inline::encodings::hash::{Blake3, Handle, Hash};
-use crate::inline::encodings::iu256::U256;
 use crate::inline::Inline;
 #[cfg(test)]
 use crate::inline::InlineEncoding;
 use crate::prelude::attributes;
 use crate::trible::TribleSet;
+
+pub use crate::capability::policy::{
+    admission_delegate_threshold, admission_invoke_threshold, admission_policy_root,
+};
 
 /// Tag identifying a canonical collection descriptor.
 ///
@@ -108,36 +111,6 @@ attributes! {
     /// Anchor minted with `trible genid` on 2026-08-28:
     /// `A2EEF06D4E1AA4B17B745AA2E8C37867`.
     "A2EEF06D4E1AA4B17B745AA2E8C37867" as pub collection_name: Handle<UTF8String>;
-    /// Self-contained READ policy entity.
-    ///
-    /// The linked entity is embedded through Fragment spread, so every root
-    /// and threshold participates directly in collection identity.
-    ///
-    /// Anchor minted with `trible genid` on 2026-08-30:
-    /// `4108A59A03E8F8EC9DCDCC3C8597A292`.
-    "4108A59A03E8F8EC9DCDCC3C8597A292" as pub collection_read_policy: GenId;
-    /// Self-contained WRITE policy entity.
-    ///
-    /// Anchor minted with `trible genid` on 2026-08-30:
-    /// `06930EAD5B83C83A30B6061B53A2840B`.
-    "06930EAD5B83C83A30B6061B53A2840B" as pub collection_write_policy: GenId;
-    /// One distinct trust root of a quorum admission policy.
-    ///
-    /// Anchor minted with `trible genid` on 2026-08-30:
-    /// `E9AC4E4749FD219705E9533B02AAA405`.
-    "E9AC4E4749FD219705E9533B02AAA405" as pub admission_policy_root: ED25519PublicKey;
-    /// Number of distinct roots required to invoke the governed action.
-    ///
-    /// Anchor minted with `trible genid` on 2026-08-30:
-    /// `AF874E4D44C3A6565754D3EE8EDE48B5`.
-    "AF874E4D44C3A6565754D3EE8EDE48B5" as pub admission_invoke_threshold: U256;
-    /// Legacy delegation threshold retained as identity-bearing policy data.
-    ///
-    /// Capability proof modes now govern delegation. This attribute remains
-    /// part of the descriptor grammar so existing handles round-trip exactly.
-    /// Anchor minted with `trible genid` on 2026-08-30:
-    /// `1300EF404FE61D26FC091B0CEC1C41EC`.
-    "1300EF404FE61D26FC091B0CEC1C41EC" as pub admission_delegate_threshold: U256;
     /// The collection this one derives from, by descriptor handle.
     ///
     /// This says *what* a derived collection is computed from; which state of

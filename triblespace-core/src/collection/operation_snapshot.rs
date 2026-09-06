@@ -314,9 +314,8 @@ mod tests {
 
     use super::*;
     use crate::blob::encodings::{simplearchive::SimpleArchive, UnknownBlob};
-    use crate::capability::{Capability, CapabilityAction, CapabilityMode, CapabilityResource};
+    use crate::capability::{Capability, CapabilityHandle, CapabilityMode, CapabilityResource};
     use crate::collection::{CollectionDerive, CollectionStore};
-    use crate::id::Id;
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{BlobStorePut, CapabilityProofStore, SnapshotSource, WantRequest, WantStore};
 
@@ -334,10 +333,7 @@ mod tests {
         CapabilityProof::issue_root(
             &root,
             CapabilityResource::new([byte; 32]),
-            Capability::new(
-                CapabilityAction::new(Id::new([byte; 16]).expect("nonzero action")),
-                CapabilityMode::Invoke,
-            ),
+            Capability::new(CapabilityHandle::new([byte; 32]), CapabilityMode::Invoke),
             None,
             leaf.verifying_key(),
         )

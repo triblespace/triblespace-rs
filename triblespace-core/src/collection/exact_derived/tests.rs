@@ -14,13 +14,14 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::{BlobEncoding, IntoBlob, TryFromBlob};
 use crate::capability::{
-    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityProofId,
+    Capability, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityProofId,
     CapabilityResource, CapabilityValidity,
 };
 use crate::collection::{
-    collection_read_audience, AdmissionPolicy, CollectionCommit, CollectionMerge, CollectionPolicy,
-    CollectionRead, CollectionReadAudience, CollectionRecordFingerprint, CollectionRecordSelector,
-    CollectionSnapshotExt, CollectionStore, CollectionStoreExt, ACTION_READ, ACTION_WRITE,
+    collection_read_audience, read_capability, write_capability, AdmissionPolicy, CollectionCommit,
+    CollectionMerge, CollectionPolicy, CollectionRead, CollectionReadAudience,
+    CollectionRecordFingerprint, CollectionRecordSelector, CollectionSnapshotExt, CollectionStore,
+    CollectionStoreExt,
 };
 use crate::id::{ExclusiveId, Id};
 use crate::id_hex;
@@ -62,11 +63,11 @@ where
 fn append_adversarial_proof_edge(
     proof: CapabilityProof,
     issuer: &SigningKey,
-    action: CapabilityAction,
+    action: CapabilityHandle,
     delegate: VerifyingKey,
 ) -> CapabilityProof {
     let mut bytes = proof.into_bytes();
-    bytes.extend_from_slice(&action.id().raw());
+    bytes.extend_from_slice(&action.raw);
     bytes.push(1); // CapabilityMode::Invoke
     bytes.extend_from_slice(&[0; 32]); // Unbounded validity.
     bytes.extend_from_slice(&delegate.to_bytes());
@@ -944,7 +945,7 @@ fn root_ensure_hydrates_admitted_commit_closure_and_defers_concurrent_authority(
         .unwrap();
     let descriptor: Blob<SimpleArchive> = registry.snapshot().unwrap().get(root.handle()).unwrap();
     let resource = CapabilityResource::from(root.handle());
-    let write = Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke);
+    let write = Capability::new(write_capability(), CapabilityMode::Invoke);
     let proof = |writer: &SigningKey| {
         CapabilityProof::issue_root(&authority, resource, write, None, writer.verifying_key())
     };
@@ -1095,7 +1096,7 @@ fn active_read_audience_acquires_a_cold_descriptor() {
     let proof = CapabilityProof::issue_root(
         &authority,
         CapabilityResource::from(collection.handle()),
-        Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+        Capability::new(read_capability(), CapabilityMode::Invoke),
         None,
         reader.verifying_key(),
     );
@@ -1135,7 +1136,7 @@ fn active_read_audience_ignores_irrelevant_or_forged_proofs() {
         )
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let read = Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke);
+    let read = Capability::new(read_capability(), CapabilityMode::Invoke);
 
     let irrelevant_proof = CapabilityProof::issue_root(
         &irrelevant_authority,
@@ -1188,7 +1189,7 @@ fn active_read_audience_walks_a_valid_delegated_proof_path() {
         )
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let action = CapabilityAction::new(ACTION_READ);
+    let action = read_capability();
     let proof = CapabilityProof::issue_root(
         &authority,
         resource,
@@ -1240,7 +1241,7 @@ fn active_read_audience_stops_before_a_signed_but_semantically_impossible_tail()
         )
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let action = CapabilityAction::new(ACTION_READ);
+    let action = read_capability();
     let root_proof = CapabilityProof::issue_root(
         &authority,
         resource,
@@ -1291,7 +1292,7 @@ fn snapshot_read_audience_defers_later_proofs_after_descriptor_acquisition() {
         .get(collection.handle())
         .unwrap();
     let resource = CapabilityResource::from(collection.handle());
-    let read = Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke);
+    let read = Capability::new(read_capability(), CapabilityMode::Invoke);
     let mut inner = MemoryRepo::default();
     inner
         .insert_proof(CapabilityProof::issue_root(

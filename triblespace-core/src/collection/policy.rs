@@ -1,283 +1,154 @@
-//! Self-contained READ and WRITE admission policies.
+//! Construction conveniences for a collection's generic resource policies.
 //!
-//! A collection descriptor links one immutable policy entity for each action.
-//! A policy is either open or a quorum over a canonical set of capability
-//! roots. Actual proof paths remain outside the descriptor, so authority can
-//! be delegated without changing collection identity.
+//! Ordinary admission reads the descriptor's binding relation directly. This
+//! value is only a producer (or explicit scalar diagnostic), never a catalog
+//! loaded to decide which facts are visible.
 
-use std::error::Error;
-use std::fmt;
-
-use ed25519_dalek::VerifyingKey;
-
-use crate::capability::is_valid_capability_principal;
-use crate::id::{id_hex, Id};
-use crate::metadata;
+use crate::blob::{encodings::simplearchive::SimpleArchive, IntoBlob};
+use crate::capability::capability_action;
 use crate::prelude::entity;
 use crate::trible::Fragment;
 
-use super::records::{
-    admission_delegate_threshold, admission_invoke_threshold, admission_policy_root,
+pub use crate::capability::policy::{
+    AdmissionPolicy, AdmissionPolicyError, ValidatedQuorum, KIND_ADMISSION_POLICY_OPEN,
+    KIND_ADMISSION_POLICY_QUORUM,
 };
 
-/// An admission policy requiring no proof.
+use super::{ACTION_READ, ACTION_WRITE};
+
+pub(super) fn read_definition() -> Fragment {
+    entity! { capability_action: ACTION_READ }
+}
+
+pub(super) fn write_definition() -> Fragment {
+    entity! { capability_action: ACTION_WRITE }
+}
+
+/// A descriptor producer with READ/WRITE conveniences and generic bindings.
 ///
-/// Minted with `trible genid` on 2026-08-30.
-pub const KIND_ADMISSION_POLICY_OPEN: Id = id_hex!("77983C388E5109F9D55106A28D1C18FA");
-
-/// A threshold policy over a canonical nonempty root set.
-///
-/// Minted with `trible genid` on 2026-08-30.
-pub const KIND_ADMISSION_POLICY_QUORUM: Id = id_hex!("DC81E78C55E759F71AFFA645A02C44C5");
-
-/// Invalid quorum geometry.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionPolicyError {
-    /// A quorum has no roots.
-    EmptyRoots,
-    /// A root is not a unique, usable Ed25519 principal encoding.
-    InvalidRoot { key: [u8; 32] },
-    /// A threshold is zero or exceeds the number of distinct roots.
-    InvalidThreshold {
-        /// Which threshold failed.
-        field: &'static str,
-        /// Supplied threshold.
-        threshold: u32,
-        /// Number of distinct policy roots.
-        roots: usize,
-    },
-}
-
-impl fmt::Display for AdmissionPolicyError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::EmptyRoots => formatter.write_str("an admission quorum needs at least one root"),
-            Self::InvalidRoot { .. } => {
-                formatter.write_str("an admission root must be a canonical, non-weak Ed25519 key")
-            }
-            Self::InvalidThreshold {
-                field,
-                threshold,
-                roots,
-            } => write!(
-                formatter,
-                "{field} threshold {threshold} is outside 1..={roots}",
-            ),
-        }
-    }
-}
-
-impl Error for AdmissionPolicyError {}
-
-/// Immutable authorization law for one action.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub enum AdmissionPolicy {
-    /// Every principal is admitted without evidence.
-    Open,
-    /// Distinct roots jointly support invocation.
-    ///
-    /// The encoded policy may also retain a legacy delegation threshold as
-    /// identity-bearing descriptor data. Delegation authority itself is now
-    /// carried only by the signed mode on each self-contained proof prefix.
-    Quorum(ValidatedQuorum),
-}
-
-/// Canonical, structurally valid quorum geometry.
-///
-/// The fields are deliberately private: sorting, deduplication, and the
-/// threshold bounds are invariants of the value rather than checks every
-/// consumer must remember to repeat.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ValidatedQuorum {
-    roots: Vec<VerifyingKey>,
-    invoke_threshold: u32,
-    delegate_threshold: Option<u32>,
-}
-
-impl ValidatedQuorum {
-    /// Distinct roots in canonical public-key order.
-    pub fn roots(&self) -> &[VerifyingKey] {
-        &self.roots
-    }
-
-    /// Number of distinct roots required to invoke the action.
-    pub const fn invoke_threshold(&self) -> u32 {
-        self.invoke_threshold
-    }
-
-    /// Legacy identity-bearing delegation threshold.
-    ///
-    /// This value is round-tripped because it participates in existing
-    /// descriptor handles. It is not consulted by capability admission;
-    /// signed proof-prefix modes govern delegation.
-    pub const fn delegate_threshold(&self) -> Option<u32> {
-        self.delegate_threshold
-    }
-}
-
-impl AdmissionPolicy {
-    /// Canonical threshold policy over the distinct supplied roots.
-    pub fn quorum(
-        roots: impl IntoIterator<Item = VerifyingKey>,
-        invoke_threshold: u32,
-        delegate_threshold: Option<u32>,
-    ) -> Result<Self, AdmissionPolicyError> {
-        let mut roots: Vec<_> = roots.into_iter().collect();
-        if let Some(root) = roots
-            .iter()
-            .find(|root| !is_valid_capability_principal(root))
-        {
-            return Err(AdmissionPolicyError::InvalidRoot {
-                key: root.to_bytes(),
-            });
-        }
-        roots.sort_unstable_by_key(VerifyingKey::to_bytes);
-        roots.dedup_by_key(|key| key.to_bytes());
-        if roots.is_empty() {
-            return Err(AdmissionPolicyError::EmptyRoots);
-        }
-        validate_threshold("invoke", invoke_threshold, roots.len())?;
-        if let Some(threshold) = delegate_threshold {
-            validate_threshold("delegate", threshold, roots.len())?;
-        }
-        Ok(Self::Quorum(ValidatedQuorum {
-            roots,
-            invoke_threshold,
-            delegate_threshold,
-        }))
-    }
-
-    /// One-root policy whose legacy delegation-threshold field is absent.
-    ///
-    /// This constructor does not constrain proof delegation. A proof issued
-    /// with [`crate::capability::CapabilityMode::Invoke`] cannot be extended;
-    /// one issued with a delegating mode can.
-    pub fn direct(root: VerifyingKey) -> Self {
-        Self::quorum([root], 1, None).expect("one-root direct policy is valid")
-    }
-
-    /// One-root policy retaining the legacy delegation-threshold value `1`.
-    ///
-    /// This remains available solely to reproduce existing descriptor
-    /// identities. Proof-prefix modes, not this field, govern delegation.
-    pub fn delegable(root: VerifyingKey) -> Self {
-        Self::quorum([root], 1, Some(1)).expect("one-root delegable policy is valid")
-    }
-
-    /// Canonical self-contained policy fragment.
-    pub fn fragment(&self) -> Fragment {
-        match self {
-            Self::Open => {
-                let kind = KIND_ADMISSION_POLICY_OPEN;
-                entity! { _ @ metadata::tag: kind }
-            }
-            Self::Quorum(quorum) => {
-                let kind = KIND_ADMISSION_POLICY_QUORUM;
-                entity! { _ @
-                    metadata::tag: kind,
-                    admission_policy_root*: quorum.roots.iter().copied(),
-                    admission_invoke_threshold: quorum.invoke_threshold,
-                    admission_delegate_threshold?: quorum.delegate_threshold,
-                }
-            }
-        }
-    }
-
-    /// Distinct canonical roots, or `None` for open admission.
-    pub fn roots(&self) -> Option<&[VerifyingKey]> {
-        match self {
-            Self::Open => None,
-            Self::Quorum(quorum) => Some(quorum.roots()),
-        }
-    }
-
-    /// Invocation threshold, or `None` for open admission.
-    pub const fn invoke_threshold(&self) -> Option<u32> {
-        match self {
-            Self::Open => None,
-            Self::Quorum(quorum) => Some(quorum.invoke_threshold()),
-        }
-    }
-
-    /// Legacy identity-bearing delegation threshold.
-    ///
-    /// Capability admission ignores this value; it remains observable so a
-    /// decoded descriptor can be reproduced byte-for-byte.
-    pub const fn delegate_threshold(&self) -> Option<u32> {
-        match self {
-            Self::Open => None,
-            Self::Quorum(quorum) => quorum.delegate_threshold(),
-        }
-    }
-}
-
-fn validate_threshold(
-    field: &'static str,
-    threshold: u32,
-    roots: usize,
-) -> Result<(), AdmissionPolicyError> {
-    if threshold == 0 || threshold as usize > roots {
-        return Err(AdmissionPolicyError::InvalidThreshold {
-            field,
-            threshold,
-            roots,
-        });
-    }
-    Ok(())
-}
-
-/// Independent immutable READ and WRITE policies for one collection.
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// The descriptor stores only the binding relation returned by `fragment`.
+/// The two policy fields preserve the convenient construction/inspection API;
+/// runtime admission queries all supported bindings instead of this value.
+#[derive(Clone, Debug)]
 pub struct CollectionPolicy {
     read: AdmissionPolicy,
     write: AdmissionPolicy,
+    bindings: Fragment,
 }
 
+impl PartialEq for CollectionPolicy {
+    fn eq(&self, other: &Self) -> bool {
+        self.read == other.read
+            && self.write == other.write
+            && self.bindings.facts() == other.bindings.facts()
+    }
+}
+
+impl Eq for CollectionPolicy {}
+
 impl CollectionPolicy {
-    /// State both action policies explicitly.
-    pub const fn new(read: AdmissionPolicy, write: AdmissionPolicy) -> Self {
-        Self { read, write }
+    /// State the two standard capability policies explicitly.
+    pub fn new(read: AdmissionPolicy, write: AdmissionPolicy) -> Self {
+        let bindings =
+            bind_definition(read_definition(), &read) + bind_definition(write_definition(), &write);
+        Self {
+            read,
+            write,
+            bindings,
+        }
     }
 
-    /// READ admission policy.
+    /// Add one custom capability definition and its descriptor-local policy.
+    ///
+    /// The definition's facts are archived independently; its roots, delegates,
+    /// validity, and this resource's identity do not belong in those facts.
+    /// The complete supplied attachment store travels with the new binding.
+    /// Repeating an identical definition/policy pair is idempotent.
+    pub fn with_capability(mut self, definition: Fragment, policy: AdmissionPolicy) -> Self {
+        self.bindings += bind_definition(definition, &policy);
+        self
+    }
+
+    /// The complete generic binding fragment, ready for `resource_policy*:`.
+    pub fn fragment(&self) -> Fragment {
+        self.bindings.clone()
+    }
+
+    /// READ policy supplied to this constructor or scalar diagnostic.
     pub const fn read(&self) -> &AdmissionPolicy {
         &self.read
     }
 
-    /// WRITE admission policy.
+    /// WRITE policy supplied to this constructor or scalar diagnostic.
     pub const fn write(&self) -> &AdmissionPolicy {
         &self.write
     }
+
+    pub(crate) fn from_bindings(
+        read: AdmissionPolicy,
+        write: AdmissionPolicy,
+        mut bindings: Fragment,
+    ) -> Self {
+        // The two standard definitions are known by construction. Custom
+        // handles and every raw binding fact remain exactly as observed; this
+        // diagnostic does not acquire an arbitrary definition closure.
+        bindings.put::<SimpleArchive, _>(read_definition().facts().clone());
+        bindings.put::<SimpleArchive, _>(write_definition().facts().clone());
+        Self {
+            read,
+            write,
+            bindings,
+        }
+    }
+}
+
+fn bind_definition(definition: Fragment, policy: &AdmissionPolicy) -> Fragment {
+    let (_, facts, metafacts, blobs) = definition.into_parts();
+    let blob = IntoBlob::<SimpleArchive>::to_blob(facts);
+    let mut binding = policy.binding(blob.get_handle());
+    *binding.metafacts_mut() += metafacts;
+    binding.blobs_mut().union(blobs);
+    binding.put::<SimpleArchive, _>(blob);
+    binding
 }
 
 #[cfg(test)]
 mod tests {
-    use ed25519_dalek::SigningKey;
-
     use super::*;
-
-    fn key(byte: u8) -> VerifyingKey {
-        SigningKey::from_bytes(&[byte; 32]).verifying_key()
-    }
-
-    #[test]
-    fn quorum_roots_are_a_canonical_set() {
-        let a = AdmissionPolicy::quorum([key(2), key(1), key(2)], 1, Some(1)).unwrap();
-        let b = AdmissionPolicy::quorum([key(1), key(2)], 1, Some(1)).unwrap();
-        assert_eq!(a, b);
-        assert_eq!(a.fragment(), b.fragment());
-    }
+    use crate::capability::policy::{capability_handle, resource_policy};
+    use crate::collection::{descriptor, read_capability, write_capability};
+    use crate::metadata;
+    use crate::prelude::{find, pattern};
+    use crate::repo::{BlobStoreGet, SnapshotSource};
 
     #[test]
-    fn invalid_thresholds_are_rejected() {
-        assert!(AdmissionPolicy::quorum([], 1, None).is_err());
-        assert!(AdmissionPolicy::quorum([key(1)], 0, None).is_err());
-        assert!(AdmissionPolicy::quorum([key(1)], 1, Some(2)).is_err());
-
-        let weak = VerifyingKey::from_bytes(&[0; 32]).unwrap();
+    fn generic_binding_construction_is_idempotent_and_preserves_definition_blobs() {
+        let definition = entity! { metadata::name: "custom key delivery" };
+        let handle = IntoBlob::<SimpleArchive>::to_blob(definition.facts().clone()).get_handle();
+        let once = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open)
+            .with_capability(definition.clone(), AdmissionPolicy::Open);
+        let twice = once
+            .clone()
+            .with_capability(definition, AdmissionPolicy::Open);
+        assert_eq!(once, twice);
+        let fragment = descriptor::naming::<SimpleArchive>("capabilities", once);
+        let handles: std::collections::BTreeSet<_> = find!(
+            handle: crate::capability::CapabilityHandle,
+            pattern!(fragment.facts(), [
+                { _?descriptor @ resource_policy: _?binding },
+                { _?binding @ capability_handle: ?handle },
+            ])
+        )
+        .collect();
         assert_eq!(
-            AdmissionPolicy::quorum([weak], 1, None),
-            Err(AdmissionPolicyError::InvalidRoot { key: [0; 32] })
+            handles,
+            [read_capability(), write_capability(), handle].into()
         );
+        let blobs = fragment.blobs().snapshot().unwrap();
+        for handle in handles {
+            assert!(blobs
+                .get::<crate::blob::Blob<SimpleArchive>, _>(handle)
+                .is_ok());
+        }
     }
 }

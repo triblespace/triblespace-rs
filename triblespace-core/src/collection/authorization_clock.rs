@@ -52,10 +52,9 @@ mod tests {
     use ed25519_dalek::SigningKey;
 
     use crate::capability::{
-        Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-        CapabilityValidity,
+        Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
     };
-    use crate::collection::{CollectionHandle, ACTION_READ};
+    use crate::collection::{read_capability, CollectionHandle};
     use crate::repo::memoryrepo::MemoryRepo;
     use crate::repo::{CapabilityProofStore, SnapshotSource, StoreChanges};
 
@@ -68,7 +67,7 @@ mod tests {
         let proof = CapabilityProof::issue_root(
             &root,
             CapabilityResource::from(CollectionHandle::new([3; 32])),
-            Capability::new(CapabilityAction::new(ACTION_READ), CapabilityMode::Invoke),
+            Capability::new(read_capability(), CapabilityMode::Invoke),
             Some(
                 CapabilityValidity::new(
                     Epoch::from_tai_seconds(10.0),

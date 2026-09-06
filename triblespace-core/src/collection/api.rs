@@ -25,10 +25,9 @@ use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::Blob;
 use crate::capability::{
     capability_quorum_authorized_subjects, capability_quorum_authorizes, Capability,
-    CapabilityAction, CapabilityAtom, CapabilityMode, CapabilityProof, CapabilityRequest,
+    CapabilityAtom, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityRequest,
     CapabilityResource,
 };
-use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
 use crate::metadata::MetaDescribe;
@@ -47,17 +46,16 @@ use super::encoding::{
 };
 use super::exact_derived::CollectionRealizationError;
 use super::operation_snapshot::OperationFrontier;
-use super::records::{collection_read_policy, collection_write_policy};
 use super::simplearchive_union::{FactViewError, PreparedCollectionCommit};
 use super::{
     collection_complete_physical_cover, descriptor, discover_collection_records_authorized,
-    resolve_collection_semantics_from_roots, Collection, CollectionClaimValidation,
-    CollectionCommit, CollectionData, CollectionDiscoveryError, CollectionEncoding,
-    CollectionFunctionalConflict, CollectionHandle, CollectionOperationError, CollectionRead,
-    CollectionRecord, CollectionRecordSelector, CollectionResolutionError, CollectionSemantics,
-    CollectionSnapshot, CollectionStore, CollectionTypeError, CollectionValidationRequest,
-    DiscoveredCollectionRecords, RecordDecodeError, TryFromCover, TryFromCoverError, ACTION_READ,
-    ACTION_WRITE,
+    read_capability, resolve_collection_semantics_from_roots, write_capability, Collection,
+    CollectionClaimValidation, CollectionCommit, CollectionData, CollectionDiscoveryError,
+    CollectionEncoding, CollectionFunctionalConflict, CollectionHandle, CollectionOperationError,
+    CollectionRead, CollectionRecord, CollectionRecordSelector, CollectionResolutionError,
+    CollectionSemantics, CollectionSnapshot, CollectionStore, CollectionTypeError,
+    CollectionValidationRequest, DiscoveredCollectionRecords, RecordDecodeError, TryFromCover,
+    TryFromCoverError,
 };
 use super::{
     AdmissionPolicy, CanonicalDerivation, CollectionDerivation, CollectionMapping, CollectionPolicy,
@@ -205,14 +203,14 @@ pub enum CollectionGrantError<SnapshotError, GetError, InsertError> {
     /// The collection action is already open and therefore needs no proof.
     OpenPolicy {
         /// Exact action whose policy is open.
-        action: Id,
+        capability: CapabilityHandle,
         /// Exact collection whose action policy is open.
         collection: CollectionHandle,
     },
     /// The supplied signing key is not one of this collection action's roots.
     RootNotAuthorized {
         /// Exact action whose policy rejected the signer.
-        action: Id,
+        capability: CapabilityHandle,
         /// Exact collection whose policy rejected the signer.
         collection: CollectionHandle,
         /// Public half of the supplied root signing key.
@@ -235,21 +233,24 @@ where
                 write!(formatter, "failed to freeze store snapshot: {source}")
             }
             Self::Descriptor(source) => source.fmt(formatter),
-            Self::OpenPolicy { action, collection } => write!(
+            Self::OpenPolicy {
+                capability,
+                collection,
+            } => write!(
                 formatter,
                 "collection {} has an open {} policy; no proof is required",
                 hex::encode_upper(collection.raw),
-                collection_action_label(*action),
+                collection_capability_label(*capability),
             ),
             Self::RootNotAuthorized {
-                action,
+                capability,
                 collection,
                 root,
             } => write!(
                 formatter,
                 "key {} is not a {} root of collection {}",
                 hex::encode_upper(root.to_bytes()),
-                collection_action_label(*action),
+                collection_capability_label(*capability),
                 hex::encode_upper(collection.raw),
             ),
             Self::ProofInsert(source) => {
@@ -284,11 +285,13 @@ pub type CollectionReadGrantError<SnapshotError, GetError, InsertError> =
 pub type CollectionWriteGrantError<SnapshotError, GetError, InsertError> =
     CollectionGrantError<SnapshotError, GetError, InsertError>;
 
-fn collection_action_label(action: Id) -> &'static str {
-    match action {
-        ACTION_READ => "READ",
-        ACTION_WRITE => "WRITE",
-        _ => "unknown collection action",
+fn collection_capability_label(capability: CapabilityHandle) -> String {
+    if capability == read_capability() {
+        "READ".to_owned()
+    } else if capability == write_capability() {
+        "WRITE".to_owned()
+    } else {
+        hex::encode_upper(capability.raw)
     }
 }
 
@@ -306,7 +309,10 @@ pub enum CollectionAdmissionError<ProofsError, GetError> {
     Evidence(CollectionEvidenceDiscoveryError<ProofsError>),
 }
 
-/// The READ audience derivable from one collection policy and proof snapshot.
+/// The Invoke audience derivable for one capability and proof snapshot.
+///
+/// The existing name remains the READ convenience surface; generic consumers
+/// receive the same explicit finite-or-open result.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CollectionReadAudience {
     /// Every principal is admitted; no finite principal list is complete.
@@ -1069,7 +1075,7 @@ impl AdmissionEvidence {
 
 pub(crate) fn admission_evidence_from_proofs(
     policy: &AdmissionPolicy,
-    action: crate::id::Id,
+    capability: CapabilityHandle,
     required: CapabilityMode,
     collection: CollectionHandle,
     proofs: Arc<[CapabilityProof]>,
@@ -1077,10 +1083,7 @@ pub(crate) fn admission_evidence_from_proofs(
     let AdmissionPolicy::Quorum(quorum) = policy else {
         return AdmissionEvidence::Open;
     };
-    let atom = CapabilityAtom::new(
-        CapabilityAction::new(action),
-        CapabilityResource::from(collection),
-    );
+    let atom = CapabilityAtom::new(capability, CapabilityResource::from(collection));
     let request = CapabilityRequest::new(atom, required);
     AdmissionEvidence::Quorum {
         roots: quorum.roots().to_vec(),
@@ -1094,7 +1097,7 @@ pub(crate) fn admission_evidence_from_proofs(
 fn discover_admission_evidence<S>(
     snapshot: &S,
     policies: impl IntoIterator<Item = AdmissionPolicy>,
-    action: crate::id::Id,
+    capability: CapabilityHandle,
     required: CapabilityMode,
     collection: CollectionHandle,
 ) -> Result<AdmissionEvidence, CollectionEvidenceDiscoveryError<S::ProofsError>>
@@ -1123,7 +1126,7 @@ where
             .map(|policy| {
                 admission_evidence_from_proofs(
                     policy,
-                    action,
+                    capability,
                     required,
                     collection,
                     Arc::clone(&proofs),
@@ -1148,12 +1151,8 @@ where
         .map_err(CollectionCoverError::Descriptor)?;
     let evidence = discover_admission_evidence(
         snapshot,
-        descriptor::admission_policies(
-            loaded.fragment.facts(),
-            &collection_write_policy,
-            Some(L::id()),
-        ),
-        ACTION_WRITE,
+        descriptor::admission_policies(loaded.fragment.facts(), write_capability(), Some(L::id())),
+        write_capability(),
         CapabilityMode::Invoke,
         collection.handle(),
     )
@@ -1203,7 +1202,7 @@ where
     S: SnapshotSource + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
-    grant_collection_action(store, collection, root, recipient, ACTION_READ)
+    grant_collection_capability(store, collection, read_capability(), root, recipient)
 }
 
 /// Persist one deterministic root-issued WRITE/Invoke proof for `recipient`.
@@ -1230,15 +1229,20 @@ where
     S: SnapshotSource + CapabilityProofStore,
     <S as SnapshotSource>::Snapshot: BlobStoreGet,
 {
-    grant_collection_action(store, collection, root, recipient, ACTION_WRITE)
+    grant_collection_capability(store, collection, write_capability(), root, recipient)
 }
 
-fn grant_collection_action<S>(
+/// Persist one unbounded Invoke grant for an exact descriptor-local capability.
+///
+/// Only supported bindings for this exact handle nominate roots. Missing or
+/// unrelated bindings cannot lend authority; custom definition blobs are not
+/// fetched or interpreted while issuing the proof.
+pub fn grant_collection_capability<S>(
     store: &mut S,
     collection: CollectionHandle,
+    capability: CapabilityHandle,
     root: &SigningKey,
     recipient: VerifyingKey,
-    action: Id,
 ) -> Result<
     CapabilityProof,
     CollectionGrantError<
@@ -1254,21 +1258,25 @@ where
     let snapshot = store.snapshot().map_err(CollectionGrantError::Snapshot)?;
     let descriptor = load_collection_descriptor(&snapshot, collection)
         .map_err(CollectionGrantError::Descriptor)?;
-    let policy = descriptor::policy(descriptor.fragment.facts()).map_err(|source| {
-        CollectionGrantError::Descriptor(CollectionDescriptorError::Invalid { collection, source })
-    })?;
-    let policy = match action {
-        ACTION_READ => policy.read(),
-        ACTION_WRITE => policy.write(),
-        _ => unreachable!("grant wrappers only supply collection actions"),
-    };
-    let roots = policy
-        .roots()
-        .ok_or(CollectionGrantError::OpenPolicy { action, collection })?;
+    let policies: Vec<_> =
+        descriptor::admission_policies(descriptor.fragment.facts(), capability, None).collect();
+    if policies
+        .iter()
+        .any(|policy| matches!(policy, AdmissionPolicy::Open))
+    {
+        return Err(CollectionGrantError::OpenPolicy {
+            capability,
+            collection,
+        });
+    }
     let root_key = root.verifying_key();
-    if !roots.contains(&root_key) {
+    if !policies.iter().any(|policy| {
+        policy
+            .roots()
+            .is_some_and(|roots| roots.contains(&root_key))
+    }) {
         return Err(CollectionGrantError::RootNotAuthorized {
-            action,
+            capability,
             collection,
             root: root_key,
         });
@@ -1278,7 +1286,7 @@ where
     let proof = CapabilityProof::issue_root(
         root,
         CapabilityResource::from(collection),
-        Capability::new(CapabilityAction::new(action), CapabilityMode::Invoke),
+        Capability::new(capability, CapabilityMode::Invoke),
         None,
         recipient,
     );
@@ -1305,18 +1313,16 @@ where
     S: StoreSnapshot + BlobStoreGet,
 {
     let loaded = load_collection_descriptor(snapshot, collection)?;
-    let admitted =
-        descriptor::admission_policies(loaded.fragment.facts(), &collection_read_policy, None).any(
-            |policy| {
-                collection_reader_is_admitted_by_policy_at(
-                    collection,
-                    &policy,
-                    subject,
-                    proofs,
-                    snapshot.instant(),
-                )
-            },
-        );
+    let admitted = descriptor::admission_policies(loaded.fragment.facts(), read_capability(), None)
+        .any(|policy| {
+            collection_reader_is_admitted_by_policy_at(
+                collection,
+                &policy,
+                subject,
+                proofs,
+                snapshot.instant(),
+            )
+        });
     Ok(admitted)
 }
 
@@ -1334,7 +1340,7 @@ pub fn collection_reader_is_admitted_by_policy_at(
 ) -> bool {
     let evidence = admission_evidence_from_proofs(
         policy,
-        ACTION_READ,
+        read_capability(),
         CapabilityMode::Invoke,
         collection,
         proofs.to_vec().into(),
@@ -1358,7 +1364,7 @@ pub fn collection_read_audience_by_policy_at(
 ) -> CollectionReadAudience {
     admission_evidence_from_proofs(
         policy,
-        ACTION_READ,
+        read_capability(),
         CapabilityMode::Invoke,
         collection,
         proofs.to_vec().into(),
@@ -1377,12 +1383,27 @@ pub fn collection_read_audience<S>(
 where
     S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
 {
+    collection_capability_audience(snapshot, collection, read_capability())
+}
+
+/// Discover the finite Invoke audience for one exact capability handle.
+///
+/// This generic collection-resource seam is also used by consumers such as
+/// key delivery. It never substitutes READ or WRITE for an absent binding.
+pub fn collection_capability_audience<S>(
+    snapshot: &S,
+    collection: CollectionHandle,
+    capability: CapabilityHandle,
+) -> Result<CollectionReadAudience, CollectionAdmissionError<S::ProofsError, S::GetError<Infallible>>>
+where
+    S: StoreSnapshot + BlobStoreGet + CapabilityProofRead,
+{
     let loaded = load_collection_descriptor(snapshot, collection)
         .map_err(CollectionAdmissionError::Descriptor)?;
     let evidence = discover_admission_evidence(
         snapshot,
-        descriptor::admission_policies(loaded.fragment.facts(), &collection_read_policy, None),
-        ACTION_READ,
+        descriptor::admission_policies(loaded.fragment.facts(), capability, None),
+        capability,
         CapabilityMode::Invoke,
         collection,
     )
@@ -1405,7 +1426,7 @@ pub fn collection_writer_is_admitted_by_policy_at(
 ) -> bool {
     let evidence = admission_evidence_from_proofs(
         policy,
-        ACTION_WRITE,
+        write_capability(),
         CapabilityMode::Invoke,
         collection,
         proofs.to_vec().into(),
@@ -1485,10 +1506,10 @@ impl<L: CollectionEncoding> Collection<L> {
             snapshot,
             descriptor::admission_policies(
                 loaded.fragment.facts(),
-                &collection_write_policy,
+                write_capability(),
                 Some(L::id()),
             ),
-            ACTION_WRITE,
+            write_capability(),
             CapabilityMode::Invoke,
             self.handle(),
         )
@@ -1515,10 +1536,10 @@ impl<L: CollectionEncoding> Collection<L> {
             snapshot,
             descriptor::admission_policies(
                 loaded.fragment.facts(),
-                &collection_read_policy,
+                read_capability(),
                 Some(L::id()),
             ),
-            ACTION_READ,
+            read_capability(),
             CapabilityMode::Invoke,
             self.handle(),
         )
@@ -1545,7 +1566,7 @@ impl<L: CollectionEncoding> Collection<L> {
         let loaded = load_collection_descriptor(snapshot, self.handle())?;
         let admitted = descriptor::admission_policies(
             loaded.fragment.facts(),
-            &collection_read_policy,
+            read_capability(),
             Some(L::id()),
         )
         .any(|policy| {
@@ -1726,10 +1747,10 @@ where
         &bounded,
         descriptor::admission_policies(
             descriptor.fragment.facts(),
-            &collection_write_policy,
+            write_capability(),
             Some(SimpleArchive::id()),
         ),
-        ACTION_WRITE,
+        write_capability(),
         CapabilityMode::Invoke,
         foundation.handle(),
     )

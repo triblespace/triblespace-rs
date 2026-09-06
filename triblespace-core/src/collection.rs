@@ -6,7 +6,10 @@
 //! test-only: it exercises algebraic laws rather than serving as another
 //! runtime implementation.
 
+use crate::blob::{encodings::simplearchive::SimpleArchive, IntoBlob};
+use crate::capability::CapabilityHandle;
 use crate::id::{id_hex, Id};
+use std::sync::OnceLock;
 
 /// The exact action required to contribute a signed commit to a collection.
 ///
@@ -19,6 +22,22 @@ pub const ACTION_WRITE: Id = id_hex!("66B660A5481E04E552A1FA96AA9ECC48");
 /// Minted with `trible genid` on 2026-08-30. Capability policies pair this
 /// stable action with one exact collection descriptor handle.
 pub const ACTION_READ: Id = id_hex!("76583A671BBD61A6A8E66405DE75873F");
+
+/// Exact definition handle of collection READ; descriptor builders attach it.
+pub fn read_capability() -> CapabilityHandle {
+    static HANDLE: OnceLock<CapabilityHandle> = OnceLock::new();
+    *HANDLE.get_or_init(|| {
+        IntoBlob::<SimpleArchive>::to_blob(policy::read_definition().facts().clone()).get_handle()
+    })
+}
+
+/// Exact definition handle of collection WRITE; descriptor builders attach it.
+pub fn write_capability() -> CapabilityHandle {
+    static HANDLE: OnceLock<CapabilityHandle> = OnceLock::new();
+    *HANDLE.get_or_init(|| {
+        IntoBlob::<SimpleArchive>::to_blob(policy::write_definition().facts().clone()).get_handle()
+    })
+}
 
 /// Narrow write facade for a scoped fact collection.
 pub mod api;

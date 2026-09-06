@@ -10,14 +10,13 @@ use triblespace_core::blob::encodings::succinctarchive::{
 };
 use triblespace_core::blob::{Blob, IntoBlob};
 use triblespace_core::capability::{
-    Capability, CapabilityAction, CapabilityMode, CapabilityProof, CapabilityResource,
-    CapabilityValidity,
+    Capability, CapabilityMode, CapabilityProof, CapabilityResource, CapabilityValidity,
 };
 use triblespace_core::collection::succinctarchive_union;
 use triblespace_core::collection::{
     AdmissionPolicy, CollectionCommit, CollectionDerive, CollectionMerge, CollectionPolicy,
     CollectionRead, CollectionRealizationError, CollectionRecord, CollectionSnapshotExt,
-    CollectionStore, CollectionStoreExt, ACTION_WRITE,
+    CollectionStore, CollectionStoreExt,
 };
 use triblespace_core::inline::encodings::hash::Handle;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
@@ -36,8 +35,11 @@ fn one_fact(seed: u8) -> TribleSet {
     facts
 }
 
-fn write_capability() -> Capability {
-    Capability::new(CapabilityAction::new(ACTION_WRITE), CapabilityMode::Invoke)
+fn write_grant() -> Capability {
+    Capability::new(
+        triblespace_core::collection::write_capability(),
+        CapabilityMode::Invoke,
+    )
 }
 
 #[test]
@@ -653,7 +655,7 @@ fn collection_uses_its_snapshots_frozen_authorization_instant() {
         .insert_proof(CapabilityProof::issue_root(
             &authority,
             CapabilityResource::from(collection.handle()),
-            write_capability(),
+            write_grant(),
             Some(validity),
             writer.verifying_key(),
         ))
@@ -804,7 +806,7 @@ fn self_contained_capability_proof_activates_commit_without_blob_closure() {
     let proof = CapabilityProof::issue_root(
         &root,
         CapabilityResource::from(collection.handle()),
-        write_capability(),
+        write_grant(),
         None,
         writer.verifying_key(),
     );

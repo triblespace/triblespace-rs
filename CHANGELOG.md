@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Store resource authorization as descriptor-local capability-handle bindings
+  to Open or independent-root quorum policies. Collection READ/WRITE remain
+  construction conveniences over stable SimpleArchive definition blobs; custom
+  definitions share exact-handle grant and audience APIs without borrowing
+  READ/WRITE authority. Preserve definition attachments and raw custom binding
+  facts, and keep ordinary admission query-shaped. New attribute anchors minted
+  with installed `trible genid` on 2026-09-06:
+  `D6065F21923709C72144866C05F74B46` (resource_policy) and
+  `2949050AA6092F5689EA7EAA52700CE9` (capability_handle).
 - Store capability proofs as shared owning byte views. Pile replay validates
   canonical framing once and retains mmap-backed proof values in its existing
   PATCH index; snapshots, exact lookups, and iteration clone those values without

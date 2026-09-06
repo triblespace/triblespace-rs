@@ -12,7 +12,7 @@
 //! instance instead. Mapping parameters hang from that mapping entity, not
 //! from the collection descriptor, so the conversion remains independently
 //! identifiable and queryable. Both kinds carry independent, self-contained
-//! READ and WRITE policy fragments. Each action is either open or governed by
+//! capability policy bindings. Each capability is either open or governed by
 //! a quorum over its own canonical root set; there is no privileged collection
 //! owner or shared anchor. Policy is never inferred by walking the source
 //! chain. Readers query the facts they need; unrelated fields and retired
@@ -24,17 +24,19 @@
 
 use itertools::Itertools;
 
-use crate::attribute::Attribute;
 use crate::blob::encodings::simplearchive::SimpleArchive;
 use crate::blob::encodings::utf8string::UTF8String;
 use crate::blob::encodings::UnknownBlob;
 use crate::blob::Blob;
+use crate::capability::policy::{capability_handle, resource_policies, resource_policy};
+use crate::capability::CapabilityHandle;
 use crate::id::Id;
 use crate::inline::encodings::genid::GenId;
 use crate::inline::encodings::hash::Handle;
+use crate::inline::encodings::UnknownInline;
 use crate::inline::{Inline, IntoInline, RawInline};
 use crate::metadata::{self, MetaDescribe};
-use crate::prelude::{and, entity, exists, find, or, pattern};
+use crate::prelude::{and, entity, find, or, pattern};
 use crate::query::TriblePattern;
 use crate::repo::{BlobStorePut, SnapshotSource};
 use crate::trible::{Fragment, TribleSet};
@@ -44,11 +46,11 @@ use super::policy::{
 };
 use super::records::{
     admission_delegate_threshold, admission_invoke_threshold, admission_policy_root,
-    collection_mapping, collection_name, collection_read_policy, collection_representation,
-    collection_source, collection_write_policy, mapping_algorithm as mapping_algorithm_attribute,
-    CollectionHandle, RecordDecodeError, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
+    collection_mapping, collection_name, collection_representation, collection_source,
+    mapping_algorithm as mapping_algorithm_attribute, CollectionHandle, RecordDecodeError,
+    KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING,
 };
-use super::{CollectionEncoding, CollectionMapping};
+use super::{read_capability, write_capability, CollectionEncoding, CollectionMapping};
 
 /// Store one descriptor archive and every blob carried by its self-contained
 /// Fragment, returning the canonical descriptor handle.
@@ -98,8 +100,7 @@ where
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_name: name.to_owned(),
-        collection_read_policy*: policy.read().fragment(),
-        collection_write_policy*: policy.write().fragment(),
+        resource_policy*: policy.fragment(),
         collection_representation*: <E as MetaDescribe>::describe(),
     }
 }
@@ -124,8 +125,7 @@ where
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_source: source,
-        collection_read_policy*: policy.read().fragment(),
-        collection_write_policy*: policy.write().fragment(),
+        resource_policy*: policy.fragment(),
         collection_representation*: <M::Target as MetaDescribe>::describe(),
         collection_mapping*: mapping.fragment(),
     }
@@ -239,91 +239,102 @@ pub fn name(facts: &TribleSet) -> Result<Option<Inline<Handle<UTF8String>>>, Rec
     )
 }
 
-/// Immutable capability policy declared by this descriptor.
+/// Explicit scalar READ/WRITE policy inspection, retaining all binding facts.
 ///
-/// This singular accessor still requires both links to be single-valued.
-/// Only facts on the descriptor and the linked policy entities participate;
-/// fields on embedded descriptions cannot supply or invalidate a policy.
-/// Unknown kinds and invalid quorum geometry never imply open admission.
+/// Ordinary admission does not reconstruct this producer. This diagnostic
+/// requires one descriptor and one binding for each standard capability; its
+/// generic binding Fragment also retains custom and unknown policy facts.
 pub fn policy(facts: &TribleSet) -> Result<CollectionPolicy, RecordDecodeError> {
     let descriptor = entity(facts)?;
     let read = exactly_one(
         find!(
-            read: Id,
-            pattern!(facts, [{ descriptor @ collection_read_policy: ?read }])
+            binding: Id,
+            pattern!(facts, [
+                { descriptor @ resource_policy: ?binding },
+                { ?binding @ capability_handle: read_capability() },
+            ])
         ),
-        "collection_read_policy",
+        "collection READ capability policy",
     )?;
     let write = exactly_one(
         find!(
-            write: Id,
-            pattern!(facts, [{ descriptor @ collection_write_policy: ?write }])
+            binding: Id,
+            pattern!(facts, [
+                { descriptor @ resource_policy: ?binding },
+                { ?binding @ capability_handle: write_capability() },
+            ])
         ),
-        "collection_write_policy",
+        "collection WRITE capability policy",
     )?;
-    Ok(CollectionPolicy::new(
+    let exports: Vec<_> = find!(
+        binding: Id,
+        pattern!(facts, [{ descriptor @ resource_policy: ?binding }])
+    )
+    .collect();
+    let binding_facts: TribleSet = find!(
+        (binding: Id, attribute: Id, value: Inline<UnknownInline>),
+        pattern!(facts, [
+            { descriptor @ resource_policy: ?binding },
+            { ?binding @ ?attribute: ?value },
+        ])
+    )
+    .map(|(binding, attribute, value)| crate::trible::Trible::force(&binding, &attribute, &value))
+    .collect();
+    Ok(CollectionPolicy::from_bindings(
         decode_admission_policy(facts, read)?,
         decode_admission_policy(facts, write)?,
+        Fragment::new(exports, binding_facts),
     ))
 }
 
-/// Query the supported policy alternatives for one descriptor-local action.
+/// Query every supported capability-policy interpretation of a descriptor.
 ///
-/// `policy_attribute` is normally [`collection_read_policy`] or
-/// [`collection_write_policy`]. A typed consumer supplies its representation;
-/// that fact and the policy link must belong to the same tagged descriptor
-/// entity. A representation-neutral consumer supplies `None`.
+/// A typed consumer supplies its representation; that encoding and the
+/// resource-policy link must belong to the same tagged descriptor entity.
+/// Representation-neutral consumers supply `None`. Definitions are not
+/// fetched or interpreted here: each exact handle remains an opaque key.
+pub fn capability_policies<'a>(
+    facts: &'a TribleSet,
+    representation: Option<Id>,
+) -> impl Iterator<Item = (CapabilityHandle, AdmissionPolicy)> + 'a {
+    descriptor_entities(facts, representation)
+        .flat_map(move |descriptor| resource_policies(facts, descriptor, None))
+}
+
+/// Query supported policies for one exact descriptor-local capability.
 ///
 /// Every recognized alternative contributes independently. Unknown kinds,
-/// undecodable values, and unsupported quorum thresholds contribute no row;
-/// absence never supplies an open policy. Legacy delegation thresholds do not
-/// govern admission: each signed proof path carries its own delegation mode.
-/// The singular [`policy`] accessor remains available for explicit inspection.
+/// undecodable values, and unsupported thresholds supply no row; absence
+/// never supplies Open. Modes and time restrictions remain in proof records.
 pub fn admission_policies<'a>(
     facts: &'a TribleSet,
-    policy_attribute: &'a Attribute<GenId>,
+    capability: CapabilityHandle,
     representation: Option<Id>,
 ) -> impl Iterator<Item = AdmissionPolicy> + 'a {
-    let policies: Box<dyn Iterator<Item = Id> + 'a> = match representation {
+    descriptor_entities(facts, representation)
+        .flat_map(move |descriptor| resource_policies(facts, descriptor, Some(capability)))
+        .map(|(_, policy)| policy)
+}
+
+fn descriptor_entities<'a>(
+    facts: &'a TribleSet,
+    representation: Option<Id>,
+) -> Box<dyn Iterator<Item = Id> + 'a> {
+    match representation {
         Some(representation) => Box::new(find!(
-            policy: Id,
-            pattern!(facts, [{ _?descriptor @
+            descriptor: Id,
+            pattern!(facts, [{ ?descriptor @
                 metadata::tag: KIND_COLLECTION_DESCRIPTOR,
                 collection_representation: representation,
-                policy_attribute: ?policy,
             }])
         )),
         None => Box::new(find!(
-            policy: Id,
-            pattern!(facts, [{ _?descriptor @
+            descriptor: Id,
+            pattern!(facts, [{ ?descriptor @
                 metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-                policy_attribute: ?policy,
             }])
         )),
-    };
-    policies.flat_map(move |policy| {
-        let open = exists!(pattern!(facts, [{ policy @
-            metadata::tag: KIND_ADMISSION_POLICY_OPEN,
-        }]))
-        .then_some(AdmissionPolicy::Open);
-        let roots: Vec<_> = find!(
-            root: ed25519_dalek::VerifyingKey,
-            pattern!(facts, [{ policy @ admission_policy_root: ?root }])
-        )
-        .filter(crate::capability::is_valid_capability_principal)
-        .collect();
-        let quorums = find!(
-            invoke: u32,
-            pattern!(facts, [{ policy @
-                metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
-                admission_invoke_threshold: ?invoke,
-            }])
-        )
-        .filter_map(move |invoke| {
-            AdmissionPolicy::quorum(roots.iter().copied(), invoke, None).ok()
-        });
-        open.into_iter().chain(quorums)
-    })
+    }
 }
 
 fn decode_admission_policy(
@@ -456,8 +467,7 @@ pub(crate) fn named_for_tests(name: &str, representation: Id) -> Fragment {
     entity! {
         metadata::tag: KIND_COLLECTION_DESCRIPTOR,
         collection_name: name.to_owned(),
-        collection_read_policy*: AdmissionPolicy::direct(root).fragment(),
-        collection_write_policy*: AdmissionPolicy::direct(root).fragment(),
+        resource_policy*: CollectionPolicy::new(AdmissionPolicy::direct(root), AdmissionPolicy::direct(root)).fragment(),
         collection_representation: representation,
     }
 }
@@ -535,23 +545,26 @@ mod policy_tests {
     fn missing_policy_link_fails_closed() {
         let fragment = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_write_policy*: AdmissionPolicy::direct(key(6)).fragment(),
+            resource_policy*: AdmissionPolicy::direct(key(6)).binding(write_capability()),
         };
         assert_eq!(
             policy(fragment.facts()),
-            Err(RecordDecodeError::MissingField("collection_read_policy"))
+            Err(RecordDecodeError::MissingField(
+                "collection READ capability policy"
+            ))
         );
     }
 
     #[test]
     fn unknown_policy_kind_fails_closed() {
         let unknown = entity! {
+            capability_handle: read_capability(),
             metadata::tag: crate::id::id_hex!("44444444444444444444444444444444"),
         };
         let fragment = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: unknown,
-            collection_write_policy*: AdmissionPolicy::direct(key(7)).fragment(),
+            resource_policy*: unknown,
+            resource_policy*: AdmissionPolicy::direct(key(7)).binding(write_capability()),
         };
         assert_eq!(
             policy(fragment.facts()),
@@ -571,19 +584,17 @@ mod policy_tests {
             ),
         );
         let descriptor = fragment.root().expect("descriptor root");
-        let second: Inline<GenId> = AdmissionPolicy::Open
-            .fragment()
-            .root()
-            .expect("open policy root")
-            .to_inline();
-        fragment.facts_mut().insert(&Trible::force(
-            &descriptor,
-            &collection_read_policy.id(),
-            &second,
-        ));
+        let second_binding = AdmissionPolicy::Open.binding(read_capability());
+        let second: Inline<GenId> = second_binding.root().expect("open policy root").to_inline();
+        fragment += second_binding;
+        fragment
+            .facts_mut()
+            .insert(&Trible::force(&descriptor, &resource_policy.id(), &second));
         assert_eq!(
             policy(fragment.facts()),
-            Err(RecordDecodeError::RepeatedField("collection_read_policy"))
+            Err(RecordDecodeError::RepeatedField(
+                "collection READ capability policy"
+            ))
         );
     }
 
@@ -594,12 +605,14 @@ mod policy_tests {
         let subject = crate::id::rngid();
         let mut fragment = entity! { &subject @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: entity! { &read @
+            resource_policy*: entity! { &read @
+                capability_handle: read_capability(),
                 metadata::tag*: [KIND_ADMISSION_POLICY_OPEN, metadata::KIND_BLOB_ENCODING],
                 admission_policy_root: key(9),
                 admission_invoke_threshold: 0_u32,
             },
-            collection_write_policy*: entity! { &write @
+            resource_policy*: entity! { &write @
+                capability_handle: write_capability(),
                 metadata::tag*: [KIND_ADMISSION_POLICY_QUORUM, metadata::KIND_BLOB_ENCODING],
                 admission_policy_root: key(9),
                 admission_invoke_threshold: 1_u32,
@@ -608,30 +621,35 @@ mod policy_tests {
         // An embedded description may use the same attributes. It is not a
         // second policy link on this descriptor.
         fragment += entity! {
-            collection_read_policy*: AdmissionPolicy::direct(key(10)).fragment(),
-            collection_write_policy*: AdmissionPolicy::Open.fragment(),
+            resource_policy*: AdmissionPolicy::direct(key(10)).binding(read_capability()),
+            resource_policy*: AdmissionPolicy::Open.binding(write_capability()),
         };
-        assert_eq!(
-            policy(fragment.facts()),
-            Ok(CollectionPolicy::new(
-                AdmissionPolicy::Open,
-                AdmissionPolicy::direct(key(9))
-            ))
-        );
+        let decoded = policy(fragment.facts()).unwrap();
+        assert_eq!(decoded.read(), &AdmissionPolicy::Open);
+        assert_eq!(decoded.write(), &AdmissionPolicy::direct(key(9)));
+        let root_inline: Inline<crate::inline::encodings::ed25519::ED25519PublicKey> =
+            key(9).to_inline();
+        assert!(decoded.fragment().facts().contains(&Trible::force(
+            &read.id,
+            &admission_policy_root.id(),
+            &root_inline
+        )));
     }
 
     #[test]
     fn policy_does_not_borrow_a_missing_link_from_another_entity() {
         let mut fragment = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_write_policy*: AdmissionPolicy::direct(key(9)).fragment(),
+            resource_policy*: AdmissionPolicy::direct(key(9)).binding(write_capability()),
         };
         fragment += entity! {
-            collection_read_policy*: AdmissionPolicy::Open.fragment(),
+            resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
         };
         assert_eq!(
             policy(fragment.facts()),
-            Err(RecordDecodeError::MissingField("collection_read_policy"))
+            Err(RecordDecodeError::MissingField(
+                "collection READ capability policy"
+            ))
         );
     }
 
@@ -643,13 +661,16 @@ mod policy_tests {
         let subject = fragment.root().unwrap();
         let write = find!(
             write: Id,
-            pattern!(fragment.facts(), [{ subject @ collection_write_policy: ?write }])
+            pattern!(fragment.facts(), [
+                { subject @ resource_policy: ?write },
+                { ?write @ capability_handle: write_capability() },
+            ])
         )
         .next()
         .unwrap();
         fragment.facts_mut().insert(&Trible::force(
             &subject,
-            &collection_read_policy.id(),
+            &resource_policy.id(),
             &Inline::<GenId>::new([0xFF; 32]),
         ));
         fragment.facts_mut().insert(&Trible::force(
@@ -657,13 +678,16 @@ mod policy_tests {
             &admission_invoke_threshold.id(),
             &Inline::<crate::inline::encodings::iu256::U256>::new([0xFF; 32]),
         ));
-        assert_eq!(policy(fragment.facts()), Ok(expected));
+        let decoded = policy(fragment.facts()).unwrap();
+        assert_eq!(decoded.read(), expected.read());
+        assert_eq!(decoded.write(), expected.write());
 
         // Filtering is not a fallback to Open when no threshold decodes.
         let unreadable = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
-            collection_read_policy*: AdmissionPolicy::Open.fragment(),
-            collection_write_policy*: entity! {
+            resource_policy*: AdmissionPolicy::Open.binding(read_capability()),
+            resource_policy*: entity! {
+                capability_handle: write_capability(),
                 metadata::tag: KIND_ADMISSION_POLICY_QUORUM,
                 admission_policy_root: key(9),
                 admission_invoke_threshold:
@@ -687,7 +711,8 @@ mod policy_tests {
         let mut fragment = entity! { &subject @
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_representation: representation,
-            collection_write_policy*: entity! { &policy @
+            resource_policy*: entity! { &policy @
+                capability_handle: write_capability(),
                 metadata::tag*: [KIND_ADMISSION_POLICY_QUORUM, unknown.id],
                 admission_policy_root: key(13),
                 admission_invoke_threshold*: [0_u32, 1_u32, 2_u32],
@@ -696,7 +721,7 @@ mod policy_tests {
             },
         };
         let invalid = Inline::<GenId>::new([0xFF; 32]);
-        for attribute in [collection_write_policy.id(), collection_representation.id()] {
+        for attribute in [resource_policy.id(), collection_representation.id()] {
             fragment
                 .facts_mut()
                 .insert(&Trible::force(&subject.id, &attribute, &invalid));
@@ -711,12 +736,9 @@ mod policy_tests {
             &admission_policy_root.id(),
             &Inline::<GenId>::new([0; 32]),
         ));
-        let policies: Vec<_> = admission_policies(
-            fragment.facts(),
-            &collection_write_policy,
-            Some(representation),
-        )
-        .collect();
+        let policies: Vec<_> =
+            admission_policies(fragment.facts(), write_capability(), Some(representation))
+                .collect();
         assert_eq!(policies, vec![AdmissionPolicy::direct(key(13))]);
     }
 
@@ -725,14 +747,15 @@ mod policy_tests {
         let fragment = entity! {
             metadata::tag: KIND_COLLECTION_DESCRIPTOR,
             collection_representation: <SimpleArchive as MetaDescribe>::id(),
-            collection_read_policy*: entity! {
+            resource_policy*: entity! {
+                capability_handle: read_capability(),
                 metadata::tag*: [KIND_ADMISSION_POLICY_OPEN, KIND_ADMISSION_POLICY_QUORUM],
                 admission_policy_root: key(14),
                 admission_invoke_threshold: 1_u32,
             },
         };
         let policies: Vec<_> =
-            admission_policies(fragment.facts(), &collection_read_policy, None).collect();
+            admission_policies(fragment.facts(), read_capability(), None).collect();
         assert_eq!(policies.len(), 2);
         assert!(policies.contains(&AdmissionPolicy::Open));
         assert!(policies.contains(&AdmissionPolicy::direct(key(14))));
