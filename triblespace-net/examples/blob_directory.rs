@@ -24,7 +24,7 @@ use anyhow::{Context, Result, anyhow, ensure};
 use iroh_base::{EndpointAddr, EndpointId, SecretKey};
 use tokio::time::timeout;
 use triblespace_core::repo::pile::Pile;
-use triblespace_core::repo::{BlobStoreList, SnapshotSource, StorageClose};
+use triblespace_core::repo::{BlobStoreList, SnapshotSource};
 use triblespace_net::host::PeerConfig;
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::protocol::{PILE_SYNC_ALPN, op_find_node, op_provider_get};
