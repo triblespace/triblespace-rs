@@ -31,6 +31,7 @@ use crate::capability::{
 use crate::id::Id;
 use crate::inline::encodings::hash::Handle;
 use crate::inline::{Inline, InlineEncoding};
+use crate::metadata::MetaDescribe;
 use crate::patch::{Blake3Merkle, IdentitySchema, PATCH};
 use crate::repo::async_store::AsyncBlobStoreAcquire;
 use crate::repo::{BlobStoreGet, BlobStoreList, BlobStoreMeta, BlobStorePut, CapabilityProofRead};
@@ -1304,7 +1305,7 @@ where
     S: StoreSnapshot + BlobStoreGet,
 {
     let loaded = load_collection_descriptor(snapshot, collection)?;
-    Ok(
+    let admitted =
         descriptor::admission_policies(loaded.fragment.facts(), &collection_read_policy, None).any(
             |policy| {
                 collection_reader_is_admitted_by_policy_at(
@@ -1315,8 +1316,8 @@ where
                     snapshot.instant(),
                 )
             },
-        ),
-    )
+        );
+    Ok(admitted)
 }
 
 /// Decide READ admission against one already validated collection policy.
@@ -1542,7 +1543,7 @@ impl<L: CollectionEncoding> Collection<L> {
         S: StoreSnapshot + BlobStoreGet,
     {
         let loaded = load_collection_descriptor(snapshot, self.handle())?;
-        Ok(descriptor::admission_policies(
+        let admitted = descriptor::admission_policies(
             loaded.fragment.facts(),
             &collection_read_policy,
             Some(L::id()),
@@ -1555,7 +1556,8 @@ impl<L: CollectionEncoding> Collection<L> {
                 proofs,
                 snapshot.instant(),
             )
-        }))
+        });
+        Ok(admitted)
     }
 
     /// Discover the exact payload cover admitted in this snapshot.
