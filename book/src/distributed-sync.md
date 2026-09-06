@@ -250,6 +250,20 @@ Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
 READ(C). Exact bytes are gated only by the endpoint-bound mutual proof of H.
 
+Foreground exact-H acquisition has one end-to-end deadline, normally ten
+seconds, including capability readiness, cold bootstrap dialing, DHT lookup,
+and bearer GET. Its three-second routing window begins with the first
+authenticated replica response, not before the cold bootstrap dial. This lets
+a healthy delayed bootstrap connect while a stalled secondary route cannot
+consume the whole remaining budget before GET. Background publication and
+collection recovery start their three-second lookup window immediately. A
+caller's shorter deadline still wins; progress does not reset either deadline,
+and no failed lookup starts an unbounded retry loop.
+Diagnostics distinguish a successful lookup with no advertised provider from
+failure to reach a replica, a provider transport/protocol failure, or exhaustion
+of the end-to-end budget. A directory miss is an observation, not proof that H
+does not exist. Diagnostics do not log the bearer handle.
+
 ## Lattice-aware sparse replication
 
 The network does not force every replica to mirror every blob. Collection

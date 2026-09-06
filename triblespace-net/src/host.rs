@@ -579,7 +579,22 @@ struct NetCap<T: Transport> {
 impl<T: Transport> NetCapability for NetCap<T> {
     fn fetch_blob(&self, hash: RawHash) -> futures::future::BoxFuture<'static, Option<Bytes>> {
         let client = self.client.clone();
-        Box::pin(async move { client.fetch_blob(hash).await })
+        Box::pin(async move {
+            match client.fetch_blob(hash, None).await {
+                Ok(Some(bytes)) => {
+                    debug!("exact blob fetch completed");
+                    Some(bytes)
+                }
+                Ok(None) => {
+                    debug!("responding DHT replicas or providers had no exact blob available");
+                    None
+                }
+                Err(error) => {
+                    debug!(%error, "exact blob fetch failed before availability could be established");
+                    None
+                }
+            }
+        })
     }
 }
 
@@ -650,12 +665,25 @@ impl NetSender {
     }
 
     pub async fn fetch_blob(&self, hash: RawHash, budget: std::time::Duration) -> Option<Bytes> {
-        tokio::time::timeout(budget, async {
-            self.ready_capability().await.ok()?.fetch_blob(hash).await
-        })
-        .await
-        .ok()
-        .flatten()
+        let fetch = async {
+            match self.ready_capability().await {
+                Ok(capability) => capability.fetch_blob(hash).await,
+                Err(error) => {
+                    debug!(%error, "exact blob fetch could not start");
+                    None
+                }
+            }
+        };
+        match tokio::time::timeout(budget, fetch).await {
+            Ok(bytes) => bytes,
+            Err(_) => {
+                debug!(
+                    ?budget,
+                    "exact blob fetch exhausted its end-to-end deadline"
+                );
+                None
+            }
+        }
     }
 }
 
@@ -764,6 +792,7 @@ pub(crate) fn start(
 }
 
 const DIAL_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+const BACKGROUND_LOOKUP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
 const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const REPAIR_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
@@ -1297,13 +1326,22 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                         let client = provider_client.clone();
                         let events = wiring.evt_tx.clone();
                         tokio::spawn(async move {
-                            if let Some(bytes) = client.fetch_blob(collection.raw).await {
-                                let mut batch = NetEventBatch::default();
-                                let _ = batch.try_push(NetEvent::Blob {
-                                    expected: collection.raw,
-                                    bytes,
-                                });
-                                let _ = events.send(batch).await;
+                            match client
+                                .fetch_blob(collection.raw, Some(BACKGROUND_LOOKUP_DEADLINE))
+                                .await
+                            {
+                                Ok(Some(bytes)) => {
+                                    let mut batch = NetEventBatch::default();
+                                    let _ = batch.try_push(NetEvent::Blob {
+                                        expected: collection.raw,
+                                        bytes,
+                                    });
+                                    let _ = events.send(batch).await;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    debug!(%error, "collection descriptor fetch failed");
+                                }
                             }
                         });
                     }
@@ -1347,8 +1385,13 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                                 collection_provider_key(collection),
                                 collection_provider_token,
                                 collection.raw,
+                                Some(BACKGROUND_LOOKUP_DEADLINE),
                             )
-                            .await;
+                            .await
+                            .unwrap_or_else(|error| {
+                                debug!(%error, "collection provider lookup failed");
+                                Vec::new()
+                            });
                         let _ = discovery_tx.send((collection, peers)).await;
                     });
                 } else if !has_candidate && !state.in_flight {
@@ -1523,47 +1566,65 @@ impl<T: Transport> ProviderClient<T> {
         }
     }
 
-    async fn lookup_replicas(&self, target: RoutingKey) -> Vec<PeerId> {
+    /// A foreground fetch's end-to-end deadline bounds cold bootstrap. Start
+    /// the short routing window only after an authenticated reply, so a slow
+    /// secondary route cannot consume all the remaining time for provider GET.
+    /// Background work starts its short lookup window immediately.
+    async fn lookup_replicas(
+        &self,
+        target: RoutingKey,
+        limit: Option<std::time::Duration>,
+    ) -> Vec<PeerId> {
         let seeds = self.candidates.lock().unwrap().closest(target, K);
         let mut lookup = IterativeLookup::new(self.my_id, target, seeds);
         let mut pending: FuturesUnordered<
             futures::future::BoxFuture<'_, (PeerId, anyhow::Result<Vec<PeerId>>)>,
         > = FuturesUnordered::new();
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            loop {
-                for peer in lookup.next_batch() {
-                    pending.push(Box::pin(async move {
-                        let reply = self.find_node(peer, target).await;
-                        (peer, reply)
-                    }));
-                }
-                let Some((peer, reply)) = pending.next().await else {
-                    break;
-                };
-                match reply {
-                    Ok(peers) => {
-                        let valid = peers
-                            .into_iter()
-                            .filter(|candidate| EndpointId::from_bytes(candidate).is_ok());
-                        lookup.record_authenticated_response(
-                            peer,
-                            valid,
-                            &mut self.candidates.lock().unwrap(),
-                        );
-                    }
+        let mut deadline = limit.map(|limit| tokio::time::Instant::now() + limit);
+        loop {
+            for peer in lookup.next_batch() {
+                pending.push(Box::pin(async move {
+                    let reply = self.find_node(peer, target).await;
+                    (peer, reply)
+                }));
+            }
+            let reply = match deadline {
+                Some(deadline) => match tokio::time::timeout_at(deadline, pending.next()).await {
+                    Ok(reply) => reply,
                     Err(_) => {
-                        lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
+                        debug!("DHT replica lookup routing window exhausted");
+                        break;
                     }
+                },
+                None => pending.next().await,
+            };
+            let Some((peer, reply)) = reply else {
+                break;
+            };
+            match reply {
+                Ok(peers) => {
+                    deadline.get_or_insert_with(|| {
+                        tokio::time::Instant::now() + BACKGROUND_LOOKUP_DEADLINE
+                    });
+                    let valid = peers
+                        .into_iter()
+                        .filter(|candidate| EndpointId::from_bytes(candidate).is_ok());
+                    lookup.record_authenticated_response(
+                        peer,
+                        valid,
+                        &mut self.candidates.lock().unwrap(),
+                    );
                 }
-                if lookup.is_finished() && pending.is_empty() {
-                    break;
+                Err(error) => {
+                    debug!(%error, "DHT replica lookup request failed");
+                    lookup.record_failure(peer, &mut self.candidates.lock().unwrap());
                 }
             }
-        })
-        .await;
-        if completed.is_err() {
-            drop(pending);
+            if lookup.is_finished() && pending.is_empty() {
+                break;
+            }
         }
+        drop(pending);
         let mut replicas = lookup.closest_authenticated_responders().to_vec();
         replicas.push(self.my_id);
         replicas.sort_unstable_by(|a, b| crate::routing::distance_cmp(target, *a, *b));
@@ -1610,7 +1671,9 @@ impl<T: Transport> ProviderClient<T> {
     }
 
     async fn announce_key(&self, key: ProviderKey, token: ProviderToken) -> PublicationResult {
-        let targets = self.lookup_replicas(key).await;
+        let targets = self
+            .lookup_replicas(key, Some(BACKGROUND_LOOKUP_DEADLINE))
+            .await;
         let mut attempts = futures::stream::iter(targets)
             .map(|peer| async move { (peer, self.put(peer, key, token).await) })
             .buffer_unordered(ALPHA);
@@ -1625,25 +1688,31 @@ impl<T: Transport> ProviderClient<T> {
         publication
     }
 
-    async fn get(&self, peer: PeerId, key: ProviderKey) -> Vec<(PeerId, ProviderToken)> {
+    async fn get(
+        &self,
+        peer: PeerId,
+        key: ProviderKey,
+    ) -> anyhow::Result<Vec<(PeerId, ProviderToken)>> {
         if peer == self.my_id {
-            return self
+            return Ok(self
                 .providers
                 .lock()
                 .unwrap()
-                .get(key, crate::clock::mono_now());
+                .get(key, crate::clock::mono_now()));
         }
-        let Ok(connection) = pool_get(&self.transport, &self.pool, peer).await else {
-            return Vec::new();
-        };
-        match tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &key)).await {
-            Ok(Ok(providers)) => {
+        let connection = pool_get(&self.transport, &self.pool, peer).await?;
+        let response = tokio::time::timeout(OP_DEADLINE, op_provider_get(connection.conn(), &key))
+            .await
+            .map_err(|_| anyhow::anyhow!("DHT provider query deadline exceeded"))
+            .and_then(|response| response);
+        match response {
+            Ok(providers) => {
                 self.candidates.lock().unwrap().promote_authenticated(peer);
-                providers
+                Ok(providers)
             }
-            Ok(Err(_)) | Err(_) => {
+            Err(error) => {
                 pool_invalidate(&self.pool, peer, &connection.entry);
-                Vec::new()
+                Err(error)
             }
         }
     }
@@ -1653,57 +1722,96 @@ impl<T: Transport> ProviderClient<T> {
         key: ProviderKey,
         token_for: fn([u8; 32], PeerId) -> ProviderToken,
         identity: [u8; 32],
-    ) -> Vec<PeerId> {
-        let replicas = self.lookup_replicas(key).await;
+        lookup_limit: Option<std::time::Duration>,
+    ) -> anyhow::Result<Vec<PeerId>> {
+        let replicas = self.lookup_replicas(key, lookup_limit).await;
         let mut replies = futures::stream::iter(replicas)
-            .map(|peer| async move { self.get(peer, key).await })
+            .map(|peer| async move { (peer, self.get(peer, key).await) })
             .buffer_unordered(ALPHA);
         let mut providers = Vec::new();
-        while let Some(reply) = replies.next().await {
+        let mut remote_responded = false;
+        let mut failure = None;
+        while let Some((peer, reply)) = replies.next().await {
+            let reply = match reply {
+                Ok(reply) => {
+                    remote_responded |= peer != self.my_id;
+                    reply
+                }
+                Err(error) => {
+                    failure.get_or_insert(error);
+                    continue;
+                }
+            };
             for (provider, token) in reply {
                 if token_for(identity, provider) == token {
                     providers.push(provider);
                 }
             }
         }
-        canonical_provider_subset(key, providers)
+        if providers.is_empty() {
+            if let Some(error) = failure {
+                return Err(error.context("DHT provider lookup incomplete"));
+            }
+            if !remote_responded {
+                anyhow::bail!("DHT provider lookup reached no remote replica");
+            }
+        }
+        Ok(canonical_provider_subset(key, providers))
     }
 
-    async fn fetch_from_providers(&self, hash: RawHash, providers: Vec<PeerId>) -> Option<Bytes> {
+    async fn fetch_from_providers(
+        &self,
+        hash: RawHash,
+        providers: Vec<PeerId>,
+    ) -> anyhow::Result<Option<Bytes>> {
         let mut attempts = futures::stream::iter(providers)
             .map(|peer| async move {
-                let connection = pool_get(&self.transport, &self.pool, peer).await.ok()?;
+                let connection = pool_get(&self.transport, &self.pool, peer).await?;
                 let response = tokio::time::timeout(
                     OP_DEADLINE,
                     op_get_blob(connection.conn(), self.my_id, &hash),
                 )
-                .await;
+                .await
+                .map_err(|_| anyhow::anyhow!("exact blob provider request deadline exceeded"))
+                .and_then(|response| response);
                 match response {
-                    Ok(Ok(Some(bytes))) => {
+                    Ok(Some(bytes)) => {
                         self.candidates.lock().unwrap().promote_authenticated(peer);
-                        Some(bytes)
+                        Ok(Some(bytes))
                     }
-                    Ok(Ok(None)) => None,
-                    Ok(Err(_)) | Err(_) => {
+                    Ok(None) => Ok(None),
+                    Err(error) => {
                         pool_invalidate(&self.pool, peer, &connection.entry);
-                        None
+                        Err(error)
                     }
                 }
             })
             .buffer_unordered(ALPHA);
+        let mut failure = None;
         while let Some(result) = attempts.next().await {
-            if result.is_some() {
-                return result;
+            match result {
+                Ok(Some(bytes)) => return Ok(Some(bytes)),
+                Ok(None) => {}
+                Err(error) => {
+                    failure.get_or_insert(error);
+                }
             }
         }
-        None
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(None),
+        }
     }
 
     /// Discover candidates only from H, then complete the H-only handshake.
-    async fn fetch_blob(&self, hash: RawHash) -> Option<Bytes> {
+    async fn fetch_blob(
+        &self,
+        hash: RawHash,
+        lookup_limit: Option<std::time::Duration>,
+    ) -> anyhow::Result<Option<Bytes>> {
         let providers = self
-            .find_key(blob_locator(hash), blob_provider_token, hash)
-            .await
+            .find_key(blob_locator(hash), blob_provider_token, hash, lookup_limit)
+            .await?
             .into_iter()
             .filter(|peer| *peer != self.my_id)
             .collect::<Vec<_>>();
@@ -1930,6 +2038,9 @@ fn op_name(op: u8) -> &'static str {
         _ => "UNKNOWN",
     }
 }
+
+#[cfg(all(test, feature = "sim"))]
+mod acquisition_tests;
 
 #[cfg(test)]
 mod tests {

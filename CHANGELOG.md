@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Let foreground exact-H DHT acquisition use its existing end-to-end deadline
+  instead of cancelling cold bootstrap connections at the background lookup's
+  three-second cap. Retain short background lookup bounds and distinguish
+  responsive provider misses from transport failures and deadline exhaustion
+  in diagnostics, without changing bearer authorization or creating WANTs.
 - Make the canonical PROOF magic the native Pile record kind itself. Records
   are generic framing followed directly by the prefix-signed proof; remove the
   nested length/reserved wrapper and separate inner magic. Fixed-width edges
