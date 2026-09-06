@@ -461,12 +461,6 @@ fn blob_occurrence_entry(offset: [u8; 8]) -> IndexEntry {
     )
 }
 
-#[derive(Debug, Clone, Copy)]
-struct CapabilityProofIndexEntry {
-    data_offset: usize,
-    data_len: usize,
-}
-
 mod blob_occurrence_key {
     crate::key_segmentation!(Segments, 40, [32, 8]);
     crate::key_schema!(Schema, Segments, 40, [0, 1]);
@@ -481,7 +475,7 @@ type PileBlobIndex = PATCH<40, blob_occurrence_key::Schema, CachedValidation, Xo
 type CollectionRecordIndex = PATCH<32, IdentitySchema, CollectionRecord, XorSip128>;
 type CollectionRecordCollectionIndex =
     PATCH<64, collection_record_collection_key::Schema, (), XorSip128>;
-type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProofIndexEntry, XorSip128>;
+type CapabilityProofIndex = PATCH<32, IdentitySchema, CapabilityProof, XorSip128>;
 type LegacyCollectionHeaderIndex = PATCH<V3_HEADER_LEN, IdentitySchema>;
 
 fn collection_record_collection(record: CollectionRecord) -> CollectionHandle {
@@ -1660,14 +1654,14 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                     content: PileRecordContent::RetiredCapabilityProofV1,
                 });
             }
-            let proof =
-                CapabilityProof::from_bytes(&bytes[prefix_len..data_end]).map_err(|_| corrupt())?;
+            let proof_bytes = &bytes[prefix_len..data_end];
+            CapabilityProof::validate_bytes(proof_bytes).map_err(|_| corrupt())?;
             let data_offset = offset.checked_add(prefix_len).ok_or_else(corrupt)?;
             Ok(PileRecord {
                 offset,
                 len,
                 content: PileRecordContent::CapabilityProof {
-                    id: proof.id(),
+                    id: Inline::new(Blake3::digest(proof_bytes)),
                     data_offset,
                     data_len,
                 },
@@ -2538,6 +2532,7 @@ pub struct Pile {
     /// Derived selector index keyed by `collection_handle || record_fingerprint`.
     collection_records_by_collection: CollectionRecordCollectionIndex,
     /// Complete canonical proofs keyed by the BLAKE3 identity of exact bytes.
+    /// Each value owns its validated mmap-backed view, shared by snapshots and readers.
     capability_proofs: CapabilityProofIndex,
     /// Exact byte-distinct legacy V3 collection headers accepted during replay.
     /// They remain inert but are conservatively carried through retained
@@ -3309,39 +3304,18 @@ impl Pile {
                 data_offset,
                 data_len,
             } => {
-                let candidate = CapabilityProofIndexEntry {
-                    data_offset,
-                    data_len,
+                // The decoder just validated this exact immutable body and its
+                // bounds. Retaining the mapping makes the proof independent of
+                // this Pile's lifetime and subsequent mapping replacements.
+                let bytes = unsafe {
+                    let body = slice_from_raw_parts(self.mmap.as_ptr().add(data_offset), data_len)
+                        .as_ref()
+                        .unwrap();
+                    Bytes::from_raw_parts(body, self.mmap.clone())
                 };
-                if let Some(existing) = self.capability_proofs.get(&id.raw).copied() {
-                    let existing_end = existing.data_offset.checked_add(existing.data_len).ok_or(
-                        ReadError::CorruptPile {
-                            valid_length: start_offset,
-                        },
-                    )?;
-                    let candidate_end =
-                        data_offset
-                            .checked_add(data_len)
-                            .ok_or(ReadError::CorruptPile {
-                                valid_length: start_offset,
-                            })?;
-                    let existing_bytes = unsafe {
-                        slice_from_raw_parts(
-                            self.mmap.as_ptr().add(existing.data_offset),
-                            existing_end - existing.data_offset,
-                        )
-                        .as_ref()
-                        .unwrap()
-                    };
-                    let candidate_bytes = unsafe {
-                        slice_from_raw_parts(
-                            self.mmap.as_ptr().add(data_offset),
-                            candidate_end - data_offset,
-                        )
-                        .as_ref()
-                        .unwrap()
-                    };
-                    if existing_bytes != candidate_bytes {
+                let candidate = CapabilityProof::from_validated_bytes(bytes);
+                if let Some(existing) = self.capability_proofs.get(&id.raw) {
+                    if existing != &candidate {
                         return Err(ReadError::CorruptPile {
                             valid_length: start_offset,
                         });
@@ -3651,13 +3625,7 @@ pub struct PileCollectionRecordIter {
 
 /// Deterministic owned snapshot of the pile's complete capability proofs.
 pub struct PileCapabilityProofIter {
-    mmap: Arc<MmapRaw>,
-    keys: crate::patch::PATCHIntoOrderedIterator<
-        32,
-        IdentitySchema,
-        CapabilityProofIndexEntry,
-        XorSip128,
-    >,
+    keys: crate::patch::PATCHIntoOrderedIterator<32, IdentitySchema, CapabilityProof, XorSip128>,
     lookup: CapabilityProofIndex,
 }
 
@@ -3666,22 +3634,11 @@ impl Iterator for PileCapabilityProofIter {
 
     fn next(&mut self) -> Option<Self::Item> {
         let key = self.keys.next()?;
-        let entry = *self
+        let proof = self
             .lookup
             .get(&key)
             .expect("proof key from PATCH snapshot must retain its value");
-        let body = unsafe {
-            slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
-                .as_ref()
-                .unwrap()
-        };
-        Some(CapabilityProof::from_bytes(body).map_err(|_| {
-            ReadError::CorruptPile {
-                valid_length: entry
-                    .data_offset
-                    .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
-            }
-        }))
+        Some(Ok(proof.clone()))
     }
 }
 
@@ -3911,28 +3868,13 @@ impl CapabilityProofRead for PileSnapshot {
     fn proofs<'a>(&'a self) -> Result<Self::ProofIter<'a>, Self::ProofsError> {
         let keys = self.capability_proofs.clone().into_iter_ordered();
         Ok(PileCapabilityProofIter {
-            mmap: self.mmap.clone(),
             keys,
             lookup: self.capability_proofs.clone(),
         })
     }
 
     fn proof(&self, id: CapabilityProofId) -> Result<Option<CapabilityProof>, Self::ProofsError> {
-        let Some(entry) = self.capability_proofs.get(&id.raw) else {
-            return Ok(None);
-        };
-        let body = unsafe {
-            slice_from_raw_parts(self.mmap.as_ptr().add(entry.data_offset), entry.data_len)
-                .as_ref()
-                .unwrap()
-        };
-        CapabilityProof::from_bytes(body)
-            .map(Some)
-            .map_err(|_| ReadError::CorruptPile {
-                valid_length: entry
-                    .data_offset
-                    .saturating_sub(std::mem::size_of::<CapabilityProofRecordPrefix>()),
-            })
+        Ok(self.capability_proofs.get(&id.raw).cloned())
     }
 }
 
@@ -3942,7 +3884,6 @@ impl CapabilityProofStore for Pile {
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let bytes = proof.as_bytes();
         let data_len = bytes.len();
-        debug_assert!(CapabilityProof::from_bytes(bytes).is_ok());
         let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
         let span_blocks =
             envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(|| {
@@ -3970,15 +3911,7 @@ impl CapabilityProofStore for Pile {
             self.refresh_locked()?;
 
             if let Some(existing) = self.capability_proofs.get(&id.raw) {
-                let existing_bytes = unsafe {
-                    slice_from_raw_parts(
-                        self.mmap.as_ptr().add(existing.data_offset),
-                        existing.data_len,
-                    )
-                    .as_ref()
-                    .unwrap()
-                };
-                return if existing_bytes == bytes {
+                return if existing.as_bytes() == bytes {
                     Ok(())
                 } else {
                     Err(CapabilityProofInsertError::IdCollision { id })
@@ -4711,10 +4644,10 @@ pub fn reframe_into(
                     .ok_or(PileReframeError::SourcePayload {
                         offset: record.offset,
                     })?;
-                let proof = CapabilityProof::from_bytes(&records.bytes()[data_offset..end])
-                    .map_err(|_| PileReframeError::SourcePayload {
-                        offset: record.offset,
-                    })?;
+                // PileRecords already validated this immutable body while
+                // decoding the frame; retain its byte owner without reparsing.
+                let proof =
+                    CapabilityProof::from_validated_bytes(records.bytes().slice(data_offset..end));
                 destination
                     .insert_proof(proof)
                     .map_err(PileReframeError::CapabilityProof)?;
@@ -5341,6 +5274,70 @@ mod tests {
             vec![proof]
         );
         reopened.close().unwrap();
+    }
+
+    #[test]
+    fn native_proof_views_survive_refresh_mapping_replacement_and_store_close() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = fresh_empty_pile_path(&dir, "owned-proofs.pile");
+        let expected = capability_fixture(81, [82; 32]);
+        let later = capability_fixture(83, [84; 32]);
+        let mut pile = Pile::open(&path).unwrap();
+        pile.insert_proof(expected.clone()).unwrap();
+
+        let snapshot = pile.snapshot().unwrap();
+        let proof = snapshot.proof(expected.id()).unwrap().unwrap();
+        let repeated = snapshot.proof(expected.id()).unwrap().unwrap();
+        let mut proofs = snapshot.proofs().unwrap();
+        let mut retained_iterator = snapshot.proofs().unwrap();
+        let iterated = proofs.next().unwrap().unwrap();
+        assert!(proofs.next().is_none());
+        let body_offset = std::mem::size_of::<CapabilityProofRecordPrefix>();
+        assert_eq!(
+            proof.as_bytes().as_ptr(),
+            pile.mmap.as_ptr().wrapping_add(body_offset),
+            "the indexed proof must own the decoded mmap slice, not a copied vector"
+        );
+        assert_eq!(proof.as_bytes().as_ptr(), repeated.as_bytes().as_ptr());
+        assert_eq!(proof.as_bytes().as_ptr(), iterated.as_bytes().as_ptr());
+        let original_mapping = Arc::downgrade(&pile.mmap);
+        let mapped_len = pile.mmap.len();
+
+        // A real append past the old mapping forces a replacement. The
+        // existing proof leaf and its frozen snapshot still own the old view.
+        pile.put::<UnknownBlob, _>(Bytes::from_source(vec![7_u8; mapped_len]))
+            .unwrap();
+        assert!(!Arc::ptr_eq(
+            &original_mapping.upgrade().unwrap(),
+            &pile.mmap
+        ));
+        pile.insert_proof(later.clone()).unwrap();
+        let refreshed = pile.snapshot().unwrap();
+        assert!(snapshot.proof(later.id()).unwrap().is_none());
+        assert_eq!(refreshed.proof(later.id()).unwrap(), Some(later));
+        assert_eq!(
+            refreshed
+                .proof(expected.id())
+                .unwrap()
+                .unwrap()
+                .as_bytes()
+                .as_ptr(),
+            proof.as_bytes().as_ptr()
+        );
+        let before_duplicate = std::fs::metadata(&path).unwrap().len();
+        pile.insert_proof(proof.clone()).unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), before_duplicate);
+
+        drop((snapshot, refreshed, proofs, repeated, iterated));
+        pile.close().unwrap();
+        assert!(original_mapping.upgrade().is_some());
+        assert_eq!(proof, expected);
+        proof.verify_signatures().unwrap();
+        let after_close = retained_iterator.next().unwrap().unwrap();
+        assert_eq!(after_close.as_bytes().as_ptr(), proof.as_bytes().as_ptr());
+        assert!(retained_iterator.next().is_none());
+        drop((proof, after_close, retained_iterator));
+        assert!(original_mapping.upgrade().is_none());
     }
 
     #[test]

@@ -19,6 +19,7 @@ use std::error::Error;
 use std::fmt;
 use std::num::NonZeroUsize;
 
+use anybytes::{Bytes, View};
 use ed25519::signature::Signer;
 use ed25519::Signature;
 use ed25519_dalek::{SigningKey, VerifyingKey};
@@ -332,14 +333,47 @@ struct CapabilityProofEdge {
     signature_offset: usize,
 }
 
+/// Structurally canonical proof bytes with shared immutable ownership.
+///
+/// Cloning does not copy the body. A view may retain its complete backing
+/// allocation or mmap; neither construction nor ownership assigns authority.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct CapabilityProof {
-    bytes: Vec<u8>,
+    bytes: View<[u8]>,
 }
 
 impl CapabilityProof {
-    /// Parse structurally canonical bytes without assigning them authority.
+    /// Copy borrowed, structurally canonical bytes without assigning authority.
+    ///
+    /// Use [`Self::from_owned_bytes`] to retain an existing byte owner instead.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, CapabilityProofDecodeError> {
+        Self::validate_bytes(bytes)?;
+        Ok(Self::from_validated_bytes(Bytes::from_source(
+            bytes.to_vec(),
+        )))
+    }
+
+    /// Retain structurally canonical bytes without copying or assigning authority.
+    /// Clones share the same immutable byte owner, including mmap-backed owners.
+    pub fn from_owned_bytes(bytes: Bytes) -> Result<Self, CapabilityProofDecodeError> {
+        Self::validate_bytes(&bytes)?;
+        Ok(Self::from_validated_bytes(bytes))
+    }
+
+    /// Attach ownership to known-canonical immutable bytes.
+    ///
+    /// Callers must establish the invariants of [`Self::validate_bytes`], either
+    /// by validating this exact slice or by constructing it canonically. Pile
+    /// replay uses only the immutable body already accepted by its decoder.
+    /// This performs neither framing validation nor signature verification.
+    pub(crate) fn from_validated_bytes(bytes: Bytes) -> Self {
+        Self {
+            bytes: bytes.view().expect("every byte slice has a u8 view"),
+        }
+    }
+
+    /// Validate borrowed framing without allocating or assigning authority.
+    pub(crate) fn validate_bytes(bytes: &[u8]) -> Result<(), CapabilityProofDecodeError> {
         if bytes.len() < MIN_CAPABILITY_PROOF_BYTES
             || (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) % CAPABILITY_PROOF_EDGE_LEN != 0
         {
@@ -388,9 +422,7 @@ impl CapabilityProof {
             parse_key(&edge[delegate_start..delegate_start + PUBLIC_KEY_LEN])
                 .ok_or(CapabilityProofDecodeError::InvalidKey { key: step + 1 })?;
         }
-        Ok(Self {
-            bytes: bytes.to_vec(),
-        })
+        Ok(())
     }
 
     /// Issue the first edge of one root's authority path.
@@ -414,7 +446,7 @@ impl CapabilityProof {
         bytes.extend_from_slice(resource.as_bytes());
         bytes.extend_from_slice(&root.verifying_key().to_bytes());
         append_edge(&mut bytes, root, capability, validity, delegate);
-        Self { bytes }
+        Self::from_validated_bytes(Bytes::from_source(bytes))
     }
 
     /// Append one path-local delegation edge.
@@ -464,14 +496,15 @@ impl CapabilityProof {
         let mut bytes = Vec::with_capacity(self.bytes.len() + CAPABILITY_PROOF_EDGE_LEN);
         bytes.extend_from_slice(&self.bytes);
         append_edge(&mut bytes, issuer, capability, validity, delegate);
-        Ok(Self { bytes })
+        Ok(Self::from_validated_bytes(Bytes::from_source(bytes)))
     }
 
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
+    /// Materialize the canonical bytes as an independently owned vector.
     pub fn into_bytes(self) -> Vec<u8> {
-        self.bytes
+        self.bytes.to_vec()
     }
     pub fn id(&self) -> CapabilityProofId {
         Inline::new(Blake3::digest(&self.bytes))
@@ -1146,6 +1179,61 @@ mod tests {
             Ok(proof) => proof.verify_signatures().is_ok(),
             Err(_) => false,
         }
+    }
+
+    #[test]
+    fn owned_proof_clones_retain_the_exact_byte_view() {
+        let expected = proof(&key(91), &key(92), 93, 94, CapabilityMode::Invoke, None);
+        let mut storage = vec![0_u8; 11];
+        storage.extend_from_slice(expected.as_bytes());
+        storage.extend_from_slice(&[0_u8; 13]);
+        let owner = Bytes::from_source(storage);
+        let weak = owner.downgrade();
+        let bytes = owner.slice(11..11 + expected.as_bytes().len());
+        let address = bytes.as_ptr();
+        let proof = CapabilityProof::from_owned_bytes(bytes).unwrap();
+        let clone = proof.clone();
+        assert_eq!(proof.as_bytes().as_ptr(), address);
+        assert_eq!(clone.as_bytes().as_ptr(), address);
+        assert_eq!(proof.id(), expected.id());
+        assert_eq!(proof, expected);
+        drop((owner, proof));
+        assert!(weak.upgrade().is_some());
+        clone.verify_signatures().unwrap();
+        assert_eq!(clone.into_bytes(), expected.as_bytes());
+        assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn owned_proof_parsing_rejects_the_same_malformed_framing() {
+        let valid = proof(&key(95), &key(96), 97, 98, CapabilityMode::Invoke, None);
+        let mut cases = vec![
+            Vec::new(),
+            vec![0_u8; CAPABILITY_PROOF_HEADER_LEN],
+            vec![0_u8; MIN_CAPABILITY_PROOF_BYTES - 1],
+            vec![0_u8; MIN_CAPABILITY_PROOF_BYTES + 1],
+        ];
+        let mut bad_magic = valid.as_bytes().to_vec();
+        bad_magic[0] ^= 1;
+        cases.push(bad_magic);
+        let mut bad_flags = valid.as_bytes().to_vec();
+        bad_flags[CAPABILITY_PROOF_HEADER_LEN + ID_LEN] |= 0x80;
+        cases.push(bad_flags);
+        let mut bad_validity = valid.as_bytes().to_vec();
+        bad_validity[CAPABILITY_PROOF_HEADER_LEN + ID_LEN + FLAGS_LEN] = 1;
+        cases.push(bad_validity);
+        for bytes in cases {
+            let expected = CapabilityProof::from_bytes(&bytes).unwrap_err();
+            assert_eq!(
+                CapabilityProof::from_owned_bytes(Bytes::from_source(bytes)).unwrap_err(),
+                expected
+            );
+        }
+
+        let mut bad_signature = valid.into_bytes();
+        *bad_signature.last_mut().unwrap() ^= 1;
+        let inert = CapabilityProof::from_owned_bytes(Bytes::from_source(bad_signature)).unwrap();
+        assert!(inert.verify_signatures().is_err());
     }
 
     #[test]

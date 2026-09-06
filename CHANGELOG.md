@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Store capability proofs as shared owning byte views. Pile replay validates
+  canonical framing once and retains mmap-backed proof values in its existing
+  PATCH index; snapshots, exact lookups, and iteration clone those values without
+  reparsing or copying proof bytes. Borrowed parsing remains available, and
+  `from_owned_bytes` accepts existing byte owners without copying. Proof bytes,
+  content identities, signature checks, and authorization semantics are unchanged.
 - Let derived maintenance follow the coarsest resident immediate-source cover
   before ordinary target size-tier carries. Reuse existing child images when
   a source merge witnesses their union, or map the resident coarse source
