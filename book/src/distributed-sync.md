@@ -259,6 +259,14 @@ consume the whole remaining budget before GET. Background publication and
 collection recovery start their three-second lookup window immediately. A
 caller's shorter deadline still wins; progress does not reset either deadline,
 and no failed lookup starts an unbounded retry loop.
+When the routing window expires, issued requests still awaiting a reply count
+as failed learned routes. They cannot occupy every slot again on the next
+background attempt merely because cancellation preceded the dial deadline.
+Unissued candidates and partial authenticated responders are preserved, and
+explicitly configured routes remain available for retries. This does not make
+a configured-only cold dial longer than three seconds fit the background
+window: if each attempt starts equally cold, background retries can still miss
+that endpoint. Foreground acquisition retains its separate end-to-end bound.
 Diagnostics distinguish a successful lookup with no advertised provider from
 failure to reach a replica, a provider transport/protocol failure, or exhaustion
 of the end-to-end budget. A directory miss is an observation, not proof that H

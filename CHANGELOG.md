@@ -16,6 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Retire issued, unanswered learned DHT routes when a bounded routing window
+  cancels them, so stale close candidates cannot monopolize repeated background
+  publication attempts. Preserve configured routes, unissued candidates, partial
+  authenticated responders, and existing lookup deadlines; cover the remaining
+  configured-only cold-start limit explicitly.
 - Add a bounded, read-only DHT directory example for exact blob locators. Reuse
   the public protocol operations and expose the existing locator/token
   derivations without sending bearer handles, fetching bodies, or publishing

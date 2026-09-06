@@ -345,6 +345,21 @@ impl IterativeLookup {
         true
     }
 
+    /// Fail issued requests still pending when the routing deadline expires.
+    /// Unissued candidates and authenticated responders retain their evidence;
+    /// failed configured peers remain available through explicit configuration.
+    pub(crate) fn record_timeouts(&mut self, routes: &mut RoutingTable) -> usize {
+        let in_flight: Vec<_> = self
+            .shortlist
+            .iter()
+            .filter_map(|(peer, state)| (*state == LookupState::InFlight).then_some(*peer))
+            .collect();
+        for peer in &in_flight {
+            self.record_failure(*peer, routes);
+        }
+        in_flight.len()
+    }
+
     pub(crate) fn is_finished(&self) -> bool {
         let has_in_flight = self
             .shortlist
@@ -812,6 +827,27 @@ mod tests {
         assert_eq!(routes.configured_len(), K);
         assert_eq!(routes.len(), K);
         assert!((1..=K as u16).all(|n| routes.state(id(n)) == Some(RouteState::Candidate)));
+    }
+
+    #[test]
+    fn routing_timeout_fails_only_issued_unanswered_requests() {
+        let local = id(0);
+        let mut routes = RoutingTable::new(local, [id(2)]);
+        for n in 1..=4 {
+            routes.promote_authenticated(id(n));
+        }
+        let mut lookup = IterativeLookup::new(local, local, routes.closest(local, K));
+        assert_eq!(lookup.next_batch(), vec![id(1), id(2), id(3)]);
+        assert!(lookup.record_authenticated_response(id(1), [], &mut routes));
+
+        assert_eq!(lookup.record_timeouts(&mut routes), 2);
+        assert_eq!(routes.state(id(1)), Some(RouteState::Verified));
+        assert_eq!(routes.state(id(2)), Some(RouteState::Candidate));
+        assert_eq!(routes.state(id(3)), None);
+        assert_eq!(routes.state(id(4)), Some(RouteState::Verified));
+        assert_eq!(lookup.closest_authenticated_responders(), &[id(1)]);
+        assert_eq!(lookup.record_timeouts(&mut routes), 0);
+        assert_eq!(lookup.next_batch(), vec![id(4)]);
     }
 
     #[test]
