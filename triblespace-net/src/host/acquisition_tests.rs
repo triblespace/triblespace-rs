@@ -3,6 +3,8 @@
 //! Only connection latency and the caller deadline advance in these tests.
 //! Preinstalled, unexpired directory leases isolate acquisition from the
 //! independent publication scheduler and require no global virtual clock.
+//! The shared unit-test guard excludes body receivers on other test runtimes,
+//! whose independent clocks cannot make progress on this paused timeline.
 
 use std::time::Duration;
 
@@ -135,6 +137,7 @@ impl Drop for Fixture {
 
 #[tokio::test(start_paused = true)]
 async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
     let started = tokio::time::Instant::now();
     assert_eq!(
@@ -161,6 +164,7 @@ async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
 
 #[tokio::test(start_paused = true)]
 async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
     let stalled_key = SigningKey::from_bytes(&[93; 32]);
     let stalled = stalled_key.verifying_key().to_bytes();
@@ -183,6 +187,7 @@ async fn responsive_provider_is_not_held_behind_stalled_secondary_bootstrap() {
 
 #[tokio::test(start_paused = true)]
 async fn background_lookup_keeps_its_short_bound() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
     let started = tokio::time::Instant::now();
     let error = fixture
@@ -197,6 +202,7 @@ async fn background_lookup_keeps_its_short_bound() {
 
 #[tokio::test(start_paused = true)]
 async fn warm_provider_miss_is_not_a_transport_failure_or_direct_peer_probe() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
     // The bootstrap endpoint holds H but has no lease for it. Warming the
     // topology must not turn that route into an alternate direct-H probe.
@@ -232,6 +238,7 @@ async fn warm_provider_miss_is_not_a_transport_failure_or_direct_peer_probe() {
 
 #[tokio::test(start_paused = true)]
 async fn stalled_bootstrap_still_exhausts_the_one_foreground_deadline() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(true);
     fixture.net.stall_dials(fixture.provider);
     let started = tokio::time::Instant::now();
@@ -243,5 +250,51 @@ async fn stalled_bootstrap_still_exhausts_the_one_foreground_deadline() {
             .is_none()
     );
     assert_eq!(started.elapsed(), INTERACTIVE_FETCH_DEADLINE);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn exact_receive_contention_remains_inside_the_caller_deadline() {
+    use tokio::io::AsyncWriteExt as _;
+
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(true);
+    let (mut writer, mut reader) = tokio::io::duplex(1);
+    let blocked = crate::protocol::recv_exact_blob_body(&mut reader, 1);
+    tokio::pin!(blocked);
+    // The receive owns the process-wide permit, then waits for its one byte.
+    assert!(futures::poll!(&mut blocked).is_pending());
+
+    let started = tokio::time::Instant::now();
+    assert!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await
+            .is_none()
+    );
+    assert_eq!(started.elapsed(), INTERACTIVE_FETCH_DEADLINE);
+    assert_eq!(
+        fixture
+            .client
+            .candidates
+            .lock()
+            .unwrap()
+            .state(fixture.provider),
+        Some(crate::routing::RouteState::Verified),
+        "bootstrap authenticated before waiting for the local receive slot"
+    );
+
+    writer.write_all(b"x").await.unwrap();
+    assert_eq!(blocked.await.unwrap().as_ref(), b"x");
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(started.elapsed(), Duration::ZERO);
     fixture.assert_no_control_effects();
 }

@@ -347,6 +347,18 @@ pub(crate) async fn recv_exact_blob_body<R: AsyncRead + Unpin>(
         .map_err(|error| anyhow!("freeze blob receive area: {error}"))
 }
 
+/// Independent test runtimes must not time each other's shared receive permit.
+/// A paused Tokio clock advances while a permit's owner on another test thread
+/// is still running. Hold this before exercising any body receive in a unit test;
+/// contention within that test's own runtime still uses the production semaphore.
+#[cfg(test)]
+pub(crate) fn exact_blob_receive_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    static SERIAL: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    SERIAL
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -358,6 +370,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_get_mutual_proof_succeeds_without_a_collection() {
+        let _guard = exact_blob_receive_test_guard();
         let requester = [7; 32];
         let provider = [8; 32];
         let content = b"bearer capability";
@@ -509,6 +522,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_get_rejects_bytes_that_do_not_hash_to_the_handle() {
+        let _guard = exact_blob_receive_test_guard();
         let requester = [15; 32];
         let provider = [16; 32];
         let expected = handle(b"expected");
@@ -557,6 +571,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_get_accepts_empty_content_and_rejects_trailing_bytes() {
+        let _guard = exact_blob_receive_test_guard();
         assert_eq!(
             recv_blob_response(&mut [0; 8].as_slice()).await.unwrap(),
             Some(Bytes::from_source(Vec::<u8>::new()))

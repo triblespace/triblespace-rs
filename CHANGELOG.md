@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Isolate exact-blob receiver unit tests that otherwise shared one process-wide
+  receive permit across independent paused Tokio clocks. Cover same-runtime
+  receive contention within the unchanged ten-second foreground deadline;
+  production receive limits, DHT scheduling, and lookup deadlines are unchanged.
 - Let peer snapshots fetch and cache exact immutable blobs with shared async
   `get`, without advancing frozen records, proofs, authorization time, or
   selected covers. Keep passive residency/collection reads local, never emit
