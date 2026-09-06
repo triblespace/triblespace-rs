@@ -9,8 +9,10 @@ magic | resource | root |
     (capability handle | mode/validity flags | validity | delegate | signature)+
 ```
 
-The high-entropy magic identifies this exact grammar. An incompatible grammar
-gets a new magic rather than a version branch inside the decoder. `resource`
+The 32-byte magic is the handle of this grammar's SimpleArchive description.
+It is also the native Pile record kind: there is one format identity, not an
+outer kind wrapping a separately tagged proof. An incompatible grammar gets a
+new description and magic rather than a version branch inside the decoder. `resource`
 is an uninterpreted 32-byte identity: collections use their descriptor handle,
 while another subsystem may give the same kernel a different kind of resource.
 `root` and every delegate are canonical, non-weak Ed25519 public keys. This
@@ -34,11 +36,11 @@ identity.
 
 ## Canonical wire value
 
-The proof header is 80 bytes:
+The proof header is 96 bytes:
 
 | bytes | field |
 |---:|---|
-| 16 | grammar magic |
+| 32 | grammar magic, also the Pile record kind |
 | 32 | opaque resource identity |
 | 32 | root public key |
 
@@ -124,10 +126,16 @@ Repair exchanges proofs only and does not emit WANTs. Re-inserting identical
 proof bytes is idempotent. Pile indexes hold shared owning `anybytes::View`
 values; parsing and replay do not verify signatures or assign authority.
 
-The proof grammar's magic, the pile record kind, and the network protocol are
-separate compatibility boundaries. The new proof body uses a fresh pile record
-kind; the previous development-only proof kind remains recognizable as inert
-so old append-only piles can still be crossed safely. Old signatures cannot be
+In a Pile, the generic framing magic and block count precede those same
+canonical proof bytes. The record kind is the proof's first field, not an
+additional wrapper. Generic framing and zero block padding are outside the
+signed and hashed value. Every edge has a nonzero mode, so whole zero edges and
+a zero short remainder can only be padding; the decoder also requires the
+minimal block span. The network sends the exact unpadded proof unchanged.
+
+The proof grammar and Pile kind share one compatibility identity; the transport
+protocol has its own boundary. Historical live proof kinds remain recognizable
+as inert so old append-only piles can still be crossed safely. Old signatures cannot be
 mechanically migrated because they signed different bytes. Delegated authority
 must be reissued by the relevant private keys.
 

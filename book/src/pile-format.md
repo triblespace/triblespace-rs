@@ -68,9 +68,9 @@ fresh piles neither write nor advertise those dead formats.
 
 The arithmetic works out exactly. A signed commit contains six 32-byte fields,
 so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge capability
-proof has a 241-byte body after its 96-byte envelope prefix and therefore uses
-two blocks. Longer proofs use the minimal additional whole blocks without
-changing their canonical body.
+proof is 257 bytes starting at the record-kind field at offset 32, so its
+289 unpadded bytes use two blocks. Longer proofs use the minimal additional
+whole blocks without changing their canonical body.
 
 A collection descriptor remains an ordinary blob. Capability proofs are
 self-contained native records and have no companion claim blobs.
@@ -547,7 +547,7 @@ replay.
 canonical self-contained prefix-signed proof body
 
 ```text
-magic16 | resource32 | root32 |
+magic32 | resource32 | root32 |
     (capability_handle32 | flags1 | validity32 | delegate32 | signature64)+
 ```
 
@@ -559,19 +559,20 @@ is not duplicated in the frame.
 |---:|---:|---|
 | `0..28` | 28 | Framing magic |
 | `28..32` | 4 | Minimal total 256-byte-block span, little-endian |
-| `32..64` | 32 | Proof kind `CFAD21DF6FA3D3ADF9939E432DDCF8447CB9C57081B979F1CFD669E4800D3E32`, rooted at `0A1F399185ED9AB70299C951D32B1041` |
-| `64..72` | 8 | Exact proof-body byte length, little-endian |
-| `72..96` | 24 | Reserved zeros |
-| `96..96+length` | variable | Canonical proof body |
+| `32..64` | 32 | PROOF magic / record kind `CF346E81157B2169045EA8574896BAD23976A4A08D7DC70DDCADABA9AFF2442A`, rooted at `D81538DE724347280A6D97F51EDE08F6` |
+| `64..96` | 32 | Opaque resource identity |
+| `96..128` | 32 | Root Ed25519 public key |
+| `128..128+161n` | variable | Delegation edges |
 | remainder | variable | Zero padding to the declared span |
 
-The proof header is exactly 80 bytes:
+There is no proof-specific envelope, inner magic, or separate byte-length field.
+The proof starts with the record kind itself. Its header is exactly 96 bytes:
 
 | Body offset | Width | Field |
 |---:|---:|---|
-| `0..16` | 16 | Grammar magic `92DDF6E5ED9F35A5E513E74350AA1175` |
-| `16..48` | 32 | Opaque resource identity |
-| `48..80` | 32 | Root Ed25519 public key |
+| `0..32` | 32 | PROOF magic, the same record-kind handle |
+| `32..64` | 32 | Opaque resource identity |
+| `64..96` | 32 | Root Ed25519 public key |
 
 Each following edge is exactly 161 bytes:
 
@@ -583,19 +584,26 @@ Each following edge is exactly 161 bytes:
 | `65..97` | 32 | Delegate Ed25519 public key |
 | `97..161` | 64 | Ed25519 signature over the exact body prefix through this delegate |
 
-The body length must be exactly `80 + 161n` for `1 <= n <= 255`. Replay parses
+The body length must be exactly `96 + 161n` for `1 <= n <= 255`. Replay parses
 every Ed25519 key, requires a known nonempty mode on each
 edge, validates the optional inclusive interval encoding, requires the declared
 span to be the smallest span containing the body, and rejects any nonzero
-reserved or padding byte as corruption. The low two flag bits encode Invoke,
+padding byte as corruption. The low two flag bits encode Invoke,
 Delegate, or both; bit 2 marks a present interval; all higher bits must be zero.
-A one-edge body is 241 bytes, so its pile record occupies two 256-byte blocks.
+A one-edge body is 257 bytes, so its pile record occupies two 256-byte blocks.
+The generic framing declares only the block span. To recover the exact proof,
+the decoder walks fixed-width edges until the zero suffix: a valid edge cannot
+be all zero because its mode is nonempty. A bounded scan, the minimal-span
+check, and an entirely zero remainder make this unambiguous even when padding
+is longer than one edge. Zero bytes at the end of a signature remain part of
+the proof. A 128-edge proof fills its blocks exactly and has no padding.
 
 Insertion of identical bytes is idempotent. Different bytes reconstructing to
 the same proof ID are a collision and fail. Exact lookup is only by proof ID;
 the store does not infer a proof from a key, resource, or request, and record
 presence grants no authority. Each signature is last and covers every earlier
-body byte through its own delegate, including prior signatures. An exact prefix
+body byte through its own delegate, including the record kind and prior signatures.
+Generic framing and block padding are excluded. An exact prefix
 ending after any signature is therefore a complete proof for that intermediate
 delegate.
 

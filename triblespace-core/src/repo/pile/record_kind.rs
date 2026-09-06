@@ -96,7 +96,7 @@ pub fn describe_blob(fragment: &Fragment) -> Blob<SimpleArchive> {
 macro_rules! record_kinds {
     ($(
         $(#[$meta:meta])*
-        $ty:ident = $id:ident $id_hex:literal, $handle:ident $handle_hex:literal,
+        $ty:ident = $id:ident $id_hex:literal, $handle:ident $handle_value:expr,
         $name:literal, $layout:literal;
     )*) => {
         $(
@@ -109,7 +109,7 @@ macro_rules! record_kinds {
             ///
             /// The 32-byte record kind written into bytes `32..64` of the
             /// envelope: the handle of this kind's description archive.
-            pub const $handle: RawInline = hex_literal::hex!($handle_hex);
+            pub const $handle: RawInline = $handle_value;
 
             $(#[$meta])*
             pub struct $ty;
@@ -139,19 +139,19 @@ macro_rules! record_kinds {
 record_kinds! {
     /// A blob record: fixed header followed by the payload.
     BlobRecordV1 = KIND_ID_BLOB "9C33EEB525065A62EAEC4BE43DCC355A",
-        KIND_BLOB "01148F301FE56E346D16596A8480532E8B4420C4EFD00C8DFF437D0DF9810ED0",
+        KIND_BLOB hex_literal::hex!("01148F301FE56E346D16596A8480532E8B4420C4EFD00C8DFF437D0DF9810ED0"),
         "pile-blob-v1",
         "A content-addressed blob. Envelope bytes 64..72 hold the insertion timestamp in Unix milliseconds as an unsigned little-endian 64-bit integer, 72..80 the exact unpadded payload length in bytes in the same encoding, 80..96 zeros, 96..128 the BLAKE3 digest of the payload, and 128..256 zeros. The payload begins at record_start + 256 and is post-padded with zeros to the declared block span. Padding is not covered by the digest.";
 
     /// A pin (branch) head assignment.
     PinHeadRecordV1 = KIND_ID_PIN_HEAD "AC363D04AFE1AF17B39581B1E23021D7",
-        KIND_PIN_HEAD "2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D",
+        KIND_PIN_HEAD hex_literal::hex!("2BC0B9FE0EFDB0BC53654E17BB9D06E01259F36AF93EEE54AD5D557B12DF706D"),
         "pile-pin-head-v1",
         "A last-writer-wins assignment of one pin (branch) identifier to the handle of its metadata blob. Envelope bytes 64..80 hold the 16-byte pin identifier, 80..96 zeros, 96..128 the BLAKE3 handle of the head SimpleArchive, and 128..256 zeros. The record spans exactly one 256-byte block and has no payload. The pile does not require the referenced blob to be resident.";
 
     /// A pin (branch) tombstone.
     PinTombstoneRecordV1 = KIND_ID_PIN_TOMBSTONE "D0CBA0C8EAAB4C0C73121C3205671E4F",
-        KIND_PIN_TOMBSTONE "8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5",
+        KIND_PIN_TOMBSTONE hex_literal::hex!("8D9F27E76D3620EEC29B781F841E9EF77F2607B40DC702FE3DAED007E9228CA5"),
         "pile-pin-tombstone-v1",
         "Retraction of a pin (branch) head assignment, resolved last-writer-wins against pile-pin-head-v1 records for the same identifier. Envelope bytes 64..80 hold the 16-byte pin identifier and 80..256 are zeros. The record spans exactly one 256-byte block and has no payload.";
 
@@ -159,35 +159,35 @@ record_kinds! {
     ///
     /// Kind id minted with `trible genid` on 2026-09-02.
     WantRecordV3 = KIND_ID_WANT "E6CEE6F8578E3B8DB4C081486A8CBD28",
-        KIND_WANT "82EE8C72E252AB403C431AA98C9E77C0EA89796A8111DFF8C252ABCDE6F87D6F",
+        KIND_WANT hex_literal::hex!("82EE8C72E252AB403C431AA98C9E77C0EA89796A8111DFF8C252ABCDE6F87D6F"),
         "pile-want-v3",
         "One element of the grow-only durable local WANT set, keyed by a canonical 97-byte WantRequest. Envelope byte 64 holds the versioned request tag, 65..96 are zeros, 96..128 hold field A, 128..160 field B, 160..192 field C, and 192..256 are zeros. Tag 1 is a blob request (A the BLAKE3 blob handle; B and C zero); tag 2 is a merge request (A the collection descriptor handle; B and C the input digests in lexicographic order); tag 4 is a derive request (A the target collection descriptor handle; B the input digest; C zero). The record spans exactly one 256-byte block and has no payload. Repeating an exact request is idempotent. There is no retraction kind; forgetting is a policy rewrite such as Yard reclaim.";
 
     /// A signed collection commit.
     CollectionCommitRecordV4 = KIND_ID_COLLECTION_COMMIT "CBF2CF97D52A3486E16C12D70D397C66",
-        KIND_COLLECTION_COMMIT "A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59",
+        KIND_COLLECTION_COMMIT hex_literal::hex!("A1322BB3F5214287C314D42AFCC1A97CB264FACD9A22B4938838BE78DB31AA59"),
         "pile-collection-commit-v4",
         "A signed COMMIT(collection, data, metadata) assertion. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the data digest, 128..160 the metadata archive handle, 160..192 the author Ed25519 public key, 192..224 the signature R component, and 224..256 the signature S component. This is the tightest record the pile writes: it fills the block exactly and reserves nothing. The signature covers a domain-separated transcript, not these bytes, so a commit survives reframing unchanged.";
 
     /// An unsigned merge equation.
     CollectionMergeRecordV4 = KIND_ID_COLLECTION_MERGE "9F5D028D4C423620D6957A5F726FA727",
-        KIND_COLLECTION_MERGE "0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379",
+        KIND_COLLECTION_MERGE hex_literal::hex!("0CEE320DE0BDA40A6A6F52221C5E4E4D2CE3B165B69C858673FD13D98F655379"),
         "pile-collection-merge-v4",
         "An unsigned MERGE equation asserting that two element digests join to a third under the collection's recipe. Envelope bytes 64..96 hold the collection descriptor handle, 96..128 the lexicographically lower input digest, 128..160 the higher input digest, 160..192 the result digest, and 192..256 are zeros. Storing the inputs in order means operand order cannot produce a second representation of the same commutative equation.";
 
     /// An unsigned derive equation.
     CollectionDeriveRecordV5 = KIND_ID_COLLECTION_DERIVE "ED6B46F7286D4556B076C17B79FD8315",
-        KIND_COLLECTION_DERIVE "7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36",
+        KIND_COLLECTION_DERIVE hex_literal::hex!("7ACE1ED10F3EBC632627058CC461DC1CC171CD2E56C52E5DCE60EA4C8DC23C36"),
         "pile-collection-derive-v5",
         "An unsigned DERIVE equation asserting that an input state of a derived collection's source maps to an output state of that collection. Envelope bytes 64..96 hold the target collection's descriptor handle, 96..128 the input digest, 128..160 the output digest, and 160..256 are zeros. The source is not named here because the target's descriptor already names it, and naming it twice only creates a way for the two to disagree.";
 
     /// A self-contained prefix-signed capability proof.
     ///
     /// Kind id minted with `trible genid` on 2026-09-06.
-    CapabilityProofRecordV3 = KIND_ID_AUTH_PROOF "0A1F399185ED9AB70299C951D32B1041",
-        KIND_AUTH_PROOF "CFAD21DF6FA3D3ADF9939E432DDCF8447CB9C57081B979F1CFD669E4800D3E32",
-        "pile-auth-proof-v3",
-        "A canonical self-contained prefix-signed capability proof. Envelope bytes 64..72 hold the exact unpadded proof length as an unsigned little-endian 64-bit integer and 72..96 are zeros. The proof begins at byte 96 with a 16-byte grammar magic, a 32-byte opaque resource, and the 32-byte root Ed25519 public key, followed by one or more 161-byte edges. Each edge holds a 32-byte SimpleArchive capability-definition handle, one flags byte whose low two bits encode invocation and delegation and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix through its edge's delegate, including all preceding signatures. The declared length is exactly 80 + 161n bytes for n at least one. The record is post-padded with zeros to its declared 256-byte block span; padding is not proof content and does not participate in its BLAKE3 content id. Capability definition handles are strong blob references; the resource remains opaque. Proof verification does not acquire or interpret those definitions.";
+    CapabilityProofRecordV4 = KIND_ID_AUTH_PROOF "D81538DE724347280A6D97F51EDE08F6",
+        KIND_AUTH_PROOF crate::capability::CAPABILITY_PROOF_MAGIC,
+        "pile-auth-proof-v4",
+        "A canonical self-contained prefix-signed capability proof. The proof starts at envelope byte 32: the 32-byte record kind is also its grammar magic, followed by a 32-byte opaque resource at 64..96 and the 32-byte root Ed25519 public key at 96..128. One to 255 fixed 161-byte edges follow. Each edge holds a 32-byte SimpleArchive capability-definition handle, one flags byte whose low two bits encode a nonempty invocation/delegation mode and whose bit 2 indicates bounded validity, two signed big-endian 16-byte TAI-nanosecond validity bounds (all zero when absent), a 32-byte delegate Ed25519 public key, and a 64-byte Ed25519 signature. Each signature covers the exact proof prefix from the record kind through its edge's delegate, including all preceding signatures. The unpadded proof length is exactly 96 + 161n bytes. There is no separate proof length or inner magic. The generic frame declares the minimal 256-byte block span; its trailing zero padding cannot form an edge because every edge has a nonzero mode. Generic framing and padding are not proof content and do not participate in signatures or its BLAKE3 content id. Capability definition handles are strong blob references; the resource remains opaque. Proof verification does not acquire or interpret those definitions.";
 
 }
 

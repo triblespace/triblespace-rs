@@ -47,7 +47,10 @@ use crate::blob::Blob;
 use crate::blob::BlobEncoding;
 use crate::blob::IntoBlob;
 use crate::blob::TryFromBlob;
-use crate::capability::{CapabilityProof, CapabilityProofId};
+use crate::capability::{
+    CapabilityProof, CapabilityProofId, CAPABILITY_PROOF_EDGE_LEN, CAPABILITY_PROOF_HEADER_LEN,
+    CAPABILITY_PROOF_MAGIC, MAX_CAPABILITY_PROOF_STEPS,
+};
 use crate::collection::store::{selectors_match_record, CollectionRead};
 use crate::collection::{
     CollectionCommit, CollectionDerive, CollectionHandle, CollectionMerge, CollectionRecord,
@@ -291,10 +294,12 @@ const GPU_DATA_ALIGNMENT: usize = 256;
 /// data follows at `record_start + ENVELOPE_HEADER_LEN`.
 const V3_HEADER_LEN: usize = 256;
 const ENVELOPE_HEADER_LEN: usize = 256;
+/// The generic framing ends here; a canonical proof starts with its kind.
+const FRAME_KIND_OFFSET: usize = FRAME_MAGIC_LEN + 4;
 /// First byte of a current record's kind-specific body: 28 bytes of magic, a
 /// 4-byte span, and a 32-byte record kind. A multiple of 32, which is the
 /// whole point of the width choice.
-const FRAME_BODY_OFFSET: usize = FRAME_MAGIC_LEN + 4 + 32;
+const FRAME_BODY_OFFSET: usize = FRAME_KIND_OFFSET + 32;
 const ENVELOPE_BLOCK_LEN: usize = GPU_DATA_ALIGNMENT;
 const ENVELOPE_HEADER_BLOCKS: u32 = 1;
 /// Post-data padding that rounds a fixed-header record up to a 256-byte block.
@@ -885,11 +890,10 @@ struct RecordFrame {
     record_kind: RawInline,
 }
 
-/// Complete capability proof: `64..72` length, `96..` canonical self-contained
-/// prefix-signed bytes, then zero padding to the declared block span.
+/// Historical nested proof framing, only decoded for inert V1/V2 records.
 #[derive(TryFromBytes, IntoBytes, Immutable, KnownLayout, Copy, Clone)]
 #[repr(C)]
-struct CapabilityProofRecordPrefix {
+struct RetiredCapabilityProofRecordPrefix {
     magic: [u8; FRAME_MAGIC_LEN],
     span_blocks: [u8; 4],
     record_kind: RawInline,
@@ -898,12 +902,13 @@ struct CapabilityProofRecordPrefix {
     scalar_pad: [u8; 24],
 }
 
-impl CapabilityProofRecordPrefix {
+#[cfg(test)]
+impl RetiredCapabilityProofRecordPrefix {
     fn new(span_blocks: u32, length: u64) -> Self {
         Self {
             magic: FRAME_MAGIC,
             span_blocks: span_blocks.to_le_bytes(),
-            record_kind: record_kind::KIND_AUTH_PROOF,
+            record_kind: record_kind::KIND_AUTH_PROOF_V1,
             length: length.to_le_bytes(),
             scalar_pad: [0u8; 24],
         }
@@ -1277,11 +1282,10 @@ const _: () = {
     assert!(std::mem::size_of::<CollectionCommitHeaderEnvelopeV1>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionMergeHeaderEnvelopeV1>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<CollectionDeriveHeaderEnvelopeV1>() == ENVELOPE_HEADER_LEN);
-    // The current framing: 28 + 4 + 32 == 64. Fixed headers fill one 256-byte
-    // block; the variable proof prefix ends at byte 96 so its body is likewise
-    // 32-byte aligned.
+    // Current framing is 28 + 4 + 32 == 64. A proof starts at the kind field,
+    // sharing it with the frame. Only historical proofs have a nested prefix.
     assert!(std::mem::size_of::<RecordFrame>() == FRAME_BODY_OFFSET);
-    assert!(std::mem::size_of::<CapabilityProofRecordPrefix>() == 96);
+    assert!(std::mem::size_of::<RetiredCapabilityProofRecordPrefix>() == 96);
     assert!(std::mem::size_of::<BlobRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<PinHeadRecordHeader>() == ENVELOPE_HEADER_LEN);
     assert!(std::mem::size_of::<PinTombstoneRecordHeader>() == ENVELOPE_HEADER_LEN);
@@ -1481,7 +1485,8 @@ pub enum PileRecordContent {
 }
 
 /// Decodes a current V2 enveloped record: 28-byte magic, 4-byte span, 32-byte
-/// record kind, 32-byte-aligned body from byte 64.
+/// record kind, 32-byte-aligned fields from byte 64. A proof includes the kind
+/// itself in its canonical bytes, so its value starts at byte 32.
 fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, ReadError> {
     let corrupt = || ReadError::CorruptPile {
         valid_length: offset,
@@ -1623,17 +1628,15 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 content,
             })
         }
-        record_kind::KIND_AUTH_PROOF_V1
-        | record_kind::KIND_AUTH_PROOF_V2
-        | record_kind::KIND_AUTH_PROOF => {
-            let (header, _) =
-                CapabilityProofRecordPrefix::try_read_from_prefix(bytes).map_err(|_| corrupt())?;
+        record_kind::KIND_AUTH_PROOF_V1 | record_kind::KIND_AUTH_PROOF_V2 => {
+            let (header, _) = RetiredCapabilityProofRecordPrefix::try_read_from_prefix(bytes)
+                .map_err(|_| corrupt())?;
             if nonzero(&[&header.scalar_pad[..]]) {
                 return Err(corrupt());
             }
             let data_len =
                 usize::try_from(u64::from_le_bytes(header.length)).map_err(|_| corrupt())?;
-            let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
+            let prefix_len = std::mem::size_of::<RetiredCapabilityProofRecordPrefix>();
             let expected_blocks =
                 envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(corrupt)?;
             if declared_blocks != expected_blocks {
@@ -1646,22 +1649,42 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
             if nonzero(&[&bytes[data_end..len]]) {
                 return Err(corrupt());
             }
-            if prefix.record_kind != record_kind::KIND_AUTH_PROOF {
-                let body = &bytes[prefix_len..data_end];
-                let structural = if prefix.record_kind == record_kind::KIND_AUTH_PROOF_V1 {
-                    retired_capability_proof_v1_is_structural(body)
-                } else {
-                    crate::capability::legacy_action_proof_is_structural(body)
-                };
-                if !structural {
-                    return Err(corrupt());
-                }
-                return Ok(PileRecord {
-                    offset,
-                    len,
-                    content: PileRecordContent::RetiredCapabilityProof,
-                });
+            let body = &bytes[prefix_len..data_end];
+            let structural = if prefix.record_kind == record_kind::KIND_AUTH_PROOF_V1 {
+                retired_capability_proof_v1_is_structural(body)
+            } else {
+                crate::capability::legacy_action_proof_is_structural(body)
+            };
+            if !structural {
+                return Err(corrupt());
             }
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::RetiredCapabilityProof,
+            })
+        }
+        record_kind::KIND_AUTH_PROOF => {
+            // The kind is the first field of the canonical proof itself.
+            let prefix_len = FRAME_KIND_OFFSET;
+            let padded = &bytes[prefix_len..len];
+            let edges = padded
+                .get(CAPABILITY_PROOF_HEADER_LEN..)
+                .ok_or_else(corrupt)?;
+            // Every edge has a nonzero mode byte, so an all-zero edge can
+            // only be padding. Bound traversal before validating the frame.
+            let count = edges
+                .chunks_exact(CAPABILITY_PROOF_EDGE_LEN)
+                .take(MAX_CAPABILITY_PROOF_STEPS + 1)
+                .take_while(|edge| edge.iter().any(|byte| *byte != 0))
+                .count();
+            let data_len = CAPABILITY_PROOF_HEADER_LEN + count * CAPABILITY_PROOF_EDGE_LEN;
+            let expected_blocks =
+                envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(corrupt)?;
+            if declared_blocks != expected_blocks || nonzero(&[&padded[data_len..]]) {
+                return Err(corrupt());
+            }
+            let data_end = prefix_len + data_len;
             let proof_bytes = &bytes[prefix_len..data_end];
             CapabilityProof::validate_bytes(proof_bytes).map_err(|_| corrupt())?;
             let data_offset = offset.checked_add(prefix_len).ok_or_else(corrupt)?;
@@ -3892,7 +3915,7 @@ impl CapabilityProofStore for Pile {
     fn insert_proof(&mut self, proof: CapabilityProof) -> Result<(), Self::InsertError> {
         let bytes = proof.as_bytes();
         let data_len = bytes.len();
-        let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
+        let prefix_len = FRAME_KIND_OFFSET;
         let span_blocks =
             envelope_blocks_for_prefixed_payload(prefix_len, data_len).ok_or_else(|| {
                 CapabilityProofInsertError::Io(std::io::Error::new(
@@ -3904,12 +3927,6 @@ impl CapabilityProofStore for Pile {
             CapabilityProofInsertError::Io(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "capability proof pile-record size overflows usize",
-            ))
-        })?;
-        let length = u64::try_from(data_len).map_err(|_| {
-            CapabilityProofInsertError::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "capability proof length exceeds u64",
             ))
         })?;
         let id = proof.id();
@@ -3926,11 +3943,17 @@ impl CapabilityProofStore for Pile {
                 };
             }
 
-            let header = CapabilityProofRecordPrefix::new(span_blocks, length);
+            let header = RecordFrame {
+                magic: FRAME_MAGIC,
+                span_blocks: span_blocks.to_le_bytes(),
+                record_kind: CAPABILITY_PROOF_MAGIC,
+            };
             let zero_buf = [0u8; ENVELOPE_BLOCK_LEN];
             self.dirty = true;
             self.file.write_all(header.as_bytes())?;
-            self.file.write_all(bytes)?;
+            // The common frame already wrote the proof's type identifier.
+            self.file
+                .write_all(&bytes[CAPABILITY_PROOF_MAGIC.len()..])?;
             if padding > 0 {
                 self.file.write_all(&zero_buf[..padding])?;
             }
@@ -5082,9 +5105,9 @@ mod tests {
     }
 
     fn retired_capability_v1_record(body: &[u8]) -> Vec<u8> {
-        let prefix_len = std::mem::size_of::<CapabilityProofRecordPrefix>();
+        let prefix_len = std::mem::size_of::<RetiredCapabilityProofRecordPrefix>();
         let blocks = envelope_blocks_for_prefixed_payload(prefix_len, body.len()).unwrap();
-        let mut bytes = CapabilityProofRecordPrefix::new(blocks, body.len() as u64)
+        let mut bytes = RetiredCapabilityProofRecordPrefix::new(blocks, body.len() as u64)
             .as_bytes()
             .to_vec();
         bytes[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET]
@@ -5092,6 +5115,74 @@ mod tests {
         bytes.extend_from_slice(body);
         bytes.resize(blocks as usize * ENVELOPE_BLOCK_LEN, 0);
         bytes
+    }
+
+    fn framed_capability_proof(proof: &[u8]) -> Vec<u8> {
+        let blocks = envelope_blocks_for_prefixed_payload(FRAME_KIND_OFFSET, proof.len()).unwrap();
+        let mut frame = FRAME_MAGIC.to_vec();
+        frame.extend_from_slice(&blocks.to_le_bytes());
+        frame.extend_from_slice(proof);
+        frame.resize(blocks as usize * ENVELOPE_BLOCK_LEN, 0);
+        frame
+    }
+
+    #[test]
+    fn native_proof_padding_is_unambiguous_for_every_edge_count() {
+        let first = capability_fixture(101, [102; 32]);
+        let mut body = first.as_bytes()[..CAPABILITY_PROOF_HEADER_LEN].to_vec();
+        let mut edge = first.as_bytes()[CAPABILITY_PROOF_HEADER_LEN..].to_vec();
+        // Framing must preserve even zero signature bytes, not trim them off
+        // with the padding. These records are evidence, not valid authority.
+        edge[CAPABILITY_PROOF_EDGE_LEN - 64..].fill(0);
+        for count in 1..=MAX_CAPABILITY_PROOF_STEPS {
+            body.extend_from_slice(&edge);
+            let frame = framed_capability_proof(&body);
+            let padding = frame.len() - FRAME_KIND_OFFSET - body.len();
+            if count == 1 {
+                assert_eq!(padding, 223);
+            } else if count == 128 {
+                assert_eq!(padding, 0);
+            }
+            let record = decode_enveloped_record(&frame, 0).unwrap();
+            let PileRecordContent::CapabilityProof {
+                id,
+                data_offset,
+                data_len,
+            } = record.content
+            else {
+                panic!("proof decoded as another record kind");
+            };
+            assert_eq!(data_offset, 32);
+            assert_eq!(data_len, body.len());
+            assert_eq!(&frame[data_offset..data_offset + data_len], &body);
+            assert_eq!(id.raw, Blake3::digest(&body));
+        }
+        body.extend_from_slice(&edge);
+        assert!(decode_enveloped_record(&framed_capability_proof(&body), 0).is_err());
+    }
+
+    #[test]
+    fn native_proof_rejects_nonzero_padding_gaps_and_nonminimal_frames() {
+        let first = capability_fixture(103, [104; 32]);
+        let frame = framed_capability_proof(first.as_bytes());
+        let padding_start = FRAME_KIND_OFFSET + first.as_bytes().len();
+        for index in padding_start..frame.len() {
+            let mut bad = frame.clone();
+            bad[index] = 1;
+            assert!(
+                decode_enveloped_record(&bad, 0).is_err(),
+                "padding at {index}"
+            );
+        }
+        let mut oversized = frame.clone();
+        oversized.extend_from_slice(&[0; ENVELOPE_BLOCK_LEN]);
+        oversized[FRAME_MAGIC_LEN..FRAME_KIND_OFFSET].copy_from_slice(&3u32.to_le_bytes());
+        assert!(decode_enveloped_record(&oversized, 0).is_err());
+
+        let mut gap = first.as_bytes().to_vec();
+        gap.extend_from_slice(&[0; CAPABILITY_PROOF_EDGE_LEN]);
+        gap.extend_from_slice(&first.as_bytes()[CAPABILITY_PROOF_HEADER_LEN..]);
+        assert!(decode_enveloped_record(&framed_capability_proof(&gap), 0).is_err());
     }
 
     #[test]
@@ -5275,7 +5366,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "proof.pile");
         let proof = capability_fixture(11, [12; 32]);
-        assert_eq!(proof.as_bytes().len(), 241);
+        assert_eq!(proof.as_bytes().len(), 257);
 
         let mut pile = Pile::open(&path).unwrap();
         pile.insert_proof(proof.clone()).unwrap();
@@ -5306,7 +5397,7 @@ mod tests {
             panic!("native proof decoded as another record kind");
         };
         assert_eq!(id, proof.id());
-        assert_eq!(data_offset, 96);
+        assert_eq!(data_offset, 32);
         assert_eq!(data_len, proof.as_bytes().len());
         assert_eq!(
             &records.bytes()[data_offset..data_offset + data_len],
@@ -5343,7 +5434,7 @@ mod tests {
         let mut retained_iterator = snapshot.proofs().unwrap();
         let iterated = proofs.next().unwrap().unwrap();
         assert!(proofs.next().is_none());
-        let body_offset = std::mem::size_of::<CapabilityProofRecordPrefix>();
+        let body_offset = FRAME_KIND_OFFSET;
         assert_eq!(
             proof.as_bytes().as_ptr(),
             pile.mmap.as_ptr().wrapping_add(body_offset),
@@ -5494,9 +5585,16 @@ mod tests {
         let root_only_path = fresh_empty_pile_path(&dir, "root-only.pile");
         let mut root_only = Vec::with_capacity(256);
         root_only.extend_from_slice(
-            CapabilityProofRecordPrefix::new(1, CAPABILITY_PROOF_HEADER_LEN as u64).as_bytes(),
+            RecordFrame {
+                magic: FRAME_MAGIC,
+                span_blocks: 1u32.to_le_bytes(),
+                record_kind: CAPABILITY_PROOF_MAGIC,
+            }
+            .as_bytes(),
         );
-        root_only.extend_from_slice(&one_edge.as_bytes()[..CAPABILITY_PROOF_HEADER_LEN]);
+        root_only.extend_from_slice(
+            &one_edge.as_bytes()[CAPABILITY_PROOF_MAGIC.len()..CAPABILITY_PROOF_HEADER_LEN],
+        );
         root_only.resize(256, 0);
         append_test_bytes(&root_only_path, &root_only);
         let mut pile = Pile::open(&root_only_path).unwrap();
@@ -5515,7 +5613,7 @@ mod tests {
                 SigningKey::from_bytes(&[24; 32]).verifying_key(),
             )
             .unwrap();
-        let padding_offset = 96 + two_edge.as_bytes().len();
+        let padding_offset = 32 + two_edge.as_bytes().len();
         let mut pile = Pile::open(&padded_path).unwrap();
         pile.insert_proof(two_edge).unwrap();
         pile.close().unwrap();

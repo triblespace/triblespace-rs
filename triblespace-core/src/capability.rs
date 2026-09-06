@@ -41,11 +41,13 @@ pub mod policy;
 /// handles; only the resource consumer interprets the definition's facts.
 pub type CapabilityHandle = Inline<Handle<SimpleArchive>>;
 
-/// Exact magic of this canonical grammar. Incompatible grammars get new magic.
-/// Minted with `trible genid` on 2026-09-06.
-pub const CAPABILITY_PROOF_MAGIC: [u8; 16] = hex_literal::hex!("92DDF6E5ED9F35A5E513E74350AA1175");
+/// Exact type identity of this canonical grammar, also used as the Pile record kind.
+/// The handle names its SimpleArchive format description; incompatible grammars
+/// get a new description and therefore a new magic.
+pub const CAPABILITY_PROOF_MAGIC: [u8; 32] =
+    hex_literal::hex!("CF346E81157B2169045EA8574896BAD23976A4A08D7DC70DDCADABA9AFF2442A");
 pub const MAX_CAPABILITY_PROOF_STEPS: usize = u8::MAX as usize;
-pub const CAPABILITY_PROOF_HEADER_LEN: usize = 16 + 32 + 32;
+pub const CAPABILITY_PROOF_HEADER_LEN: usize = CAPABILITY_PROOF_MAGIC.len() + 32 + 32;
 pub const CAPABILITY_PROOF_EDGE_LEN: usize =
     CAPABILITY_HANDLE_LEN + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
 pub const MIN_CAPABILITY_PROOF_BYTES: usize =
@@ -366,7 +368,7 @@ impl CapabilityProof {
 
     /// Validate borrowed framing without allocating or assigning authority.
     pub(crate) fn validate_bytes(bytes: &[u8]) -> Result<(), CapabilityProofDecodeError> {
-        validate_framing(bytes, CAPABILITY_PROOF_MAGIC, CAPABILITY_HANDLE_LEN)
+        validate_framing(bytes, &CAPABILITY_PROOF_MAGIC, CAPABILITY_HANDLE_LEN)
     }
 
     /// Direct strong blob references, without acquisition or interpretation.
@@ -679,34 +681,30 @@ impl CapabilityProof {
 /// No capability interpretation or signature verification occurs here.
 fn validate_framing(
     bytes: &[u8],
-    magic: [u8; 16],
+    magic: &[u8],
     handle_len: usize,
 ) -> Result<(), CapabilityProofDecodeError> {
+    let header_len = magic.len() + RESOURCE_LEN + PUBLIC_KEY_LEN;
     let edge_len = handle_len + FLAGS_LEN + VALIDITY_LEN + PUBLIC_KEY_LEN + SIGNATURE_LEN;
-    if bytes.len() < CAPABILITY_PROOF_HEADER_LEN + edge_len
-        || (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) % edge_len != 0
-    {
+    if bytes.len() < header_len + edge_len || (bytes.len() - header_len) % edge_len != 0 {
         return Err(CapabilityProofDecodeError::InvalidLength {
             actual: bytes.len(),
         });
     }
-    if bytes[..magic.len()] != magic {
+    if &bytes[..magic.len()] != magic {
         return Err(CapabilityProofDecodeError::InvalidMagic);
     }
-    let steps = (bytes.len() - CAPABILITY_PROOF_HEADER_LEN) / edge_len;
+    let steps = (bytes.len() - header_len) / edge_len;
     if steps > MAX_CAPABILITY_PROOF_STEPS {
         return Err(CapabilityProofDecodeError::TooManySteps {
             count: steps,
             limit: MAX_CAPABILITY_PROOF_STEPS,
         });
     }
-    parse_key(&bytes[magic.len() + RESOURCE_LEN..CAPABILITY_PROOF_HEADER_LEN])
+    parse_key(&bytes[magic.len() + RESOURCE_LEN..header_len])
         .ok_or(CapabilityProofDecodeError::InvalidKey { key: 0 })?;
 
-    for (step, edge) in bytes[CAPABILITY_PROOF_HEADER_LEN..]
-        .chunks_exact(edge_len)
-        .enumerate()
-    {
+    for (step, edge) in bytes[header_len..].chunks_exact(edge_len).enumerate() {
         let flags = edge[handle_len];
         if flags & !KNOWN_FLAGS != 0 || CapabilityMode::from_bits(flags & MODE_MASK).is_none() {
             return Err(CapabilityProofDecodeError::InvalidFlags { step, flags });
@@ -736,8 +734,8 @@ pub(crate) const LEGACY_ACTION_PROOF_FIXTURE: [u8; 225] = hex_literal::hex!("5c1
 /// Recognize historical action-ID proofs as inert records, never authority.
 pub(crate) fn legacy_action_proof_is_structural(bytes: &[u8]) -> bool {
     let magic = hex_literal::hex!("5C154102198D7FED2EA797720C2E258D");
-    validate_framing(bytes, magic, 16).is_ok()
-        && bytes[CAPABILITY_PROOF_HEADER_LEN..]
+    validate_framing(bytes, &magic, 16).is_ok()
+        && bytes[magic.len() + RESOURCE_LEN + PUBLIC_KEY_LEN..]
             .chunks_exact(145)
             .all(|edge| edge[..16].iter().any(|byte| *byte != 0))
 }
@@ -1272,17 +1270,17 @@ mod tests {
             None,
         );
         let expected = hex_literal::hex!(
-            "92ddf6e5ed9f35a5e513e74350aa117505050505050505050505050505050505050505050505050505050505050505058a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c04040404040404040404040404040404040404040404040404040404040404040300000000000000000000000000000000000000000000000000000000000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b394005560b3791d23dac6bdf3b42f7bc642c7ed9a1893565f43a12dd58155998915c2293f5ab53fc4132ab550672fa9628019b67a1024f95e96c6866f628314870c"
+            "cf346e81157b2169045ea8574896bad23976a4a08d7dc70ddcadaba9aff2442a05050505050505050505050505050505050505050505050505050505050505058a88e3dd7409f195fd52db2d3cba5d72ca6709bf1d94121bf3748801b40f6f5c04040404040404040404040404040404040404040404040404040404040404040300000000000000000000000000000000000000000000000000000000000000008139770ea87d175f56a35466c34c7ecccb8d8a91b4ee37a25df60f5b8fc9b3947452e3732f2fbf4c822e9aa056319ec6b03ceb4ecb5c2ee85243b71b84d4c0d44193394fa199a9d4dfca5605adf1fa41d9754d115961e960644fcecf3b216e04"
         );
         assert_eq!(first.as_bytes(), expected);
         assert_eq!(
             first.id().raw,
-            hex_literal::hex!("d19203c071ace6babd555501e5f6b0f11c0b64e764643f22ccdc4e6bf75574ee")
+            hex_literal::hex!("ae6bf44e93e772a9a188911c2ff0df87f4822f05240ab427b0ed3e93677f8aa6")
         );
         assert_eq!(first.as_bytes().len(), MIN_CAPABILITY_PROOF_BYTES);
-        assert_eq!(&first.as_bytes()[..16], &CAPABILITY_PROOF_MAGIC);
-        assert_eq!(&first.as_bytes()[16..48], resource(5).as_bytes());
-        assert_eq!(&first.as_bytes()[48..80], &root.verifying_key().to_bytes());
+        assert_eq!(&first.as_bytes()[..32], &CAPABILITY_PROOF_MAGIC);
+        assert_eq!(&first.as_bytes()[32..64], resource(5).as_bytes());
+        assert_eq!(&first.as_bytes()[64..96], &root.verifying_key().to_bytes());
         assert_eq!(
             CapabilityProof::from_bytes(first.as_bytes()),
             Ok(first.clone())
@@ -1337,15 +1335,16 @@ mod tests {
         .unwrap();
         for offset in [
             0,
-            16,
-            48,
-            80,
+            31,
+            32,
+            64,
             96,
-            97,
-            113,
+            127,
+            128,
             129,
+            145,
             161,
-            200,
+            193,
             path.as_bytes().len() - 1,
         ] {
             let mut tampered = path.as_bytes().to_vec();

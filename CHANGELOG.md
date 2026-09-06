@@ -16,6 +16,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Make the canonical PROOF magic the native Pile record kind itself. Records
+  are generic framing followed directly by the prefix-signed proof; remove the
+  nested length/reserved wrapper and separate inner magic. Fixed-width edges
+  and zero padding preserve exact proof bytes without another length field.
+  The standalone wire value, signatures, content hash, and mmap view all start
+  at the same 32-byte type identifier. New description anchor minted with
+  `trible genid` on 2026-09-06: `D81538DE724347280A6D97F51EDE08F6`.
 - Store resource authorization as descriptor-local capability-handle bindings
   to Open or independent-root quorum policies. Collection READ/WRITE remain
   construction conveniences over stable SimpleArchive definition blobs; custom
