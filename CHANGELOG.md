@@ -16,6 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Retain finite, hard-bounded local learned-route failure cooldowns across
+  repeated DHT referrals. Filter both lookup seeds and reply candidates without
+  tying lookup-local progress to positive K-bucket retention; configured routes,
+  direct authenticated recovery, and retry after expiry remain available.
 - Alternate startup provider-publication backlog with incremental arrivals in
   bounded pending turns, preserving due-renewal/retry fairness and each pending
   lane through topology outages. Report scalar queue, attempt, and retained

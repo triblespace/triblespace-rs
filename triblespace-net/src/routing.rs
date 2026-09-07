@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 
+use crate::clock::Mono;
 use crate::transport::PeerId;
 
 /// An arbitrary point in the 256-bit XOR keyspace.
@@ -19,6 +20,7 @@ pub(crate) const ALPHA: usize = 3;
 const BUCKET_COUNT: usize = std::mem::size_of::<PeerId>() * 8;
 const ROUTING_CAPACITY: usize = BUCKET_COUNT * K;
 const MAX_LOOKUP_QUERIES: usize = ROUTING_CAPACITY;
+const LEARNED_ROUTE_FAILURE_COOLDOWN: std::time::Duration = crate::RETRY_BACKOFF_CAP;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum RouteState {
@@ -32,12 +34,16 @@ pub(crate) enum RouteState {
 #[derive(Default)]
 struct Bucket {
     entries: BTreeMap<PeerId, RouteState>,
+    /// At most K recent local failures, independently of positive-route
+    /// retention. Third-party referrals cannot erase or extend these deadlines.
+    failed_until: BTreeMap<PeerId, Mono>,
 }
 
 /// A deterministic, hard-bounded Kademlia-style routing table.
 ///
 /// Each peer occupies the bucket selected by the most significant bit in its
-/// XOR distance from `local`.  A bucket retains at most [`K`] identities.
+/// XOR distance from `local`. A bucket retains at most [`K`] positive routes
+/// and independently at most [`K`] recent learned-route failure deadlines.
 /// Verified peers take precedence over candidates; ties are resolved by XOR
 /// distance from the local peer and then by identity.  Consequently inserting
 /// the same evidence in a different order produces the same table. Explicit
@@ -71,8 +77,12 @@ impl RoutingTable {
     }
 
     /// Remember an unverified identity without demoting an already verified
-    /// route. Returns whether the identity survived the bucket bound.
+    /// route. Cooling learned routes are not admitted. Returns whether the
+    /// identity survived admission and the positive-route bucket bound.
     pub(crate) fn note_candidate(&mut self, peer: PeerId) -> bool {
+        if !self.query_eligible(peer, crate::clock::mono_now()) {
+            return false;
+        }
         if self.configured.contains(&peer) {
             return true;
         }
@@ -82,7 +92,44 @@ impl RoutingTable {
     /// Promote a peer only after the caller observed a direct authenticated
     /// response. Returns whether the identity survived the bucket bound.
     pub(crate) fn promote_authenticated(&mut self, peer: PeerId) -> bool {
+        if let Some(bucket) = bucket_index(self.local, peer) {
+            self.buckets[bucket].failed_until.remove(&peer);
+        }
         self.insert(peer, RouteState::Verified)
+    }
+
+    /// A local failed request outweighs unverified gossip for a finite window.
+    /// Explicit configuration remains eligible, including cold bootstraps.
+    /// This predicate is independent of positive-route bucket admission.
+    fn query_eligible(&self, peer: PeerId, now: Mono) -> bool {
+        self.configured.contains(&peer)
+            || bucket_index(self.local, peer)
+                .and_then(|bucket| self.buckets[bucket].failed_until.get(&peer))
+                .is_none_or(|until| now >= *until)
+    }
+
+    fn note_failure(&mut self, peer: PeerId, now: Mono) {
+        self.remove(peer);
+        if self.configured.contains(&peer) {
+            return;
+        }
+        let Some(bucket) = bucket_index(self.local, peer) else {
+            return;
+        };
+        let failures = &mut self.buckets[bucket].failed_until;
+        // Expiry work and eviction inspect at most K entries in this bucket,
+        // never a process-wide peer inventory. Positive-route eviction does
+        // not erase recent failure evidence, nor does referral insertion.
+        failures.retain(|_, until| now < *until);
+        failures.insert(peer, now + LEARNED_ROUTE_FAILURE_COOLDOWN);
+        if failures.len() > K {
+            let oldest = *failures
+                .iter()
+                .min_by_key(|(peer, until)| (**until, **peer))
+                .expect("an overfull failure bucket is nonempty")
+                .0;
+            failures.remove(&oldest);
+        }
     }
 
     /// Remove failed learned evidence. Explicit local configuration survives
@@ -156,7 +203,11 @@ impl RoutingTable {
         {
             peers.insert(peer);
         }
-        peers.into_iter().collect()
+        let now = crate::clock::mono_now();
+        peers
+            .into_iter()
+            .filter(|peer| self.query_eligible(*peer, now))
+            .collect()
     }
 
     fn insert(&mut self, peer: PeerId, state: RouteState) -> bool {
@@ -325,7 +376,14 @@ impl IterativeLookup {
                 .chain(std::iter::once(peer)),
         );
         routes.promote_authenticated(peer);
-        let candidates = bounded_closest(self.target, self.local, candidates);
+        let now = crate::clock::mono_now();
+        let candidates = bounded_closest(
+            self.target,
+            self.local,
+            candidates
+                .into_iter()
+                .filter(|candidate| routes.query_eligible(*candidate, now)),
+        );
         for candidate in &candidates {
             routes.note_candidate(*candidate);
         }
@@ -334,13 +392,14 @@ impl IterativeLookup {
         true
     }
 
-    /// Complete one in-flight request as failed and remove its stale route.
+    /// Complete one in-flight request as failed, remove its stale route, and
+    /// retain bounded local failure evidence across subsequent referrals.
     pub(crate) fn record_failure(&mut self, peer: PeerId, routes: &mut RoutingTable) -> bool {
         if self.shortlist.get(&peer) != Some(&LookupState::InFlight) {
             return false;
         }
         self.shortlist.remove(&peer);
-        routes.remove(peer);
+        routes.note_failure(peer, crate::clock::mono_now());
         self.trim_shortlist();
         true
     }
@@ -672,6 +731,131 @@ mod tests {
         assert!(lookup.record_authenticated_response(named, [], &mut routes));
         assert_eq!(routes.state(named), Some(RouteState::Verified));
         assert!(lookup.is_finished());
+    }
+
+    #[test]
+    fn learned_failure_cooldown_survives_gossip_and_expires() {
+        let now = crate::clock::mono_now();
+        let local = id(0);
+        let peer = id(2);
+        let mut routes = RoutingTable::new(local, []);
+        routes.promote_authenticated(peer);
+        routes.note_failure(peer, now);
+        let until = now + LEARNED_ROUTE_FAILURE_COOLDOWN;
+        let bucket = bucket_index(local, peer).unwrap();
+        for _ in 0..3 {
+            assert!(!routes.note_candidate(peer));
+            assert!(!routes.closest(peer, K).contains(&peer));
+            assert_eq!(routes.buckets[bucket].failed_until[&peer], until);
+        }
+        assert!(!routes.query_eligible(peer, now));
+        assert!(!routes.query_eligible(
+            peer,
+            now + (LEARNED_ROUTE_FAILURE_COOLDOWN - std::time::Duration::from_nanos(1))
+        ));
+        assert!(routes.query_eligible(peer, until));
+    }
+
+    #[test]
+    fn direct_authenticated_recovery_clears_learned_failure_cooldown() {
+        let now = crate::clock::mono_now();
+        let peer = id(2);
+        let mut routes = RoutingTable::new(id(0), []);
+        routes.note_failure(peer, now);
+        assert!(!routes.query_eligible(peer, now));
+        assert!(routes.promote_authenticated(peer));
+        assert!(routes.query_eligible(peer, now));
+        assert_eq!(routes.state(peer), Some(RouteState::Verified));
+        assert_eq!(routes.closest(peer, K), vec![peer]);
+    }
+
+    #[test]
+    fn explicit_configuration_remains_eligible_after_local_failure() {
+        let now = crate::clock::mono_now();
+        let peer = id(2);
+        let mut routes = RoutingTable::new(id(0), [peer]);
+        routes.promote_authenticated(peer);
+        routes.note_failure(peer, now);
+        assert!(routes.query_eligible(peer, now));
+        assert!(routes.note_candidate(peer));
+        assert_eq!(routes.state(peer), Some(RouteState::Candidate));
+        assert_eq!(routes.closest(peer, K), vec![peer]);
+        assert!(
+            routes
+                .buckets
+                .iter()
+                .all(|bucket| bucket.failed_until.is_empty())
+        );
+    }
+
+    #[test]
+    fn referral_cooldown_is_independent_of_positive_bucket_retention() {
+        let local = id(0);
+        let seed = id(1);
+        let named = id(0xFFFF);
+        let mut routes = RoutingTable::new(local, [seed]);
+        for n in 0x8000..0x8000 + K as u16 {
+            routes.promote_authenticated(id(n));
+        }
+        assert!(!routes.note_candidate(named));
+        assert!(routes.query_eligible(named, crate::clock::mono_now()));
+
+        // Healthy lookup-local referrals remain usable even when the long-lived
+        // table's local-distance bucket cannot retain them.
+        let mut first = IterativeLookup::new(local, named, [seed]);
+        assert_eq!(first.next_batch(), vec![seed]);
+        assert!(first.record_authenticated_response(seed, [named], &mut routes));
+        assert_eq!(first.next_batch(), vec![named]);
+        assert!(first.record_failure(named, &mut routes));
+        assert_eq!(routes.state(named), None);
+
+        // The same referral cannot bypass actual local failure evidence just
+        // because the positive route was never retained.
+        let mut second = IterativeLookup::new(local, named, [seed]);
+        assert_eq!(second.next_batch(), vec![seed]);
+        assert!(second.record_authenticated_response(seed, [named], &mut routes));
+        assert!(second.next_batch().is_empty());
+        assert!(second.is_finished());
+
+        // Direct recovery also clears failure evidence independently of whether
+        // that verified route survives the positive bucket's distance bound.
+        assert!(!routes.promote_authenticated(named));
+        let mut recovered = IterativeLookup::new(local, named, [seed]);
+        assert_eq!(recovered.next_batch(), vec![seed]);
+        assert!(recovered.record_authenticated_response(seed, [named], &mut routes));
+        assert_eq!(recovered.next_batch(), vec![named]);
+    }
+
+    #[test]
+    fn learned_failure_memory_is_bounded_and_expiry_reclamation_is_bucket_local() {
+        let now = crate::clock::mono_now();
+        let local = id(0);
+        let mut routes = RoutingTable::new(local, []);
+        let bucket = bucket_index(local, id(0x8000)).unwrap();
+        for n in 0..(K * 3) as u16 {
+            routes.note_failure(
+                id(0x8000 + n),
+                now + std::time::Duration::from_nanos(u64::from(n)),
+            );
+            assert!(routes.buckets[bucket].failed_until.len() <= K);
+        }
+        assert_eq!(routes.buckets[bucket].failed_until.len(), K);
+        assert_eq!(routes.learned_len(), 0);
+        assert!(!routes.query_eligible(id(0x8000 + (K * 3 - 1) as u16), now));
+
+        routes.note_failure(
+            id(0xA000),
+            now + LEARNED_ROUTE_FAILURE_COOLDOWN + std::time::Duration::from_secs(1),
+        );
+        assert_eq!(routes.buckets[bucket].failed_until.len(), 1);
+        assert_eq!(
+            routes
+                .buckets
+                .iter()
+                .map(|bucket| bucket.failed_until.len())
+                .sum::<usize>(),
+            1
+        );
     }
 
     #[test]

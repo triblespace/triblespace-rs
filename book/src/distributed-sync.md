@@ -263,10 +263,16 @@ When the routing window expires, issued requests still awaiting a reply count
 as failed learned routes. They cannot occupy every slot again on the next
 background attempt merely because cancellation preceded the dial deadline.
 Unissued candidates and partial authenticated responders are preserved, and
-explicitly configured routes remain available for retries. This does not make
-a configured-only cold dial longer than three seconds fit the background
-window: if each attempt starts equally cold, background retries can still miss
-that endpoint. Foreground acquisition retains its separate end-to-end bound.
+explicitly configured routes remain available for retries. Each routing bucket
+also retains at most K local learned-route failures for sixty seconds, separately
+from its positive routes. Repeated third-party referrals cannot erase or extend
+that cooldown: it gates both seeds and reply candidates even when positive
+bucket retention differs from the lookup-local shortlist. Direct authenticated
+success clears a cooldown immediately; expiry permits a new probe. This is
+bounded, disposable liveness state, not authority or a permanent blacklist.
+This does not make a configured-only cold dial longer than three seconds fit
+the background window: if each attempt starts equally cold, background retries
+can still miss that endpoint. Foreground acquisition retains its separate end-to-end bound.
 Diagnostics distinguish a successful lookup with no advertised provider from
 failure to reach a replica, a provider transport/protocol failure, or exhaustion
 of the end-to-end budget. A directory miss is an observation, not proof that H
