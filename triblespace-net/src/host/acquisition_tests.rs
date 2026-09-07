@@ -164,6 +164,309 @@ impl Drop for Fixture {
     }
 }
 
+/// An independent directory or restarted provider using the production RPC
+/// handler. Its control events remain observable, and dropping it stops its
+/// accept loop. Crash faults below occur between requests: SimNet resets the
+/// connection, but does not reset an already-open raw DuplexStream itself.
+struct RecoveryNode {
+    peer: PeerId,
+    directory: Arc<Mutex<ProviderDirectory>>,
+    events: tokio::sync::mpsc::Receiver<NetEventBatch>,
+    server: tokio::task::JoinHandle<()>,
+}
+
+impl RecoveryNode {
+    fn new(net: &SimNet, key: &SigningKey, snapshot: Option<Arc<StoreSnapshot>>) -> Self {
+        let peer = key.verifying_key().to_bytes();
+        let mut harness = net.join(key);
+        let directory = Arc::new(Mutex::new(ProviderDirectory::new(peer)));
+        let (events_tx, events) = tokio::sync::mpsc::channel(16);
+        let handler = SnapshotHandler {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
+            providers: directory.clone(),
+            serve_collections: false,
+            local_id: peer,
+            events: events_tx,
+            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
+        };
+        let server = tokio::spawn(async move {
+            while let Some(incoming) = harness.incoming.recv().await {
+                assert_eq!(incoming.alpn, PILE_SYNC_ALPN);
+                let permit = handler
+                    .inbound_connections
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    handler.handle::<SimTransport>(incoming.conn, permit).await;
+                });
+            }
+        });
+        Self {
+            peer,
+            directory,
+            events,
+            server,
+        }
+    }
+
+    fn advertise(&self, hash: RawHash, provider: PeerId) -> crate::clock::Mono {
+        // Test setup installs exactly the soft state an authenticated provider
+        // PUT would leave; no raw H is sent to this node by the reader.
+        let now = crate::clock::mono_now();
+        assert!(self.directory.lock().unwrap().put(
+            blob_locator(hash),
+            provider,
+            blob_provider_token(hash, provider),
+            now,
+        ));
+        now
+    }
+
+    fn assert_no_events(&mut self) {
+        assert!(self.events.try_recv().is_err());
+    }
+}
+
+impl Drop for RecoveryNode {
+    fn drop(&mut self) {
+        self.server.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn stale_provider_lease_survives_loss_alternate_fetch_and_same_endpoint_restart() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    // These deterministic endpoint seeds are test-only, not protocol IDs.
+    let directory_key = SigningKey::from_bytes(&[101; 32]);
+    let alternate_key = SigningKey::from_bytes(&[102; 32]);
+    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    directory.advertise(fixture.hash, fixture.provider);
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        1
+    );
+
+    // Losing the provider leaves its still-live directory lease untouched.
+    // Its cached connection must fail without preventing the alternate fetch.
+    fixture.net.crash(fixture.provider);
+    fixture.server.abort();
+    let serving = fixture.provider_snapshot.lock().unwrap().clone();
+    let mut alternate = RecoveryNode::new(&fixture.net, &alternate_key, serving);
+    let last_advertised = directory.advertise(fixture.hash, alternate.peer);
+    let before = directory
+        .directory
+        .lock()
+        .unwrap()
+        .get(blob_locator(fixture.hash), crate::clock::mono_now());
+    assert_eq!(before.len(), 2);
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert!(started.elapsed() < INTERACTIVE_FETCH_DEADLINE);
+    assert_eq!(
+        fixture.net.dial_count(fixture.client.my_id, alternate.peer),
+        1
+    );
+    assert!(
+        !fixture
+            .client
+            .pool
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&fixture.provider)
+    );
+    let dials_before_restart = fixture
+        .net
+        .dial_count(fixture.client.my_id, fixture.provider);
+
+    // Reconstruct all provider-side soft state at the same endpoint, retaining
+    // only its immutable store observation. No re-announcement is made: this
+    // fresh handler must be discoverable through the original directory lease.
+    fixture.net.crash(alternate.peer);
+    alternate.server.abort();
+    let provider_key = SigningKey::from_bytes(&[91; 32]);
+    let restored = StoreSnapshot::from_store_changes(
+        fixture.store.snapshot().unwrap(),
+        &ActiveCollections::new(),
+        provider_key.verifying_key(),
+        None,
+        None,
+        StoreChanges::ALL,
+        false,
+        None,
+    )
+    .unwrap();
+    let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    assert_eq!(restarted.peer, fixture.provider);
+    assert_eq!(
+        restarted.directory.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        dials_before_restart + 1
+    );
+    assert_eq!(
+        directory
+            .directory
+            .lock()
+            .unwrap()
+            .get(blob_locator(fixture.hash), crate::clock::mono_now()),
+        before,
+        "recovery leaves both retained provider hints intact"
+    );
+    assert!(
+        directory
+            .directory
+            .lock()
+            .unwrap()
+            .get(
+                blob_locator(fixture.hash),
+                last_advertised + crate::provider::PROVIDER_LEASE_LIFETIME,
+            )
+            .is_empty(),
+        "discovery and recovery must not renew either original lease"
+    );
+    let snapshot = fixture.store.snapshot().unwrap();
+    assert_eq!(snapshot.records().unwrap().count(), 0);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    assert!(fixture.events.try_recv().is_err());
+    directory.assert_no_events();
+    alternate.assert_no_events();
+    restarted.assert_no_events();
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelled_discovered_provider_dial_leaves_a_same_client_retry_usable() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let directory_key = SigningKey::from_bytes(&[103; 32]);
+    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    directory.advertise(fixture.hash, fixture.provider);
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    // Warm only the directory, so cancellation lands in the discovered
+    // provider's dial rather than the bootstrap lookup.
+    fixture
+        .client
+        .find_node(directory.peer, blob_locator(fixture.hash))
+        .await
+        .unwrap();
+    fixture.net.stall_dials(fixture.provider);
+    let started = tokio::time::Instant::now();
+    assert!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, Duration::from_secs(1))
+            .await
+            .is_none()
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(1));
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        1
+    );
+    {
+        let pool = fixture.client.pool.lock().unwrap();
+        assert!(!pool.entries.contains_key(&fixture.provider));
+        assert!(pool.entries.contains_key(&directory.peer));
+        assert_eq!(pool.entries.len(), 1);
+    }
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.net.unstall_dials(fixture.provider);
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        2
+    );
+    assert_eq!(
+        fixture.net.dial_count(fixture.client.my_id, directory.peer),
+        1
+    );
+    fixture.assert_no_control_effects();
+    directory.assert_no_events();
+}
+
+#[tokio::test(start_paused = true)]
+async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let directory_key = SigningKey::from_bytes(&[104; 32]);
+    let stalled_key = SigningKey::from_bytes(&[105; 32]);
+    let mut directory = RecoveryNode::new(&fixture.net, &directory_key, None);
+    let stalled = stalled_key.verifying_key().to_bytes();
+    let _stalled_harness = fixture.net.join(&stalled_key);
+    fixture.net.stall_dials(stalled);
+    directory.advertise(fixture.hash, stalled);
+    directory.advertise(fixture.hash, fixture.provider);
+    *fixture.client.candidates.lock().unwrap() =
+        RoutingTable::new(fixture.client.my_id, [directory.peer]);
+    fixture
+        .client
+        .find_node(directory.peer, blob_locator(fixture.hash))
+        .await
+        .unwrap();
+
+    let started = tokio::time::Instant::now();
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(started.elapsed(), Duration::from_secs(4));
+    assert_eq!(fixture.net.dial_count(fixture.client.my_id, stalled), 1);
+    let pool = fixture.client.pool.lock().unwrap();
+    assert!(!pool.entries.contains_key(&stalled));
+    assert_eq!(pool.entries.len(), 2);
+    drop(pool);
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    fixture.assert_no_control_effects();
+    directory.assert_no_events();
+}
+
 #[tokio::test(start_paused = true)]
 async fn cold_exact_lookup_outlives_background_cap_within_caller_deadline() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();

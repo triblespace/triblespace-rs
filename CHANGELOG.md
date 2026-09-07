@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Exercise exact-H acquisition after provider loss with an unchanged stale
+  directory lease, an independently advertised alternate, and a same-endpoint
+  handler restart. Cover cancellation of a discovered provider dial followed
+  by a same-client retry, retaining the directory connection without abandoned
+  pool entries or collection/WANT effects, and cancellation of a stalled dial
+  when another discovered provider succeeds. These paused-time simulation
+  tests change no production protocol or persistence behavior.
+
 - Recheck Pile shared-replay parse failures once under an exclusive file lock
   with a fresh observed length. This distinguishes an in-flight append from a
   persistent malformed record without retrying writes or truncating data, and
