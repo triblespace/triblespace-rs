@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a test-only DHT restart experiment using the real XOR routing and lookup
+  machine. Save authenticated endpoint identities as a bounded canonical PATCH
+  set in native bytes, restore only candidates, and compare cold/warm discovery,
+  dead contacts, authenticated poisoned views, and a configured-bootstrap first
+  wave. No host persistence, provider lease, pile format, or protocol change.
+
 - Exercise exact-H acquisition after provider loss with an unchanged stale
   directory lease, an independently advertised alternate, and a same-endpoint
   handler restart. Cover cancellation of a discovered provider dial followed
