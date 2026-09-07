@@ -44,9 +44,9 @@ use crate::protocol::{
     recv_hash, recv_u8, send_hash, send_u8, serve_get_blob,
 };
 use crate::provider::{
-    ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublisher, ProviderPutResult,
-    ProviderToken, PublicationResult, blob_provider_token, collection_provider_key,
-    collection_provider_token, provider_lease_token,
+    ProviderDirectory, ProviderKey, ProviderObservation, ProviderPublication, ProviderPublisher,
+    ProviderPutResult, ProviderToken, PublicationResult, blob_provider_token,
+    collection_provider_key, collection_provider_token, provider_lease_token,
 };
 use crate::routing::{ALPHA, IterativeLookup, K, RoutingKey, RoutingTable};
 use crate::transport::{Conn, Harness, PeerId, Transport};
@@ -797,6 +797,7 @@ const OP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 const REPAIR_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const REPAIR_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const HOST_POLL_PERIOD: std::time::Duration = std::time::Duration::from_millis(10);
+const PROVIDER_PROGRESS_PERIOD: std::time::Duration = std::time::Duration::from_secs(30);
 const CONNECTION_IDLE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(120);
 const REQUEST_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
 const MAX_CONNECTIONS: usize = 64;
@@ -818,7 +819,7 @@ struct RepairOutcome {
 }
 
 struct PublicationOutcome {
-    key: ProviderKey,
+    work: ProviderPublication,
     result: PublicationResult,
 }
 
@@ -1084,6 +1085,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let (publication_tx, mut publication_rx) =
         tokio::sync::mpsc::unbounded_channel::<PublicationOutcome>();
     let mut publications_in_flight = HashSet::new();
+    let mut next_publication_progress = crate::clock::mono_now() + PROVIDER_PROGRESS_PERIOD;
+    let mut publication_attempts = 0u64;
+    let mut remote_acknowledged_attempts = 0u64;
+    let mut remote_rejected_attempts = 0u64;
+    let mut unavailable_attempts = 0u64;
 
     loop {
         let mut disconnected = false;
@@ -1255,8 +1261,19 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
         }
         while let Ok(outcome) = publication_rx.try_recv() {
-            publications_in_flight.remove(&outcome.key);
-            let effect = publisher.complete(outcome.key, outcome.result, crate::clock::mono_now());
+            publications_in_flight.remove(&outcome.work.key);
+            match outcome.result {
+                PublicationResult::Published => {
+                    remote_acknowledged_attempts = remote_acknowledged_attempts.saturating_add(1);
+                }
+                PublicationResult::RemoteRejected => {
+                    remote_rejected_attempts = remote_rejected_attempts.saturating_add(1);
+                }
+                PublicationResult::NoAuthenticatedRemoteReplica => {
+                    unavailable_attempts = unavailable_attempts.saturating_add(1);
+                }
+            }
+            let effect = publisher.complete(outcome.work, outcome.result, crate::clock::mono_now());
             if effect.topology_outage_started {
                 warn!(
                     "no authenticated remote DHT replica is reachable; provider publication is paused behind one bounded topology probe"
@@ -1267,7 +1284,6 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
             if effect.retry_budget_full {
                 warn!(
-                    key = %hex::encode(&outcome.key[..4]),
                     "provider retry budget full after an authenticated remote rejected the announcement; exact discovery is degraded until the renewal cursor returns"
                 );
             }
@@ -1451,14 +1467,16 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
 
         while publications_in_flight.len() < ALPHA && publication_budget.permits_attempt() {
-            let Some((key, identity)) = publisher.next(now) else {
+            let Some(work) = publisher.next(now) else {
                 break;
             };
+            let key = work.key;
             if !publications_in_flight.insert(key) {
                 let _ = publisher.retry(key, now);
                 break;
             }
             publication_budget.consume_attempt();
+            publication_attempts = publication_attempts.saturating_add(1);
             if publication_budget.is_exhausted() && !publication_budget_reported {
                 warn!(
                     limit = publication_limit.expect("a finite budget can be exhausted"),
@@ -1468,11 +1486,39 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
             let client = provider_client.clone();
             let publication_tx = publication_tx.clone();
-            let token = provider_lease_token(identity, key, my_id);
+            let token = provider_lease_token(work.identity, key, my_id);
             tokio::spawn(async move {
                 let result = client.announce_key(key, token).await;
-                let _ = publication_tx.send(PublicationOutcome { key, result });
+                let _ = publication_tx.send(PublicationOutcome { work, result });
             });
+        }
+
+        if now >= next_publication_progress {
+            let progress = publisher.progress();
+            // These O(1) soft-state counts may include unpruned expiry. Never
+            // wait for a directory RPC's lock just to emit diagnostics.
+            let directory = providers
+                .try_lock()
+                .ok()
+                .map(|directory| directory.retained_counts());
+            tracing::info!(
+                resident = progress.resident,
+                startup_pending = progress.startup_pending,
+                incremental_pending = progress.incremental_pending,
+                retry_pending = progress.retry_pending,
+                renewal_remaining = progress.renewal_remaining,
+                in_flight = publications_in_flight.len(),
+                topology_paused = progress.topology_paused,
+                publication_budget_exhausted = publication_budget.is_exhausted(),
+                publication_attempts,
+                remote_acknowledged_attempts,
+                remote_rejected_attempts,
+                unavailable_attempts,
+                directory_memberships = ?directory.map(|counts| counts.0),
+                directory_locators = ?directory.map(|counts| counts.1),
+                "provider publication progress; acknowledgements count attempts, not unique lease coverage"
+            );
+            next_publication_progress = now + PROVIDER_PROGRESS_PERIOD;
         }
 
         tokio::time::sleep(HOST_POLL_PERIOD).await;

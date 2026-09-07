@@ -224,14 +224,43 @@ pub(crate) struct PublicationEffect {
     pub(crate) retry_budget_full: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationLane {
+    Startup,
+    Incremental,
+}
+
+/// One bounded in-flight attempt, retaining its pending lane through a topology
+/// outage. Retries and renewals return to historical work, not fresh arrivals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderPublication {
+    pub(crate) key: ProviderKey,
+    pub(crate) identity: ProviderIdentity,
+    lane: PublicationLane,
+}
+
+/// Constant-time operational counts, not unique remote lease coverage.
+pub(crate) struct PublicationProgress {
+    pub(crate) resident: u64,
+    pub(crate) startup_pending: u64,
+    pub(crate) incremental_pending: u64,
+    pub(crate) retry_pending: u64,
+    pub(crate) renewal_remaining: u64,
+    pub(crate) topology_paused: bool,
+}
+
 /// Bounded-work publication scheduler for an arbitrarily large resident set.
 ///
-/// Snapshot changes use PATCH difference to queue newly resident keys. One
-/// persistent ordered cursor renews the complete set over one third of a lease; no
-/// timer tick scans the whole inventory or allocates a flat resident queue.
+/// Snapshot changes use PATCH difference to queue newly resident keys separately
+/// from startup inventory. These two queues alternate within the pending lane:
+/// neither waits for the other to drain, irrespective of their locator ordering.
+/// Retry and due-renewal turns retain their existing outer alternation. One
+/// persistent ordered cursor renews the complete set over one third of a lease;
+/// no timer tick scans the inventory or allocates a flat resident queue.
 pub(crate) struct ProviderPublisher {
     resident: ProviderSet,
     initialized: bool,
+    startup: ProviderSet,
     additions: ProviderSet,
     retries: ProviderSet,
     retry_at: Mono,
@@ -239,6 +268,7 @@ pub(crate) struct ProviderPublisher {
     next_renewal: Mono,
     prefer_cycle: bool,
     prefer_retry: bool,
+    prefer_startup: bool,
     topology_outage: Option<PublicationTopologyOutage>,
 }
 
@@ -249,6 +279,7 @@ impl ProviderPublisher {
         Self {
             resident: ProviderSet::default(),
             initialized: false,
+            startup: ProviderSet::default(),
             additions: ProviderSet::default(),
             retries: ProviderSet::default(),
             retry_at: now,
@@ -256,6 +287,7 @@ impl ProviderPublisher {
             next_renewal: now + PROVIDER_RENEWAL_PERIOD,
             prefer_cycle: false,
             prefer_retry: false,
+            prefer_startup: true,
             topology_outage: None,
         }
     }
@@ -263,15 +295,27 @@ impl ProviderPublisher {
     pub(crate) fn install(&mut self, resident: ProviderSet, now: Mono) {
         if self.initialized {
             let added = resident.leases.difference(&self.resident.leases);
+            self.startup.leases = self.startup.leases.intersect(&resident.leases);
             self.additions.leases = self.additions.leases.intersect(&resident.leases);
             self.additions.leases.union(added);
             self.retries.leases = self.retries.leases.intersect(&resident.leases);
         } else {
             self.initialized = true;
-            self.additions = resident.clone();
+            self.startup = resident.clone();
             self.next_renewal = now + PROVIDER_RENEWAL_PERIOD;
         }
         self.resident = resident;
+    }
+
+    pub(crate) fn progress(&self) -> PublicationProgress {
+        PublicationProgress {
+            resident: self.resident.leases.len(),
+            startup_pending: self.startup.leases.len(),
+            incremental_pending: self.additions.leases.len(),
+            retry_pending: self.retries.leases.len(),
+            renewal_remaining: self.cycle.as_ref().map_or(0, |cycle| cycle.remaining),
+            topology_paused: self.topology_outage.is_some(),
+        }
     }
 
     /// Queue one failed publication without allowing an outage to duplicate
@@ -296,13 +340,17 @@ impl ProviderPublisher {
         true
     }
 
-    fn preserve_for_topology_retry(&mut self, key: ProviderKey) {
-        let Some(identity) = self.resident.leases.get(&key).copied() else {
+    fn preserve_for_topology_retry(&mut self, work: ProviderPublication) {
+        let Some(identity) = self.resident.leases.get(&work.key).copied() else {
             return;
         };
-        self.additions
+        let pending = match work.lane {
+            PublicationLane::Startup => &mut self.startup,
+            PublicationLane::Incremental => &mut self.additions,
+        };
+        pending
             .leases
-            .replace(&PatchEntry::with_value(&key, identity));
+            .replace(&PatchEntry::with_value(&work.key, identity));
     }
 
     fn topology_backoff(attempts: u32) -> Duration {
@@ -314,10 +362,11 @@ impl ProviderPublisher {
 
     pub(crate) fn complete(
         &mut self,
-        key: ProviderKey,
+        work: ProviderPublication,
         result: PublicationResult,
         now: Mono,
     ) -> PublicationEffect {
+        let key = work.key;
         match result {
             PublicationResult::Published => PublicationEffect {
                 topology_recovered: self.topology_outage.take().is_some(),
@@ -329,7 +378,7 @@ impl ProviderPublisher {
                 ..PublicationEffect::default()
             },
             PublicationResult::NoAuthenticatedRemoteReplica => {
-                self.preserve_for_topology_retry(key);
+                self.preserve_for_topology_retry(work);
                 let topology_outage_started = self.topology_outage.is_none();
                 match &mut self.topology_outage {
                     Some(outage) if outage.probe == Some(key) => {
@@ -379,17 +428,49 @@ impl ProviderPublisher {
     fn pop_pending(
         pending: &mut ProviderSet,
         resident: &ProviderSet,
-    ) -> Option<(ProviderKey, ProviderIdentity)> {
+        lane: PublicationLane,
+    ) -> Option<ProviderPublication> {
         loop {
             let key = *pending.leases.iter_ordered().next()?;
             pending.leases.remove(&key);
             if let Some(identity) = resident.leases.get(&key).copied() {
-                return Some((key, identity));
+                return Some(ProviderPublication {
+                    key,
+                    identity,
+                    lane,
+                });
             }
         }
     }
 
-    fn pop_cycle(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
+    fn pop_arrival(&mut self) -> Option<ProviderPublication> {
+        let next = if self.prefer_startup {
+            Self::pop_pending(&mut self.startup, &self.resident, PublicationLane::Startup).or_else(
+                || {
+                    Self::pop_pending(
+                        &mut self.additions,
+                        &self.resident,
+                        PublicationLane::Incremental,
+                    )
+                },
+            )
+        } else {
+            Self::pop_pending(
+                &mut self.additions,
+                &self.resident,
+                PublicationLane::Incremental,
+            )
+            .or_else(|| {
+                Self::pop_pending(&mut self.startup, &self.resident, PublicationLane::Startup)
+            })
+        };
+        if let Some(work) = next {
+            self.prefer_startup = work.lane == PublicationLane::Incremental;
+        }
+        next
+    }
+
+    fn pop_cycle(&mut self, now: Mono) -> Option<ProviderPublication> {
         loop {
             let (key, completed, started, total) = {
                 let cycle = self.cycle.as_mut()?;
@@ -420,7 +501,11 @@ impl ProviderPublisher {
                 }
             }
             if let Some(identity) = self.resident.leases.get(&key).copied() {
-                return Some((key, identity));
+                return Some(ProviderPublication {
+                    key,
+                    identity,
+                    lane: PublicationLane::Startup,
+                });
             }
             if completed {
                 return None;
@@ -428,7 +513,7 @@ impl ProviderPublisher {
         }
     }
 
-    fn next_ready(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
+    fn next_ready(&mut self, now: Mono) -> Option<ProviderPublication> {
         self.start_cycle_if_due(now);
         if self.prefer_cycle
             && let Some(next) = self.pop_cycle(now)
@@ -440,15 +525,17 @@ impl ProviderPublisher {
         let retry_due = now >= self.retry_at;
         let mut from_retry = false;
         let pending = if self.prefer_retry && retry_due {
-            let retry = Self::pop_pending(&mut self.retries, &self.resident);
+            let retry =
+                Self::pop_pending(&mut self.retries, &self.resident, PublicationLane::Startup);
             from_retry = retry.is_some();
-            retry.or_else(|| Self::pop_pending(&mut self.additions, &self.resident))
+            retry.or_else(|| self.pop_arrival())
         } else {
-            let addition = Self::pop_pending(&mut self.additions, &self.resident);
+            let addition = self.pop_arrival();
             if addition.is_some() {
                 addition
             } else if retry_due {
-                let retry = Self::pop_pending(&mut self.retries, &self.resident);
+                let retry =
+                    Self::pop_pending(&mut self.retries, &self.resident, PublicationLane::Startup);
                 from_retry = retry.is_some();
                 retry
             } else {
@@ -470,7 +557,7 @@ impl ProviderPublisher {
         next
     }
 
-    pub(crate) fn next(&mut self, now: Mono) -> Option<(ProviderKey, ProviderIdentity)> {
+    pub(crate) fn next(&mut self, now: Mono) -> Option<ProviderPublication> {
         if self
             .topology_outage
             .as_ref()
@@ -480,11 +567,11 @@ impl ProviderPublisher {
         }
         let probing = self.topology_outage.is_some();
         let next = self.next_ready(now);
-        if probing && let Some((key, _)) = next {
+        if probing && let Some(work) = next {
             self.topology_outage
                 .as_mut()
                 .expect("an active topology outage remains until an outcome")
-                .probe = Some(key);
+                .probe = Some(work.key);
         }
         next
     }
@@ -526,6 +613,11 @@ impl ProviderDirectory {
                 memberships: MAX_PROVIDER_MEMBERSHIPS,
             },
         }
+    }
+
+    /// O(1) retained soft-state counts; expired entries may await bounded prune.
+    pub(crate) fn retained_counts(&self) -> (usize, usize) {
+        (self.memberships.len(), self.providers_by_key.len())
     }
 
     /// Install or renew one exact membership. Capacity pressure never prevents
@@ -1033,6 +1125,166 @@ mod tests {
     }
 
     #[test]
+    fn fresh_arrival_gets_a_turn_before_the_startup_backlog_drains() {
+        let now = crate::clock::mono_now();
+        let mut resident = ProviderSet::default();
+        for index in 0_u32..4096 {
+            let mut key = [0; 32];
+            key[..4].copy_from_slice(&index.to_be_bytes());
+            resident.leases.replace(&PatchEntry::with_value(&key, key));
+        }
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident.clone(), now);
+
+        // The only incremental arrival sorts after every startup key. This
+        // regression also compiles against the old single-queue scheduler,
+        // where both turns consume startup entries and the assertion fails.
+        let fresh = [0xFF; 32];
+        resident
+            .leases
+            .replace(&PatchEntry::with_value(&fresh, fresh));
+        publisher.install(resident, now);
+        for _ in 0..2 {
+            assert!(publisher.next(now).is_some());
+        }
+        assert!(
+            !publisher.additions.contains(&fresh),
+            "the incremental queue gets a turn within two non-retry pending turns"
+        );
+    }
+
+    #[test]
+    fn sustained_incremental_arrivals_do_not_starve_startup_work() {
+        let now = crate::clock::mono_now();
+        let mut resident = ProviderSet::default();
+        for byte in 0..32 {
+            resident
+                .leases
+                .replace(&PatchEntry::with_value(&[byte; 32], [byte; 32]));
+        }
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident.clone(), now);
+
+        for byte in 128..160 {
+            let fresh = [byte; 32];
+            resident
+                .leases
+                .replace(&PatchEntry::with_value(&fresh, fresh));
+            publisher.install(resident.clone(), now);
+            let first = publisher.next(now).unwrap();
+            let second = publisher.next(now).unwrap();
+            assert_eq!(first.lane, PublicationLane::Startup);
+            assert_eq!(second.lane, PublicationLane::Incremental);
+            assert_eq!(second.key, fresh);
+        }
+        let progress = publisher.progress();
+        assert_eq!(progress.resident, 64);
+        assert_eq!(progress.startup_pending, 0);
+        assert_eq!(progress.incremental_pending, 0);
+        assert_eq!(progress.retry_pending, 0);
+        assert_eq!(progress.renewal_remaining, 0);
+        assert!(!progress.topology_paused);
+    }
+
+    #[test]
+    fn topology_failure_preserves_startup_and_incremental_pending_lanes() {
+        let now = crate::clock::mono_now();
+        let old = [0; 32];
+        let fresh = [0xFF; 32];
+        let mut resident = ProviderSet::default();
+        resident.leases.replace(&PatchEntry::with_value(&old, old));
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident.clone(), now);
+        let startup = publisher.next(now).unwrap();
+        resident
+            .leases
+            .replace(&PatchEntry::with_value(&fresh, fresh));
+        publisher.install(resident, now);
+        let incremental = publisher.next(now).unwrap();
+        assert_eq!(startup.lane, PublicationLane::Startup);
+        assert_eq!(incremental.lane, PublicationLane::Incremental);
+
+        for work in [startup, incremental] {
+            publisher.complete(work, PublicationResult::NoAuthenticatedRemoteReplica, now);
+        }
+        let progress = publisher.progress();
+        assert_eq!(progress.startup_pending, 1);
+        assert_eq!(progress.incremental_pending, 1);
+        assert!(progress.topology_paused);
+        assert!(publisher.startup.contains(&old));
+        assert!(!publisher.startup.contains(&fresh));
+        assert!(publisher.additions.contains(&fresh));
+        assert!(!publisher.additions.contains(&old));
+
+        // Failed bounded probes retain their lane too, and still alternate
+        // when the topology gate next grants a pending turn.
+        for expected in [PublicationLane::Startup, PublicationLane::Incremental] {
+            let retry_at = publisher.topology_outage.as_ref().unwrap().retry_at;
+            let probe = publisher.next(retry_at).unwrap();
+            assert_eq!(probe.lane, expected);
+            publisher.complete(
+                probe,
+                PublicationResult::NoAuthenticatedRemoteReplica,
+                retry_at,
+            );
+        }
+        assert_eq!(publisher.progress().startup_pending, 1);
+        assert_eq!(publisher.progress().incremental_pending, 1);
+    }
+
+    #[test]
+    fn topology_failed_retry_and_renewal_return_as_historical_work() {
+        let now = crate::clock::mono_now();
+        let fresh = [0xFF; 32];
+        for renewal in [false, true] {
+            let mut publisher = ProviderPublisher::new(now);
+            publisher.install(ProviderSet::default(), now);
+            let mut resident = ProviderSet::default();
+            resident
+                .leases
+                .replace(&PatchEntry::with_value(&fresh, fresh));
+            publisher.install(resident, now);
+            let first = publisher.next(now).unwrap();
+            assert_eq!(first.lane, PublicationLane::Incremental);
+            let due = if renewal {
+                publisher.complete(first, PublicationResult::Published, now);
+                now + PROVIDER_RENEWAL_PERIOD
+            } else {
+                publisher.complete(first, PublicationResult::RemoteRejected, now);
+                now + crate::RETRY_BACKOFF_BASE
+            };
+            let work = publisher.next(due).unwrap();
+            assert_eq!(work.lane, PublicationLane::Startup);
+            publisher.complete(work, PublicationResult::NoAuthenticatedRemoteReplica, due);
+            assert_eq!(publisher.progress().startup_pending, 1);
+            assert_eq!(publisher.progress().incremental_pending, 0);
+            assert_eq!(publisher.progress().retry_pending, 0);
+        }
+    }
+
+    #[test]
+    fn snapshot_removal_prunes_both_pending_lanes() {
+        let now = crate::clock::mono_now();
+        let old = [0; 32];
+        let fresh = [0xFF; 32];
+        let mut resident = ProviderSet::default();
+        resident.leases.replace(&PatchEntry::with_value(&old, old));
+        let mut publisher = ProviderPublisher::new(now);
+        publisher.install(resident.clone(), now);
+        resident
+            .leases
+            .replace(&PatchEntry::with_value(&fresh, fresh));
+        publisher.install(resident, now);
+        assert_eq!(publisher.progress().startup_pending, 1);
+        assert_eq!(publisher.progress().incremental_pending, 1);
+        publisher.install(ProviderSet::default(), now);
+        assert_eq!(publisher.progress().resident, 0);
+        assert_eq!(publisher.progress().startup_pending, 0);
+        assert_eq!(publisher.progress().incremental_pending, 0);
+        assert!(publisher.next(now).is_none());
+    }
+
+    #[test]
     fn due_renewal_is_not_starved_by_sustained_additions() {
         let now = crate::clock::mono_now();
         let old_key = [0; 32];
@@ -1043,7 +1295,10 @@ mod tests {
             .replace(&PatchEntry::with_value(&old_key, old_token));
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident.clone(), now);
-        assert_eq!(publisher.next(now), Some((old_key, old_token)));
+        assert_eq!(
+            publisher.next(now).map(|work| (work.key, work.identity)),
+            Some((old_key, old_token))
+        );
 
         // Make the next due call service a new arrival first. The following
         // call must nevertheless advance the already-due renewal traversal.
@@ -1054,14 +1309,20 @@ mod tests {
             .leases
             .replace(&PatchEntry::with_value(&first_new, [3; 32]));
         publisher.install(resident.clone(), due);
-        assert_eq!(publisher.next(due), Some((first_new, [3; 32])));
+        assert_eq!(
+            publisher.next(due).map(|work| (work.key, work.identity)),
+            Some((first_new, [3; 32]))
+        );
 
         let second_new = [4; 32];
         resident
             .leases
             .replace(&PatchEntry::with_value(&second_new, [5; 32]));
         publisher.install(resident, due);
-        assert_eq!(publisher.next(due), Some((old_key, old_token)));
+        assert_eq!(
+            publisher.next(due).map(|work| (work.key, work.identity)),
+            Some((old_key, old_token))
+        );
     }
 
     #[test]
@@ -1075,12 +1336,17 @@ mod tests {
             .replace(&PatchEntry::with_value(&key, token));
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
-        assert_eq!(publisher.next(now), Some((key, token)));
+        assert_eq!(
+            publisher.next(now).map(|work| (work.key, work.identity)),
+            Some((key, token))
+        );
         assert!(publisher.retry(key, now));
 
         assert_eq!(publisher.next(now), None);
         assert_eq!(
-            publisher.next(now + crate::RETRY_BACKOFF_BASE),
+            publisher
+                .next(now + crate::RETRY_BACKOFF_BASE)
+                .map(|work| (work.key, work.identity)),
             Some((key, token))
         );
     }
@@ -1110,23 +1376,25 @@ mod tests {
         // These are the only attempts that can have left before the first
         // no-route outcome closes the global breaker.
         let initial = (0..crate::routing::ALPHA)
-            .map(|_| publisher.next(now).expect("initial publication attempt").0)
+            .map(|_| publisher.next(now).expect("initial publication attempt"))
             .collect::<Vec<_>>();
-        for (index, key) in initial.into_iter().enumerate() {
-            let effect = publisher.complete(key, unavailable, now);
+        for (index, work) in initial.into_iter().enumerate() {
+            let effect = publisher.complete(work, unavailable, now);
             assert_eq!(effect.topology_outage_started, index == 0);
         }
 
-        assert_eq!(publisher.additions.leases.len(), key_count as u64);
+        assert_eq!(publisher.startup.leases.len(), key_count as u64);
+        assert!(publisher.additions.leases.is_empty());
         assert!(publisher.retries.leases.is_empty());
         assert!(publisher.next(now).is_none());
 
         let retry_at = publisher.topology_outage.as_ref().unwrap().retry_at;
-        let probe = publisher.next(retry_at).expect("one bounded retry probe").0;
+        let probe = publisher.next(retry_at).expect("one bounded retry probe");
         assert!(publisher.next(retry_at).is_none());
         let effect = publisher.complete(probe, unavailable, retry_at);
         assert!(!effect.topology_outage_started);
-        assert_eq!(publisher.additions.leases.len(), key_count as u64);
+        assert_eq!(publisher.startup.leases.len(), key_count as u64);
+        assert!(publisher.additions.leases.is_empty());
         assert!(publisher.retries.leases.is_empty());
         assert!(publisher.next(retry_at).is_none());
     }
@@ -1149,26 +1417,27 @@ mod tests {
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
 
-        let first = publisher.next(now).unwrap().0;
+        let first = publisher.next(now).unwrap();
         assert!(
             publisher
                 .complete(first, unavailable, now)
                 .topology_outage_started
         );
         let retry_at = publisher.topology_outage.as_ref().unwrap().retry_at;
-        let probe = publisher.next(retry_at).expect("topology retry probe").0;
+        let probe = publisher.next(retry_at).expect("topology retry probe");
         let effect = publisher.complete(probe, published, retry_at);
 
         assert!(effect.topology_recovered);
         assert!(publisher.topology_outage.is_none());
         assert!(publisher.retries.leases.is_empty());
         let mut published_count = 1;
-        while let Some((key, _)) = publisher.next(retry_at) {
-            let effect = publisher.complete(key, published, retry_at);
+        while let Some(work) = publisher.next(retry_at) {
+            let effect = publisher.complete(work, published, retry_at);
             assert!(!effect.topology_outage_started);
             published_count += 1;
         }
         assert_eq!(published_count, key_count);
+        assert!(publisher.startup.leases.is_empty());
         assert!(publisher.additions.leases.is_empty());
         assert!(publisher.retries.leases.is_empty());
     }
@@ -1192,15 +1461,18 @@ mod tests {
         let mut publisher = ProviderPublisher::new(now);
         publisher.install(resident, now);
 
-        assert_eq!(publisher.next(now), Some((key, identity)));
-        let effect = publisher.complete(key, rejected, now);
+        let work = publisher.next(now).unwrap();
+        assert_eq!((work.key, work.identity), (key, identity));
+        let effect = publisher.complete(work, rejected, now);
         assert!(!effect.topology_outage_started);
         assert!(!effect.retry_budget_full);
         assert!(publisher.topology_outage.is_none());
         assert_eq!(publisher.retries.leases.len(), 1);
         assert_eq!(publisher.next(now), None);
         assert_eq!(
-            publisher.next(now + crate::RETRY_BACKOFF_BASE),
+            publisher
+                .next(now + crate::RETRY_BACKOFF_BASE)
+                .map(|work| (work.key, work.identity)),
             Some((key, identity))
         );
     }
