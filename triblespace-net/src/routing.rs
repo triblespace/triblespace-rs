@@ -490,6 +490,10 @@ where
 }
 
 #[cfg(test)]
+#[path = "routing/warm_start.rs"]
+mod warm_start;
+
+#[cfg(test)]
 mod tests {
     use std::hint::black_box;
     use std::time::Instant;

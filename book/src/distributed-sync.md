@@ -270,6 +270,87 @@ pooling, DHT buckets, and provider leases are operational soft state;
 restarting may forget them without losing semantic data and deliberately
 re-enters KDF(C) discovery for each active collection.
 
+### Restart contact experiment
+
+`routing/warm_start.rs` is a test-only experiment, not enabled host persistence.
+It runs the real `RoutingTable` and `IterativeLookup` with synthetic `FIND_NODE`
+responses. Its one durable relation is a bounded set of previously authenticated
+endpoint identities, canonicalized with `PATCH<32>` and packed into ordinary
+`RawBytes`. A temporary-file write, sync, reopen and restore exercise the byte
+boundary. The test makes no new pile record, replicated roster, schema identity,
+JSON catalog, or provider advertisement. The host currently has no learned-peer
+persistence to reuse: configured endpoint addresses seed a fresh route table and
+iroh memory lookup; retired PEER records remain inert.
+
+The maximum payload is `256 * K * 32 = 163,840` bytes, before any filesystem
+overhead. Parsing reads at most that bound plus one byte and validates the whole
+canonical endpoint set before admission. Restore uses ordinary candidate
+admission, so self, bucket bounds and existing local failure cooldowns still
+apply. Neither an old authenticated contact nor a content-addressed cache blob
+is current authentication, honest routing behavior, or collection/blob authority.
+Unqueried referrals and failed routes are not exported. Restored candidates do
+not re-export themselves as fresh evidence. No H, locator, token, lease deadline,
+or process-local monotonic timestamp appears in the packed relation.
+
+Here, "authenticated" follows the table's existing `Verified` state, not a new
+serving-longevity claim. The production host also promotes successful inbound
+RPC callers, including ephemeral foreground clients. An inbound caller need not
+be a useful long-lived DHT server. The experiment does not change that provenance
+or silently reinterpret it as evidence that a peer answered our outbound probe.
+
+The adverse fixtures distinguish three things: a dead configured bootstrap can
+make cold discovery impossible while surviving hints still find a route; stale
+closest-K hints can exclude a healthy configured seed; authenticated peers can
+answer successfully while retaining a closed, unhelpful topology. Existing
+failure cooldowns help a second lookup only in the dead-peer case and do not
+survive another restart. A test-only first wave reserves one configured DHT seed
+alongside at most `ALPHA - 1` warm candidates, then admits the deferred closest-K
+set into the same lookup. This is DHT discovery, never direct-peer blob fallback.
+It adds at most K deferred identities and one admission phase, not durable state.
+
+The first-wave fixture has one configured seed and instantaneous synthetic
+responses/failures. It does not settle multi-seed scheduling, the real three- and
+ten-second budgets, transport address rediscovery, snapshot replacement cadence,
+or handling a crash during replacement. Node churn and warm knowledge must be
+measured before selecting those policies. Endpoint IDs alone cannot help when
+no address discovery/direct route remains. Provider-directory deadlines and
+publication cursors are deliberately excluded: restarting `put` would renew a
+lease, and a saved publication cursor does not prove remote leases survived.
+An immutable cached answer needs its original expiry and provenance separately;
+reusing a serialized `Mono` or snapshot generation as freshness is invalid.
+
+Run the focused tests with `cargo test -p triblespace-net --lib warm_start --
+--nocapture`; add `--ignored` after `--` for the 1,024-node, 64-target measurement.
+Reported requests and logical waves describe routing work, not elapsed network
+latency, successful provider acquisition, or live-network availability.
+
+The first Stars run (2026-09-07 23:04 UTC, base `d0db6da2`, rustc 1.97.1,
+unoptimized net/lib tests) trained one client on 32 targets, saved 100 endpoints
+in 3,200 bytes, then independently restarted it for each of 64 other targets.
+The 1,024-node fixture gives remote peers established XOR-bucket views; only
+the measured client restarts. The totals were:
+
+| Restart state | Targets reached | FIND_NODE requests | Logical waves |
+| --- | ---: | ---: | ---: |
+| Cold, bootstrap live | 64/64 | 1,610 | 601 |
+| Warm, closest-K | 64/64 | 1,521 | 529 |
+| Warm, bootstrap first wave | 64/64 | 1,528 | 529 |
+| Cold, bootstrap dead | 0/64 | 64 | 64 |
+| Warm, bootstrap dead, first-wave policy | 64/64 | 1,589 | 549 |
+
+This is a 5.5% request reduction for the healthy closest-K fixture, not a
+universal cache speedup. A deliberately sparse 64-node line improved from 64
+requests/64 waves to 20/7 with 1,568 saved bytes. Conversely, 20 dead cached
+contacts suppressed a healthy seed: cold reached the target in two requests,
+whereas warm closest-K failed after 20. The first-wave policy reached it in
+wave two but still spent 22 requests/eight waves completing the lookup. Twenty
+authenticated closed-view peers also suppressed discovery without any failed
+requests; the first-wave policy recovered that fixture in 21 requests/seven
+waves. These counterexamples make independent bootstrap opportunity a condition
+of future integration, not an optional cache optimization.
+
+### Live request scheduling
+
 One connection pool is shared by collection repair and bearer/DHT operations.
 Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by

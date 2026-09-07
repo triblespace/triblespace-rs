@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a test-only DHT restart experiment using the real XOR routing and lookup
+  machine. Save authenticated endpoint identities as a bounded canonical PATCH
+  set in native bytes, restore only candidates, and compare cold/warm discovery,
+  dead contacts, authenticated poisoned views, and a configured-bootstrap first
+  wave. No host persistence, provider lease, pile format, or protocol change.
+
 - Recheck Pile shared-replay parse failures once under an exclusive file lock
   with a fresh observed length. This distinguishes an in-flight append from a
   persistent malformed record without retrying writes or truncating data, and
