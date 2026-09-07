@@ -73,6 +73,8 @@ use crate::repo::{
     SnapshotSource, WantRequest, WANT_REQUEST_BYTES_LEN, WANT_REQUEST_KIND_DERIVE_V1,
 };
 
+#[cfg(test)]
+mod append_visibility_tests;
 mod record_kind;
 pub use record_kind::{described_kinds, description_blobs, RecordKind, KIND_PILE_RECORD};
 
@@ -310,8 +312,10 @@ fn block_post_pad(data_len: usize) -> usize {
 /// Largest single blob record we'll write with the concurrent `write_vectored`
 /// fast path. Linux caps a single `writev` at `MAX_RW_COUNT` (`INT_MAX &
 /// ~(PAGE_SIZE - 1)`, ~2 GiB) and macOS caps it at `INT_MAX`. Below this
-/// threshold we rely on kernel atomicity and let concurrent writers hold a
-/// shared lock. Above it we switch to an exclusive-lock fallback that
+/// threshold we rely on kernel append serialization and let concurrent writers
+/// hold a shared lock. Readers can still observe an incomplete append and must
+/// recheck parse failures behind an exclusive-lock completion barrier. Above
+/// it we switch to an exclusive-lock fallback that
 /// issues plain `write_all` calls — still append-only, still recoverable
 /// via [`Pile::amputate`], just serialized with other writers for the
 /// duration of the large append. The margin keeps us comfortably below
@@ -3222,10 +3226,12 @@ impl Pile {
     /// undefined behavior.
     ///
     /// This acquires a shared file lock to avoid racing with [`Self::amputate`],
-    /// which takes an exclusive lock before truncating.
+    /// which takes an exclusive lock before truncating. A parse failure is
+    /// rechecked once under an exclusive lock with a fresh file length: shared
+    /// writers may expose an incomplete record during a single append syscall.
     pub fn refresh(&mut self) -> Result<(), ReadError> {
         self.file.lock_shared()?;
-        let res = self.refresh_locked();
+        let res = self.refresh_shared_locked();
         let unlock_res = self.file.unlock();
         res?;
         unlock_res?;
@@ -3380,11 +3386,31 @@ impl Pile {
         Ok(Some(applied))
     }
 
+    /// Replay with a shared lock already held. On a parse failure, replace it
+    /// with an exclusive lock and replay once more. The caller must unlock on
+    /// every return path; successful recovery retains the stronger lock.
+    fn refresh_shared_locked(&mut self) -> Result<(), ReadError> {
+        match self.refresh_locked() {
+            Err(ReadError::CorruptPile { .. } | ReadError::UnsupportedRecord { .. }) => {
+                #[cfg(test)]
+                append_visibility_tests::before_exclusive_recheck();
+                // Append serialization prevents writers from interleaving, not
+                // fstat/mmap from observing a partially completed syscall. Wait
+                // for all participating writers, then take a NEW length below.
+                // Do not retry the append, truncate, or suppress a stable error.
+                self.file.unlock()?;
+                self.file.lock()?;
+                self.refresh_locked()
+            }
+            result => result,
+        }
+    }
+
     fn refresh_locked(&mut self) -> Result<(), ReadError> {
-        // The observed length is the refresh linearization point. Small atomic
-        // writers share this lock and may append afterwards; those records are
-        // intentionally left for the next refresh. Exclusive writers and
-        // amputation remain excluded for the complete bounded replay.
+        // A fixed bound avoids a metadata syscall per record. Under a shared
+        // lock this can end inside an in-flight append; refresh_shared_locked
+        // confirms a parse failure after excluding all participating writers.
+        // Later appends are intentionally left for the next refresh.
         let file_len = self.observed_file_len()?;
         if file_len < self.applied_length {
             std::process::abort();
@@ -4053,7 +4079,11 @@ impl Pile {
             self.file.lock()?;
         }
         let res = (|| {
-            self.refresh_locked().map_err(InsertError::from)?;
+            if use_atomic {
+                self.refresh_shared_locked().map_err(InsertError::from)?;
+            } else {
+                self.refresh_locked().map_err(InsertError::from)?;
+            }
 
             let handle: Inline<Handle<S>> = blob.get_handle();
             let hash: Inline<Hash<Blake3>> = handle.into();
@@ -4107,6 +4137,13 @@ impl Pile {
                 }
             }
 
+            #[cfg(test)]
+            append_visibility_tests::before_blob_readback();
+            // The successful append is complete, as are preceding serialized
+            // appends. Stop at its hash (or an earlier concurrent duplicate),
+            // without parsing a later writer's potentially incomplete tail.
+            // A full refresh here would need the same completion barrier as
+            // preflight; this bounded-by-content readback does not.
             loop {
                 match self.apply_next().map_err(InsertError::from)? {
                     Some(Applied::Blob { hash: h }) => {

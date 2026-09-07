@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Recheck Pile shared-replay parse failures once under an exclusive file lock
+  with a fresh observed length. This distinguishes an in-flight append from a
+  persistent malformed record without retrying writes or truncating data, and
+  covers both snapshots and shared blob-writer preflight. Preserve readback's
+  stop at the completed blob before any later partial tail.
+
 - Add a wire-free DHT directory model using the existing Merkle PATCH repair
   walker. Seven deterministic tests compare per-entry leases with signed
   inventory roots, including forwarding, restart, expiry, partial responsibility

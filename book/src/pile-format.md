@@ -340,12 +340,15 @@ small records risks pile corruption.
 
 ## Bounded refresh snapshots
 
-Replay snapshots the observed file length once per refresh and decodes exactly
-that bounded prefix. Shared-lock atomic writers may append after the snapshot;
-those records are intentionally picked up by the next refresh. Post-write
-readback still observes the live length while looking for the caller's own
-record. This avoids a metadata syscall per record without weakening exact
-torn-tail offsets or amputation's exclusive retry.
+Replay snapshots the observed file length once per pass and decodes exactly
+that bounded prefix. A shared-lock writer's single append syscall can expose an
+intermediate file length, so a shared replay parse failure is rechecked once
+under an exclusive lock with a fresh length. This completion barrier waits for
+participating writers; a persistent malformed or unsupported record remains an
+error, without truncation or retrying any write. Shared blob-writer preflight
+uses the same recheck. Post-write readback instead stops at the completed blob
+(or an earlier concurrent duplicate) before a later writer's partial tail.
+Appends beyond a successful bounded observation remain for the next refresh.
 
 `PileSnapshot` receives persistent PATCH roots when it is created. Later
 refreshes can extend the pile without changing existing snapshots.
