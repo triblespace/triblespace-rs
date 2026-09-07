@@ -29,8 +29,8 @@ satisfy WRITE(C) -> make a signed COMMIT active in C
 ```
 
 `C` is the exact 32-byte collection descriptor handle. `H` is an exact blob
-handle. Knowing either value is already unforgeable naming power, but they do
-different jobs: `C` discovers a collection participant, while `H` is the bearer
+handle. They name immutable objects but do different jobs: `C` discovers a
+collection participant, while `H` is the bearer
 capability and private discovery secret for one exact immutable value. The
 provider directory sees only separately domain-separated KDF images and
 endpoint-bound tokens, never either raw handle.
@@ -149,7 +149,8 @@ On admission it returns record and authorization-evidence PATCH summaries plus
 the same opaque root. The client may then walk only differing prefixes and
 receive missing leaf bodies:
 
-- canonical signature-valid `COMMIT(C)` records, whether active or inert;
+- canonical signature-valid `COMMIT(C)` records, whether active or inert,
+  and structurally valid native `MERGE`/`DERIVE` equations naming C;
 - native structurally relevant proofs for C's declared capabilities.
 
 Each proof leaf already contains the complete path and all of its restrictions.
@@ -195,6 +196,12 @@ full-width opaque locator under a dedicated domain:
 ```text
 L = BLAKE3-KDF("triblespace.net/blob-locator/v1", H)
 ```
+
+This is not encryption or protection against guessing the exact blob content.
+Someone who can guess those bytes can compute both H and L and confirm a
+matching provider token. Confidential low-entropy content needs encryption;
+the additional locator hash prevents disclosure of H from a copied L, not
+reconstruction of H from already-known or guessed bytes.
 
 Every served resident blob may renew a soft lease at L on nearby XOR-DHT
 nodes. The lease contains an independently domain-separated token bound to H

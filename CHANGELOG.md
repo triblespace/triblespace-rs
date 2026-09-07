@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Clarify that exact repair includes native MERGE/DERIVE records, and that
+  bearer-handle discovery does not encrypt or hide guessable blob content.
+
 - Select the next pending provider publication by direct ordered PATCH descent
   instead of constructing and sorting a full iterator for one key. Preserve
   lexical order, stale-entry removal, lane fairness, and current resident values;
