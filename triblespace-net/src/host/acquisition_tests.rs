@@ -21,6 +21,7 @@ struct Fixture {
     client: ProviderClient<SimTransport>,
     sender: NetSender,
     provider: PeerId,
+    provider_routes: Arc<Mutex<RoutingTable>>,
     hash: RawHash,
     bytes: Bytes,
     store: MemoryRepo,
@@ -81,9 +82,10 @@ impl Fixture {
             ));
         }
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
+        let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
         let handler = SnapshotHandler {
             snapshot: Arc::new(Mutex::new(Some(Arc::new(snapshot)))),
-            candidates: Arc::new(Mutex::new(RoutingTable::new(provider, []))),
+            candidates: provider_routes.clone(),
             providers: Arc::new(Mutex::new(providers)),
             serve_collections: false,
             local_id: provider,
@@ -110,6 +112,7 @@ impl Fixture {
             client,
             sender,
             provider,
+            provider_routes,
             hash,
             bytes,
             store,
@@ -240,6 +243,54 @@ async fn configured_only_cold_background_lookup_keeps_its_short_bound() {
         );
     }
     fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn repeated_directory_gossip_does_not_erase_recent_local_route_failure() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let key = blob_locator(fixture.hash);
+    // Warm only the reachable configured directory, so setup latency cannot
+    // explain any subsequent full background routing window.
+    fixture
+        .client
+        .find_node(fixture.provider, key)
+        .await
+        .unwrap();
+    let stalled_key = SigningKey::from_bytes(&[93; 32]);
+    let stalled = stalled_key.verifying_key().to_bytes();
+    let _stalled_harness = fixture.net.join(&stalled_key);
+    fixture.net.stall_dials(stalled);
+    // The directory still has old direct-liveness evidence, so its production
+    // FIND_NODE handler re-advertises this unreachable route on every reply.
+    assert!(
+        fixture
+            .provider_routes
+            .lock()
+            .unwrap()
+            .promote_authenticated(stalled)
+    );
+    let token = blob_provider_token(fixture.hash, fixture.client.my_id);
+    let mut elapsed = Vec::new();
+    let mut stalled_dials = Vec::new();
+    for _ in 0..3 {
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            fixture.client.announce_key(key, token).await,
+            PublicationResult::Published
+        );
+        elapsed.push(started.elapsed());
+        stalled_dials.push(fixture.net.dial_count(fixture.client.my_id, stalled));
+    }
+    fixture.assert_no_control_effects();
+    // Dropping local evidence at timeout lets unverified gossip immediately
+    // restore the stalled route, even though all three publications get ACKs.
+    assert_eq!(
+        elapsed,
+        [BACKGROUND_LOOKUP_DEADLINE, Duration::ZERO, Duration::ZERO],
+        "unchanged remote gossip must not repeatedly consume the routing window; stalled dial counts: {stalled_dials:?}"
+    );
+    assert_eq!(stalled_dials, [1, 1, 1]);
 }
 
 #[tokio::test(start_paused = true)]
