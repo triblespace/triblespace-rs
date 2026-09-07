@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Prototype a two-PATCH provider directory beside the live four-index version.
+  Differential tests retain exact capacity, expiry, renewal, provider ordering,
+  and responsibility eviction semantics; an opt-in fresh-process probe measures
+  representation cost. No live directory or persistence change.
+
 - Add a test-only DHT restart experiment using the real XOR routing and lookup
   machine. Save authenticated endpoint identities as a bounded canonical PATCH
   set in native bytes, restore only candidates, and compare cold/warm discovery,
