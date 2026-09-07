@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Release abandoned connection-pool entries when the last pending dial caller
+  is cancelled, preserving shared initializer takeover, cached connections,
+  and live borrowers of evicted entries. Keep descriptor fetches owned by the
+  host and coalesced per active collection while waiting for the bounded
+  admission bridge, instead of accumulating detached downloads on each repair tick.
+
 - Generalize AUTH to resource-declared capability definitions. Prefix proofs
   retain inline delegation/time attenuation while naming exact definition
   handles; collection admission and custom audiences query generic policy

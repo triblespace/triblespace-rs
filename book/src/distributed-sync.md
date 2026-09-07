@@ -275,6 +275,19 @@ Iroh's transport authentication binds each connection to its endpoint ID.
 There is no generic AUTH or SYNC_TEAM exchange: collection evidence is gated by
 READ(C). Exact bytes are gated only by the endpoint-bound mutual proof of H.
 
+Pending dial ownership is cancellation-safe: the final departing waiter removes
+an uninitialized pool entry, while concurrent callers retain the same shared
+dial and can take over its cancelled initializer. The established-connection
+LRU remains separate from these live requests. This cleans up abandoned pool
+entries, not a new limit on simultaneous requests or detached transport handshakes.
+
+For an explicitly active collection with a missing descriptor, the host owns
+one independent bearer fetch until its result reaches the bounded admission
+bridge. Repair ticks cannot spawn additional copies while that handoff is
+blocked. Removing the interest or dropping the host cancels the pending fetch;
+a completed miss or failed attempt permits a later retry. This does not fetch
+descriptor dependencies or introduce a durable WANT.
+
 Foreground exact-H acquisition has one end-to-end deadline, normally ten
 seconds, including capability readiness, cold bootstrap dialing, DHT lookup,
 and bearer GET. Its three-second routing window begins with the first

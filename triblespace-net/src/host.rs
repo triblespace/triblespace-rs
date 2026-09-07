@@ -15,7 +15,7 @@ use std::thread;
 
 use anybytes::Bytes;
 use ed25519_dalek::{SigningKey, VerifyingKey};
-use futures::{StreamExt as _, stream::FuturesUnordered};
+use futures::{FutureExt as _, StreamExt as _, stream::FuturesUnordered};
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::{Instrument as _, debug, debug_span, info_span, warn};
@@ -477,6 +477,34 @@ impl<C> ConnectionPool<C> {
             .clone()
     }
 
+    fn release_waiter(
+        &mut self,
+        peer: PeerId,
+        entry: Arc<PoolEntry<C>>,
+    ) -> Option<Arc<PoolEntry<C>>> {
+        if !self
+            .entries
+            .get(&peer)
+            .is_some_and(|current| Arc::ptr_eq(current, &entry))
+        {
+            // An evicted/replaced entry may own a connection. Return its last
+            // reference so destruction happens outside the pool mutex.
+            return Some(entry);
+        }
+        // The map still owns this entry, so dropping the waiter cannot destroy
+        // its connection. Release this reference before unlocking: concurrent
+        // cancellations must not each see the other's departing reference and
+        // both leave an abandoned entry behind.
+        drop(entry);
+        let current = self.entries.get(&peer).unwrap();
+        if current.connection.get().is_none() && Arc::strong_count(current) == 1 {
+            // Uninitialized entries have never been admitted to the LRU.
+            self.entries.remove(&peer)
+        } else {
+            None
+        }
+    }
+
     fn admit(&mut self, peer: PeerId, expected: &Arc<PoolEntry<C>>) -> Option<Arc<PoolEntry<C>>> {
         if !self
             .entries
@@ -522,12 +550,35 @@ fn new_shared_pool<C>() -> SharedPool<C> {
     }))
 }
 
+/// Owns one request's entry until it hands off a completed connection. The
+/// final cancelled waiter removes an uninitialized entry; remaining waiters
+/// keep the same OnceCell and can take over its cancelled initializer.
+struct PoolWaiter<'a, C> {
+    pool: &'a SharedPool<C>,
+    peer: PeerId,
+    entry: Option<Arc<PoolEntry<C>>>,
+}
+
+impl<C> Drop for PoolWaiter<'_, C> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            let released = self.pool.lock().unwrap().release_waiter(self.peer, entry);
+            drop(released);
+        }
+    }
+}
+
 async fn pool_get<T: Transport>(
     transport: &T,
     pool: &SharedPool<T::Conn>,
     peer: PeerId,
 ) -> anyhow::Result<PooledConnection<T::Conn>> {
-    let entry = pool.lock().unwrap().entry(peer);
+    let mut waiter = PoolWaiter {
+        pool,
+        peer,
+        entry: Some(pool.lock().unwrap().entry(peer)),
+    };
+    let entry = waiter.entry.as_ref().unwrap();
     let initialized = entry
         .connection
         .get_or_init(|| async {
@@ -547,12 +598,15 @@ async fn pool_get<T: Transport>(
     let connection = match initialized {
         Ok(connection) => connection.clone(),
         Err(error) => {
-            pool.lock().unwrap().remove_if(peer, &entry);
+            pool.lock().unwrap().remove_if(peer, entry);
             return Err(anyhow::anyhow!(error.to_string()));
         }
     };
-    drop(pool.lock().unwrap().admit(peer, &entry));
-    Ok(PooledConnection { entry, connection })
+    drop(pool.lock().unwrap().admit(peer, entry));
+    Ok(PooledConnection {
+        entry: waiter.entry.take().unwrap(),
+        connection,
+    })
 }
 
 fn pool_invalidate<C: Conn>(pool: &SharedPool<C>, peer: PeerId, entry: &Arc<PoolEntry<C>>) {
@@ -824,6 +878,28 @@ struct PublicationOutcome {
     result: PublicationResult,
 }
 
+/// The host owns at most one descriptor fetch per explicitly active collection,
+/// including a fetched value waiting for admission. Repeated repair ticks must
+/// not create detached copies behind a full store-side channel.
+#[derive(Default)]
+struct DescriptorFetches {
+    pending: HashMap<RawHash, futures::future::BoxFuture<'static, ()>>,
+}
+
+impl DescriptorFetches {
+    fn start(&mut self, collection: RawHash, fetch: impl Future<Output = ()> + Send + 'static) {
+        self.pending
+            .entry(collection)
+            .or_insert_with(|| fetch.boxed());
+    }
+
+    fn poll(&mut self, active: &HashMap<RawHash, RawHash>) {
+        self.pending.retain(|collection, fetch| {
+            active.contains_key(collection) && fetch.as_mut().now_or_never().is_none()
+        });
+    }
+}
+
 /// Process-lifetime admission gate for DHT provider announcements.
 ///
 /// This sits outside [`ProviderPublisher`], so installing a newer resident
@@ -1071,6 +1147,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     let mut failures: HashMap<RepairTarget, (u32, crate::clock::Mono)> = HashMap::new();
     let mut discovery: HashMap<[u8; 32], DiscoveryState> = HashMap::new();
     let mut current_roots: HashMap<[u8; 32], [u8; 32]> = HashMap::new();
+    let mut descriptor_fetches = DescriptorFetches::default();
     let mut next_period = crate::clock::mono_now();
     let mut next_discovery = crate::clock::mono_now();
     let mut publisher = ProviderPublisher::new(crate::clock::mono_now());
@@ -1099,6 +1176,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 Ok(NetCommand::SnapshotChanged(notice)) => {
                     if !notice.installed {
                         current_roots.clear();
+                        descriptor_fetches.pending.clear();
                         participants.lock().unwrap().clear();
                         discovery.clear();
                         immediate.clear();
@@ -1161,9 +1239,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
         }
         if disconnected {
+            drop(descriptor_fetches);
             transport.shutdown().await;
             return;
         }
+
+        descriptor_fetches.poll(&current_roots);
 
         while let Ok(notice) = wake_rx.try_recv() {
             let (collection, received) = match notice {
@@ -1342,7 +1423,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     if descriptor_missing {
                         let client = provider_client.clone();
                         let events = wiring.evt_tx.clone();
-                        tokio::spawn(async move {
+                        descriptor_fetches.start(collection.raw, async move {
                             match client
                                 .fetch_blob(collection.raw, Some(BACKGROUND_LOOKUP_DEADLINE))
                                 .await
@@ -2109,6 +2190,9 @@ fn op_name(op: u8) -> &'static str {
 #[cfg(all(test, feature = "sim"))]
 mod acquisition_tests;
 
+#[cfg(all(test, feature = "sim"))]
+mod pool_tests;
+
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeSet, HashMap};
@@ -2124,10 +2208,10 @@ mod tests {
     use triblespace_core::collection::CollectionHandle;
 
     use super::{
-        COLLECTION_PARTICIPANT_LEASE, DiscoveryState, MAX_COLLECTION_PARTICIPANTS,
-        MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget, WakeBootstrapPeers,
-        canonical_provider_subset, enqueue_repair, forget_participant, has_repair_candidate,
-        live_participants, observe_participant, retain_active_repair_state,
+        COLLECTION_PARTICIPANT_LEASE, DescriptorFetches, DiscoveryState,
+        MAX_COLLECTION_PARTICIPANTS, MAX_PENDING_REPAIRS, ProviderPublicationBudget, RepairTarget,
+        WakeBootstrapPeers, canonical_provider_subset, enqueue_repair, forget_participant,
+        has_repair_candidate, live_participants, observe_participant, retain_active_repair_state,
     };
 
     fn endpoint(byte: u8) -> EndpointId {
@@ -2137,6 +2221,100 @@ mod tests {
                 .as_bytes(),
         )
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn descriptor_fetch_is_coalesced_until_admission_handoff_completes() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let collection = [31; 32];
+        let active = HashMap::from([(collection, [0; 32])]);
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let (events, mut received) = tokio::sync::mpsc::channel(1);
+        events.try_send(super::NetEventBatch::default()).unwrap();
+        let mut fetches = DescriptorFetches::default();
+
+        // Model many repair periods with a full admission bridge. Starting a
+        // new period must not repeat the fetch or retain another result.
+        for _ in 0..100 {
+            let attempts = attempts.clone();
+            let events = events.clone();
+            fetches.start(collection, async move {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                let mut batch = super::NetEventBatch::default();
+                batch
+                    .try_push(super::NetEvent::Blob {
+                        expected: collection,
+                        bytes: anybytes::Bytes::from_source(b"descriptor".to_vec()),
+                    })
+                    .unwrap();
+                let _ = events.send(batch).await;
+            });
+            fetches.poll(&active);
+            assert_eq!(fetches.pending.len(), 1);
+        }
+        assert_eq!(attempts.load(Ordering::Relaxed), 1);
+
+        assert!(received.recv().await.unwrap().is_empty());
+        fetches.poll(&active);
+        assert!(fetches.pending.is_empty());
+        assert_eq!(received.recv().await.unwrap().len(), 1);
+        assert!(received.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn descriptor_fetches_release_removed_collections_and_host_ownership() {
+        let first = [31; 32];
+        let second = [32; 32];
+        let mut active = HashMap::from([(first, [0; 32]), (second, [0; 32])]);
+        let mut fetches = DescriptorFetches::default();
+        let (first_owner, mut first_observer) = tokio::sync::oneshot::channel::<()>();
+        let (second_owner, mut second_observer) = tokio::sync::oneshot::channel::<()>();
+        fetches.start(first, async move {
+            let _owner = first_owner;
+            std::future::pending::<()>().await;
+        });
+        fetches.start(second, async move {
+            let _owner = second_owner;
+            std::future::pending::<()>().await;
+        });
+        fetches.poll(&active);
+        assert_eq!(fetches.pending.len(), 2);
+
+        active.remove(&first);
+        fetches.poll(&active);
+        assert_eq!(fetches.pending.len(), 1);
+        assert_eq!(
+            first_observer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+        assert_eq!(
+            second_observer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        );
+
+        drop(fetches);
+        assert_eq!(
+            second_observer.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_descriptor_attempt_allows_a_later_retry() {
+        let collection = [31; 32];
+        let active = HashMap::from([(collection, [0; 32])]);
+        let mut fetches = DescriptorFetches::default();
+        for _ in 0..2 {
+            let (complete, completion) = tokio::sync::oneshot::channel();
+            fetches.start(collection, async move {
+                complete.send(()).unwrap();
+            });
+            fetches.poll(&active);
+            assert!(fetches.pending.is_empty());
+            completion.await.unwrap();
+        }
     }
 
     #[test]
