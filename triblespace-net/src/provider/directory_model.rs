@@ -14,6 +14,9 @@
 //! not touch the membership PATCH. The deliberately unshared inclusion paths
 //! make proof-refresh cost visible rather than assuming a proof-forest win.
 
+#[path = "directory_model/shared_proofs.rs"]
+mod shared_proofs;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
@@ -507,6 +510,20 @@ impl Directory {
     }
 
     fn repair_from(&mut self, source: &Self, now: u64, cost: &mut Cost) -> Result<()> {
+        self.repair_from_with(source, now, cost, |directory, support, cost| {
+            directory.receive_content(support, now, cost)
+        })
+    }
+
+    // One test-only transport seam; selection, repair, signed leases, and the
+    // final membership verifier remain shared by both proof representations.
+    fn repair_from_with(
+        &mut self,
+        source: &Self,
+        now: u64,
+        cost: &mut Cost,
+        mut receive: impl FnMut(&mut Self, Arc<MembershipSupport>, &mut Cost) -> Result<()>,
+    ) -> Result<()> {
         // This pinned projection transfers only the receiver-selected range.
         // Production must locate it structurally; model projection is not timed.
         let pinned = source.project(self.range, now);
@@ -521,7 +538,7 @@ impl Directory {
             let support = pinned.content.get(&key).unwrap().clone();
             ensure!(support.key() == key, "content body does not bind leaf key");
             cost.content_leaves_sent += 1;
-            self.receive_content(support, now, cost)?;
+            receive(self, support, cost)?;
         }
         Ok(())
     }
