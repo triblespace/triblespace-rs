@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead contacts, authenticated poisoned views, and a configured-bootstrap first
   wave. No host persistence, provider lease, pile format, or protocol change.
 
+- Wake SimNet accept calls on connection close even while they wait for the
+  accept-queue mutex. Capture the close notification before the flag check and
+  prioritize it over queued streams, with deterministic mutex-held regressions.
+
 - Make SimNet stream halves observe connection close, crash, and partition:
   pending reads/writes wake with a reset, buffered bytes are discarded, and
   healing or endpoint restart cannot revive old streams. A deterministic
