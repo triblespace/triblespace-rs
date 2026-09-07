@@ -73,8 +73,9 @@ pub struct PeerConfig {
     /// Maximum DHT provider-announcement attempts during this process.
     ///
     /// `None` preserves the ordinary unlimited scheduler. `Some(0)` disables
-    /// announcements without disabling exact H-authorized serving. Retries and
-    /// renewals consume the same budget as first publication.
+    /// announcements without disabling exact H-authorized serving or query-time
+    /// resident self hints. Retries and renewals consume the same budget as
+    /// first publication.
     pub provider_publication_budget: Option<u64>,
 }
 
@@ -2032,11 +2033,29 @@ impl SnapshotHandler {
             }
             OP_PROVIDER_GET => {
                 let key = recv_exact_key(recv).await?;
-                let providers = self
+                let mut providers = self
                     .providers
                     .lock()
                     .unwrap()
                     .get(key, crate::clock::mono_now());
+                let resident = self
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.bearer_handle(key));
+                if let Some(handle) = resident {
+                    // Answer from the same resident index as bearer GET, without
+                    // reading bytes or installing a lease. Reserve one slot for
+                    // our own current hint; stored advertisements cannot crowd
+                    // it out. The remaining leases retain their peer-id order.
+                    providers.retain(|(provider, _)| *provider != self.local_id);
+                    providers.truncate(crate::provider::MAX_PROVIDERS_PER_KEY - 1);
+                    providers.insert(
+                        0,
+                        (self.local_id, blob_provider_token(handle, self.local_id)),
+                    );
+                }
                 send_u8(send, providers.len() as u8).await?;
                 for (provider, token) in providers {
                     send_hash(send, &provider).await?;

@@ -6,6 +6,9 @@
 //! Each supplied peer is queried with FIND_NODE and PROVIDER_GET for its opaque
 //! locator. Returned routes are counted, never followed. Matching tokens prove
 //! knowledge of H, not current blob residency or successful GET_BLOB transport.
+//! A valid self token may be synthesized from the answering node's snapshot;
+//! foreign entries in this host's replies come from retained advertisements.
+//! These source counts are not cryptographic receipts of publication.
 //! Empty replies describe only these directories at this moment.
 //!
 //! Optional pile enumeration reports a zero-based rank among resident blob
@@ -157,14 +160,21 @@ async fn main() -> Result<()> {
             }
             match timeout(DEADLINE, op_provider_get(&conn, &locator)).await {
                 Ok(Ok(providers)) => {
-                    let valid = providers
-                        .iter()
-                        .filter(|(provider, token)| {
-                            blob_provider_token(*target_handle, *provider) == *token
-                        })
-                        .count();
+                    let mut valid_self = 0;
+                    let mut valid_foreign = 0;
+                    for (provider, token) in &providers {
+                        if blob_provider_token(*target_handle, *provider) != *token {
+                            continue;
+                        }
+                        if provider == peer.as_bytes() {
+                            valid_self += 1;
+                        } else {
+                            valid_foreign += 1;
+                        }
+                    }
+                    let valid = valid_self + valid_foreign;
                     println!(
-                        "peer={index} target={label} provider_get=ok providers={} valid_tokens={valid} invalid_tokens={}",
+                        "peer={index} target={label} provider_get=ok providers={} valid_tokens={valid} valid_self_tokens={valid_self} valid_foreign_tokens={valid_foreign} invalid_tokens={}",
                         providers.len(),
                         providers.len() - valid
                     );

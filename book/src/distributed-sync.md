@@ -202,6 +202,31 @@ and the provider's authenticated endpoint ID. A requester who knows H rejects
 forged candidate entries before dialing; the directory learns neither H nor
 collection membership.
 
+For an ordinary `PROVIDER_GET(L)`, the selected DHT node also consults its
+already-installed, snapshot-coherent L→H index. If L is resident there, it
+returns its own endpoint-bound token without waiting for a `PROVIDER_PUT`.
+This deliberately extends the old lease-only answer: one reply slot is reserved
+for the resident self hint, any stored self entry is deduplicated, and at most
+63 other live leases follow in their existing deterministic peer-ID order.
+Without a resident self hint, the usual limit remains 64 leases.
+
+This is a query-time answer, not a new lease or publication attempt. It reads
+no payload, creates no WANT or collection authority, and still works with a
+zero announcement budget. A missing or withdrawn serving snapshot supplies no
+self hint; independently stored leases remain ordinary soft hints. The blob
+locator namespace does not synthesize collection-participant hints from a
+resident descriptor. Client replica selection, token verification, and the
+mutual bearer GET are unchanged: a known holder outside the selected DHT
+replicas is not probed as a fallback. Remote publication is still needed when
+the holder is not itself one of the selected replicas.
+
+A returned self token therefore does not demonstrate that any publication
+occurred. Foreign entries in this host's replies still come from retained
+advertisements. The `blob_directory` diagnostic reports valid self and foreign
+token counts separately, alongside its existing totals, without logging handles
+or tokens. These classify hint sources, not cryptographic publication receipts;
+neither category proves that a subsequent GET will succeed.
+
 The direct stream also keeps H off the wire. The requester sends only L. The
 provider resolves L in its resident locator index and proves knowledge of H
 first, binding the proof to both authenticated endpoint IDs. Only after
@@ -273,7 +298,7 @@ bounded, disposable liveness state, not authority or a permanent blacklist.
 This does not make a configured-only cold dial longer than three seconds fit
 the background window: if each attempt starts equally cold, background retries
 can still miss that endpoint. Foreground acquisition retains its separate end-to-end bound.
-Diagnostics distinguish a successful lookup with no advertised provider from
+Diagnostics distinguish a successful lookup with no provider hint from
 failure to reach a replica, a provider transport/protocol failure, or exhaustion
 of the end-to-end budget. A directory miss is an observation, not proof that H
 does not exist. Diagnostics do not log the bearer handle.

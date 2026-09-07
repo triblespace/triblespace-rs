@@ -6,6 +6,7 @@
 //! The shared unit-test guard excludes body receivers on other test runtimes,
 //! whose independent clocks cannot make progress on this paused timeline.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use triblespace_core::collection::CollectionRead;
@@ -16,12 +17,27 @@ use crate::transport::sim::{SimConfig, SimNet, SimTransport};
 
 use super::*;
 
+struct CountedBlobReader {
+    inner: Arc<dyn BlobSnapshotReader>,
+    reads: Arc<AtomicUsize>,
+}
+
+impl BlobSnapshotReader for CountedBlobReader {
+    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        self.inner.get_blob(hash)
+    }
+}
+
 struct Fixture {
     net: SimNet,
     client: ProviderClient<SimTransport>,
     sender: NetSender,
     provider: PeerId,
     provider_routes: Arc<Mutex<RoutingTable>>,
+    provider_snapshot: SnapshotSlot,
+    provider_directory: Arc<Mutex<ProviderDirectory>>,
+    blob_reads: Arc<AtomicUsize>,
     hash: RawHash,
     bytes: Bytes,
     store: MemoryRepo,
@@ -61,7 +77,7 @@ impl Fixture {
         let mut store = MemoryRepo::default();
         let bytes = Bytes::from_source(b"cold exact-H acquisition".to_vec());
         let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
-        let snapshot = StoreSnapshot::from_store_changes(
+        let mut snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
             &ActiveCollections::new(),
             provider_key.verifying_key(),
@@ -72,6 +88,11 @@ impl Fixture {
             None,
         )
         .unwrap();
+        let blob_reads = Arc::new(AtomicUsize::new(0));
+        snapshot.blobs = Arc::new(CountedBlobReader {
+            inner: snapshot.blobs,
+            reads: blob_reads.clone(),
+        });
         let mut providers = ProviderDirectory::new(provider);
         if advertise {
             assert!(providers.put(
@@ -83,10 +104,12 @@ impl Fixture {
         }
         let (events_tx, events) = tokio::sync::mpsc::channel(16);
         let provider_routes = Arc::new(Mutex::new(RoutingTable::new(provider, [])));
+        let provider_snapshot = Arc::new(Mutex::new(Some(Arc::new(snapshot))));
+        let provider_directory = Arc::new(Mutex::new(providers));
         let handler = SnapshotHandler {
-            snapshot: Arc::new(Mutex::new(Some(Arc::new(snapshot)))),
+            snapshot: provider_snapshot.clone(),
             candidates: provider_routes.clone(),
-            providers: Arc::new(Mutex::new(providers)),
+            providers: provider_directory.clone(),
             serve_collections: false,
             local_id: provider,
             events: events_tx,
@@ -113,6 +136,9 @@ impl Fixture {
             sender,
             provider,
             provider_routes,
+            provider_snapshot,
+            provider_directory,
+            blob_reads,
             hash,
             bytes,
             store,
@@ -374,8 +400,17 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
             .topology_recovered
     );
     assert_eq!(publisher.next(retry_at), None);
+    let advertised = fixture.client.get(fixture.provider, key).await.unwrap();
+    assert!(
+        advertised.contains(&(fixture.client.my_id, token)),
+        "the directory's own resident hint is not evidence of our remote publication"
+    );
     assert_eq!(
-        fixture.client.get(fixture.provider, key).await.unwrap(),
+        fixture
+            .provider_directory
+            .lock()
+            .unwrap()
+            .get(key, crate::clock::mono_now()),
         vec![(fixture.client.my_id, token)]
     );
     for peer in stale {
@@ -386,11 +421,401 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn warm_provider_miss_is_not_a_transport_failure_or_direct_peer_probe() {
+async fn resident_self_hint_needs_no_lease_or_payload_read() {
     let _guard = crate::protocol::exact_blob_receive_test_guard();
     let mut fixture = Fixture::new(false);
-    // The bootstrap endpoint holds H but has no lease for it. Warming the
-    // topology must not turn that route into an alternate direct-H probe.
+    let key = blob_locator(fixture.hash);
+    let expected = (
+        fixture.provider,
+        blob_provider_token(fixture.hash, fixture.provider),
+    );
+
+    assert_eq!(
+        fixture.client.get(fixture.provider, key).await.unwrap(),
+        vec![expected]
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        fixture.provider_directory.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+    assert_eq!(
+        fixture.client.providers.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+    fixture.assert_no_control_effects();
+
+    // Only the ordinary, DHT-selected bearer GET reads the body.
+    assert_eq!(
+        fixture.client.fetch_blob(fixture.hash, None).await.unwrap(),
+        Some(fixture.bytes.clone())
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        fixture.provider_directory.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn self_hint_requires_a_present_serving_snapshot() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let key = blob_locator(fixture.hash);
+    let snapshot = fixture.provider_snapshot.lock().unwrap().take();
+    assert!(
+        fixture
+            .client
+            .get(fixture.provider, key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    *fixture.provider_snapshot.lock().unwrap() = snapshot;
+    assert_eq!(
+        fixture.client.get(fixture.provider, key).await.unwrap(),
+        vec![(
+            fixture.provider,
+            blob_provider_token(fixture.hash, fixture.provider)
+        )]
+    );
+    fixture.provider_snapshot.lock().unwrap().take();
+    assert!(
+        fixture
+            .client
+            .get(fixture.provider, key)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.provider_directory.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+
+    // Withdrawal removes the synthesized hint, not independent foreign leases.
+    let foreign = fixture.client.my_id;
+    let token = blob_provider_token(fixture.hash, foreign);
+    assert!(fixture.provider_directory.lock().unwrap().put(
+        key,
+        foreign,
+        token,
+        crate::clock::mono_now()
+    ));
+    assert_eq!(
+        fixture.client.get(fixture.provider, key).await.unwrap(),
+        vec![(foreign, token)]
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn resident_self_hint_reserves_a_bounded_slot_and_deduplicates_self() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let key = blob_locator(fixture.hash);
+    let own = (
+        fixture.provider,
+        blob_provider_token(fixture.hash, fixture.provider),
+    );
+    let mut foreign = (1..=crate::provider::MAX_PROVIDERS_PER_KEY)
+        .map(|byte| {
+            (
+                SigningKey::from_bytes(&[byte as u8; 32])
+                    .verifying_key()
+                    .to_bytes(),
+                [0; 32],
+            )
+        })
+        .collect::<Vec<_>>();
+    foreign.sort_unstable();
+    assert!(
+        foreign
+            .iter()
+            .all(|(peer, token)| blob_provider_token(fixture.hash, *peer) != *token)
+    );
+    {
+        let mut directory = fixture.provider_directory.lock().unwrap();
+        for (peer, token) in &foreign {
+            assert!(directory.put(key, *peer, *token, crate::clock::mono_now()));
+        }
+    }
+    let reply = fixture.client.get(fixture.provider, key).await.unwrap();
+    assert_eq!(reply.len(), crate::provider::MAX_PROVIDERS_PER_KEY);
+    assert_eq!(reply[0], own);
+    assert_eq!(&reply[1..], &foreign[..foreign.len() - 1]);
+    assert_eq!(
+        fixture.provider_directory.lock().unwrap().retained_counts(),
+        (foreign.len(), 1)
+    );
+
+    // An already-stored self entry consumes no extra reply slot. Current
+    // resident knowledge replaces even a stale/incorrect stored self token.
+    {
+        let mut directory = fixture.provider_directory.lock().unwrap();
+        *directory = ProviderDirectory::new(fixture.provider);
+        assert!(directory.put(key, fixture.provider, [0; 32], crate::clock::mono_now()));
+        for (peer, token) in foreign.iter().take(foreign.len() - 1) {
+            assert!(directory.put(key, *peer, *token, crate::clock::mono_now()));
+        }
+    }
+    let deduplicated = fixture.client.get(fixture.provider, key).await.unwrap();
+    assert_eq!(deduplicated, reply);
+    assert_eq!(
+        deduplicated
+            .iter()
+            .filter(|(peer, _)| *peer == fixture.provider)
+            .count(),
+        1
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    assert!(
+        fixture
+            .provider_directory
+            .lock()
+            .unwrap()
+            .get(key, crate::clock::mono_now())
+            .contains(&(fixture.provider, [0; 32]))
+    );
+    assert_eq!(
+        fixture.client.fetch_blob(fixture.hash, None).await.unwrap(),
+        Some(fixture.bytes.clone())
+    );
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn resident_descriptor_is_not_a_collection_participant_hint() {
+    use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
+
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let collection = fixture
+        .store
+        .collection(
+            "resident-descriptor-without-collection-service",
+            CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open),
+        )
+        .unwrap();
+    let handle = collection.handle();
+    let snapshot = StoreSnapshot::from_store_changes(
+        fixture.store.snapshot().unwrap(),
+        &ActiveCollections::new(),
+        VerifyingKey::from_bytes(&fixture.provider).unwrap(),
+        None,
+        None,
+        StoreChanges::ALL,
+        false,
+        None,
+    )
+    .unwrap();
+    *fixture.provider_snapshot.lock().unwrap() = Some(Arc::new(snapshot));
+
+    assert_eq!(
+        fixture
+            .client
+            .get(fixture.provider, blob_locator(handle.raw))
+            .await
+            .unwrap(),
+        vec![(
+            fixture.provider,
+            blob_provider_token(handle.raw, fixture.provider)
+        )]
+    );
+    assert!(
+        fixture
+            .client
+            .get(fixture.provider, collection_provider_key(handle))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        fixture.provider_directory.lock().unwrap().retained_counts(),
+        (0, 0)
+    );
+    fixture.assert_no_control_effects();
+}
+
+#[tokio::test(start_paused = true)]
+async fn known_resident_outside_selected_dht_replicas_is_not_directly_probed() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    let key = blob_locator(fixture.hash);
+    let closer_keys = (0u64..4096)
+        .map(|index| {
+            let mut seed = [0; 32];
+            seed[..8].copy_from_slice(&index.to_be_bytes());
+            SigningKey::from_bytes(&seed)
+        })
+        .filter(|signer| {
+            let peer = signer.verifying_key().to_bytes();
+            peer != fixture.client.my_id
+                && crate::routing::distance_cmp(key, peer, fixture.provider).is_lt()
+        })
+        .take(K)
+        .collect::<Vec<_>>();
+    assert_eq!(closer_keys.len(), K);
+    let closer = closer_keys
+        .iter()
+        .map(|signer| signer.verifying_key().to_bytes())
+        .collect::<Vec<_>>();
+    let mut servers = Vec::new();
+    for signer in &closer_keys {
+        let peer = signer.verifying_key().to_bytes();
+        let mut harness = fixture.net.join(signer);
+        let handler = SnapshotHandler {
+            snapshot: Arc::new(Mutex::new(None)),
+            candidates: Arc::new(Mutex::new(RoutingTable::new(peer, []))),
+            providers: Arc::new(Mutex::new(ProviderDirectory::new(peer))),
+            serve_collections: false,
+            local_id: peer,
+            events: {
+                let (sender, _receiver) = tokio::sync::mpsc::channel(1);
+                sender
+            },
+            inbound_connections: Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS)),
+            inbound_requests: Arc::new(tokio::sync::Semaphore::new(MAX_REQUESTS_GLOBAL)),
+        };
+        servers.push(tokio::spawn(async move {
+            while let Some(incoming) = harness.incoming.recv().await {
+                let permit = handler
+                    .inbound_connections
+                    .clone()
+                    .try_acquire_owned()
+                    .unwrap();
+                let handler = handler.clone();
+                tokio::spawn(async move {
+                    handler.handle::<SimTransport>(incoming.conn, permit).await;
+                });
+            }
+        }));
+        pool_get(&fixture.client.transport, &fixture.client.pool, peer)
+            .await
+            .unwrap();
+    }
+    *fixture.client.candidates.lock().unwrap() = RoutingTable::new(
+        fixture.client.my_id,
+        closer.iter().copied().chain([fixture.provider]),
+    );
+    // The holder is a known, connected, usable directory/provider. Only its
+    // exclusion from the exact locator's replica set prevents its use below.
+    assert_eq!(
+        fixture.client.get(fixture.provider, key).await.unwrap(),
+        vec![(
+            fixture.provider,
+            blob_provider_token(fixture.hash, fixture.provider)
+        )]
+    );
+    let replicas = fixture.client.lookup_replicas(key, None).await;
+    assert_eq!(replicas.len(), K);
+    assert!(!replicas.contains(&fixture.provider));
+    assert!(
+        fixture
+            .client
+            .fetch_blob(fixture.hash, None)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
+    fixture.assert_no_control_effects();
+    for server in servers {
+        server.abort();
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn zero_announcement_budget_still_answers_resident_self_hints() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let local = tokio::task::LocalSet::new();
+    local
+        .run_until(async {
+            let net = SimNet::new(
+                0xC01D_D417,
+                SimConfig {
+                    latency: Duration::ZERO..Duration::ZERO,
+                },
+            );
+            let server_key = SigningKey::from_bytes(&[91; 32]);
+            let client_key = SigningKey::from_bytes(&[92; 32]);
+            let server_id = server_key.verifying_key().to_bytes();
+            let client_id = client_key.verifying_key().to_bytes();
+            let server_harness = net.join(&server_key);
+            let client_harness = net.join(&client_key);
+            let (sender, mut receiver, wiring) = wire(EndpointId::from_bytes(&server_id).unwrap());
+            let mut store = MemoryRepo::default();
+            let bytes = Bytes::from_source(b"zero-announcement resident self hint".to_vec());
+            let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
+            let serving = StoreSnapshot::from_store_changes(
+                store.snapshot().unwrap(),
+                &ActiveCollections::new(),
+                server_key.verifying_key(),
+                None,
+                None,
+                StoreChanges::ALL,
+                false,
+                None,
+            )
+            .unwrap();
+            let observation =
+                ProviderObservation::from_locators([], false, serving.bearer_locators());
+            sender.update_snapshot(serving, &ActiveCollections::new());
+            sender.update_providers(observation);
+            let host = tokio::task::spawn_local(run_host(
+                server_harness,
+                PeerConfig {
+                    peers: vec![EndpointAddr::from(
+                        EndpointId::from_bytes(&client_id).unwrap(),
+                    )],
+                    qos: ReconcileQos::default(),
+                    provider_publication_budget: Some(0),
+                },
+                wiring,
+            ));
+            let client = ProviderClient {
+                transport: client_harness.transport,
+                pool: new_shared_pool(),
+                providers: Arc::new(Mutex::new(ProviderDirectory::new(client_id))),
+                candidates: Arc::new(Mutex::new(RoutingTable::new(client_id, [server_id]))),
+                my_id: client_id,
+            };
+            assert_eq!(client.fetch_blob(hash, None).await.unwrap(), Some(bytes));
+            tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::yield_now().await;
+            assert_eq!(
+                net.dial_count(server_id, client_id),
+                0,
+                "zero budget must not announce even resident hints"
+            );
+            sender.clear_snapshot();
+            assert!(
+                client
+                    .get(server_id, blob_locator(hash))
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "querying the self hint must not install a lease"
+            );
+            assert!(receiver.try_recv().is_none());
+            let snapshot = store.snapshot().unwrap();
+            assert_eq!(snapshot.records().unwrap().count(), 0);
+            assert_eq!(snapshot.wants().unwrap().count(), 0);
+            host.abort();
+        })
+        .await;
+}
+
+#[tokio::test(start_paused = true)]
+async fn warm_provider_miss_is_not_a_transport_failure() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    let mut fixture = Fixture::new(false);
+    // Neither a directory lease nor the serving snapshot knows this exact H.
+    // A warm successful directory miss remains distinct from transport failure.
+    let missing = *blake3::hash(b"absent warm provider query").as_bytes();
     pool_get(
         &fixture.client.transport,
         &fixture.client.pool,
@@ -402,7 +827,7 @@ async fn warm_provider_miss_is_not_a_transport_failure_or_direct_peer_probe() {
     assert!(
         fixture
             .client
-            .fetch_blob(fixture.hash, None)
+            .fetch_blob(missing, None)
             .await
             .unwrap()
             .is_none()
@@ -412,12 +837,9 @@ async fn warm_provider_miss_is_not_a_transport_failure_or_direct_peer_probe() {
     fixture
         .net
         .partition(fixture.client.my_id, fixture.provider);
-    let error = fixture
-        .client
-        .fetch_blob(fixture.hash, None)
-        .await
-        .unwrap_err();
+    let error = fixture.client.fetch_blob(missing, None).await.unwrap_err();
     assert!(error.to_string().contains("no remote replica"));
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 0);
     fixture.assert_no_control_effects();
 }
 

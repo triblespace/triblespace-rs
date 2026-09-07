@@ -16,6 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Let a DHT-selected directory answer an exact blob-locator query with its own
+  snapshot-resident provider hint before background publication reaches that
+  key. Reserve one bounded reply slot for self, deduplicate stored self entries,
+  and preserve deterministic foreign-lease order. This deliberately extends
+  lease-only answers without reading payloads, storing leases, announcing,
+  changing DHT selection or bearer proof, or adding collection/WANT effects.
+  Distinguish valid self and foreign tokens in the read-only directory probe;
+  a self hint alone is no longer evidence of a provider PUT.
 - Retain finite, hard-bounded local learned-route failure cooldowns across
   repeated DHT referrals. Filter both lookup seeds and reply candidates without
   tying lookup-local progress to positive K-bucket retention; configured routes,
