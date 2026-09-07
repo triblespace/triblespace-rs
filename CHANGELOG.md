@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead contacts, authenticated poisoned views, and a configured-bootstrap first
   wave. No host persistence, provider lease, pile format, or protocol change.
 
+- Make SimNet stream halves observe connection close, crash, and partition:
+  pending reads/writes wake with a reset, buffered bytes are discarded, and
+  healing or endpoint restart cannot revive old streams. A deterministic
+  production-acquisition regression crashes during a backpressured exact-blob
+  response, rejects the old transfer, then retries on a fresh connection
+  without collection/WANT effects. Production Iroh/runtime behavior is unchanged.
+
 - Exercise exact-H acquisition after provider loss with an unchanged stale
   directory lease, an independently advertised alternate, and a same-endpoint
   handler restart. Cover cancellation of a discovered provider dial followed

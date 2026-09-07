@@ -47,6 +47,13 @@ struct Fixture {
 
 impl Fixture {
     fn new(advertise: bool) -> Self {
+        Self::with_bytes(
+            advertise,
+            Bytes::from_source(b"cold exact-H acquisition".to_vec()),
+        )
+    }
+
+    fn with_bytes(advertise: bool, bytes: Bytes) -> Self {
         // SimNet charges one round trip for connection setup: four seconds,
         // beyond the background lookup cap but within the foreground budget.
         let latency = Duration::from_secs(2);
@@ -75,7 +82,6 @@ impl Fixture {
         }));
 
         let mut store = MemoryRepo::default();
-        let bytes = Bytes::from_source(b"cold exact-H acquisition".to_vec());
         let hash = store.put::<UnknownBlob, _>(bytes.clone()).unwrap().raw;
         let mut snapshot = StoreSnapshot::from_store_changes(
             store.snapshot().unwrap(),
@@ -166,8 +172,7 @@ impl Drop for Fixture {
 
 /// An independent directory or restarted provider using the production RPC
 /// handler. Its control events remain observable, and dropping it stops its
-/// accept loop. Crash faults below occur between requests: SimNet resets the
-/// connection, but does not reset an already-open raw DuplexStream itself.
+/// accept loop. Each restart installs fresh provider-side operational state.
 struct RecoveryNode {
     peer: PeerId,
     directory: Arc<Mutex<ProviderDirectory>>,
@@ -465,6 +470,107 @@ async fn alternate_provider_success_cancels_a_stalled_discovered_dial() {
     assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
     fixture.assert_no_control_effects();
     directory.assert_no_events();
+}
+
+struct SignallingBlobReader {
+    inner: Arc<dyn BlobSnapshotReader>,
+    started: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+}
+
+impl BlobSnapshotReader for SignallingBlobReader {
+    fn get_blob(&self, hash: RawHash) -> Option<Bytes> {
+        let bytes = self.inner.get_blob(hash);
+        if let Some(started) = self.started.lock().unwrap().take() {
+            let _ = started.send(());
+        }
+        bytes
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn mid_transfer_crash_rejects_old_bytes_after_restart_and_allows_fresh_retry() {
+    let _guard = crate::protocol::exact_blob_receive_test_guard();
+    // Larger than SimNet's bounded pipe, so the authenticated server must
+    // block partway through the body while this test owns the receive permit.
+    let mut fixture = Fixture::with_bytes(false, Bytes::from_source(vec![b'x'; 8 * 1024 * 1024]));
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+    {
+        let mut slot = fixture.provider_snapshot.lock().unwrap();
+        let snapshot = Arc::get_mut(slot.as_mut().unwrap()).unwrap();
+        snapshot.blobs = Arc::new(SignallingBlobReader {
+            inner: snapshot.blobs.clone(),
+            started: Mutex::new(Some(started_tx)),
+        });
+    }
+    let (mut permit_writer, mut permit_reader) = tokio::io::duplex(1);
+    let held_receive = crate::protocol::recv_exact_blob_body(&mut permit_reader, 1);
+    tokio::pin!(held_receive);
+    assert!(futures::poll!(&mut held_receive).is_pending());
+    let sender = fixture.sender.clone();
+    let hash = fixture.hash;
+    let fetch =
+        tokio::spawn(async move { sender.fetch_blob(hash, INTERACTIVE_FETCH_DEADLINE).await });
+    // get_blob runs after both bearer proofs. The server continues until pipe
+    // backpressure yields; no timer or arbitrary scheduler-yield count gates
+    // this fault. The client cannot consume body bytes while the permit is held.
+    started_rx.await.unwrap();
+    assert!(!fetch.is_finished());
+    assert_eq!(fixture.blob_reads.load(Ordering::Relaxed), 1);
+    fixture.net.crash(fixture.provider);
+    fixture.server.abort();
+
+    let provider_key = SigningKey::from_bytes(&[91; 32]);
+    let restored = StoreSnapshot::from_store_changes(
+        fixture.store.snapshot().unwrap(),
+        &ActiveCollections::new(),
+        provider_key.verifying_key(),
+        None,
+        None,
+        StoreChanges::ALL,
+        false,
+        None,
+    )
+    .unwrap();
+    let mut restarted = RecoveryNode::new(&fixture.net, &provider_key, Some(Arc::new(restored)));
+    let failed_at = tokio::time::Instant::now();
+    permit_writer.write_all(b"x").await.unwrap();
+    held_receive.await.unwrap();
+    assert!(
+        fetch.await.unwrap().is_none(),
+        "old connection supplied bytes after restart"
+    );
+    assert_eq!(
+        failed_at.elapsed(),
+        Duration::ZERO,
+        "reset must not wait for a deadline"
+    );
+    assert!(
+        !fixture
+            .client
+            .pool
+            .lock()
+            .unwrap()
+            .entries
+            .contains_key(&fixture.provider)
+    );
+    assert_eq!(
+        fixture
+            .sender
+            .fetch_blob(fixture.hash, INTERACTIVE_FETCH_DEADLINE)
+            .await,
+        Some(fixture.bytes.clone()),
+    );
+    assert_eq!(
+        fixture
+            .net
+            .dial_count(fixture.client.my_id, fixture.provider),
+        2
+    );
+    let snapshot = fixture.store.snapshot().unwrap();
+    assert_eq!(snapshot.records().unwrap().count(), 0);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    assert!(fixture.events.try_recv().is_err());
+    restarted.assert_no_events();
 }
 
 #[tokio::test(start_paused = true)]
