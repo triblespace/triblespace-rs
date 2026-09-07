@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Document the measured directory representation tradeoff and the existing
+  retention effect of WANT's resident direct blob references.
+
 - Prototype a two-PATCH provider directory beside the live four-index version.
   Differential tests retain exact capacity, expiry, renewal, provider ordering,
   and responsibility eviction semantics; an opt-in fresh-process probe measures
