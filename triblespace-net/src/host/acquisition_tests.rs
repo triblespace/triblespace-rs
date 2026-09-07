@@ -295,7 +295,8 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
         ProviderObservation::from_locators([], false, &locators).into_set(),
         now,
     );
-    assert_eq!(publisher.next(now), Some((key, fixture.hash)));
+    let work = publisher.next(now).expect("initial publication attempt");
+    assert_eq!((work.key, work.identity), (key, fixture.hash));
     let token = blob_provider_token(fixture.hash, fixture.client.my_id);
     let started = tokio::time::Instant::now();
     let result = fixture.client.announce_key(key, token).await;
@@ -304,18 +305,23 @@ async fn background_publication_retries_past_a_stale_issued_batch() {
     let completed = now + started.elapsed();
     assert!(
         publisher
-            .complete(key, result, completed)
+            .complete(work, result, completed)
             .topology_outage_started
     );
     assert_eq!(publisher.next(completed), None);
 
     let retry_at = completed + crate::RETRY_BACKOFF_BASE;
-    assert_eq!(publisher.next(retry_at), Some((key, fixture.hash)));
+    let retry = publisher.next(retry_at).expect("topology retry probe");
+    assert_eq!((retry.key, retry.identity), (key, fixture.hash));
     let retry_started = tokio::time::Instant::now();
     let result = fixture.client.announce_key(key, token).await;
     assert_eq!(result, PublicationResult::Published);
     assert_eq!(retry_started.elapsed(), Duration::ZERO);
-    assert!(publisher.complete(key, result, retry_at).topology_recovered);
+    assert!(
+        publisher
+            .complete(retry, result, retry_at)
+            .topology_recovered
+    );
     assert_eq!(publisher.next(retry_at), None);
     assert_eq!(
         fixture.client.get(fixture.provider, key).await.unwrap(),
