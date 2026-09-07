@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add a wire-free DHT directory model using the existing Merkle PATCH repair
+  walker. Seven deterministic tests compare per-entry leases with signed
+  inventory roots, including forwarding, restart, expiry, partial responsibility
+  ranges, membership-proof binding, and logical publication budgets. Unchanged
+  inventory renewal can leave content untouched; the changed-root probe exposes
+  the cost of refreshing membership proofs. This is test-only exploration with
+  a trusted shared clock and synthetic placement, not a wire change, persistent
+  cache implementation, or live-network performance claim.
+
 - Release abandoned connection-pool entries when the last pending dial caller
   is cancelled, preserving shared initializer takeover, cached connections,
   and live borrowers of evicted entries. Keep descriptor fetches owned by the

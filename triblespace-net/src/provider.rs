@@ -17,6 +17,10 @@ pub use crate::bearer::blob_locator;
 use crate::clock::Mono;
 use crate::transport::PeerId;
 
+#[cfg(test)]
+#[path = "provider/directory_model.rs"]
+mod directory_model;
+
 /// Opaque rendezvous key for one exact collection or bearer identity.
 pub(crate) type ProviderKey = [u8; 32];
 pub(crate) type ProviderToken = [u8; 32];
