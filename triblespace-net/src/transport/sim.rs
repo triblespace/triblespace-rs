@@ -35,9 +35,13 @@
 //! identity-dependent per-request READ(C) subject binding is exercised honestly.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::io;
 use std::ops::Range;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use ed25519_dalek::SigningKey;
@@ -46,7 +50,7 @@ use iroh_gossip::proto::DeliveryScope;
 use rand::Rng;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
-use tokio::io::DuplexStream;
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 use tokio::sync::mpsc;
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
@@ -534,12 +538,90 @@ pub struct SimConn {
     local: PeerId,
     remote: PeerId,
     /// Streams we open land on the remote's accept queue.
-    open_tx: mpsc::UnboundedSender<(DuplexStream, DuplexStream)>,
+    open_tx: mpsc::UnboundedSender<(SimStream, SimStream)>,
     /// Streams the remote opens land here.
-    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(DuplexStream, DuplexStream)>>>,
+    accept_rx: Arc<tokio::sync::Mutex<mpsc::UnboundedReceiver<(SimStream, SimStream)>>>,
     /// Shared close flag — either end closing kills both directions.
     closed: Arc<AtomicBool>,
     notify_close: Arc<tokio::sync::Notify>,
+}
+
+/// One simulated stream half, permanently bound to its original connection.
+/// A reset discards buffered bytes and wakes pending reads and writes; healing
+/// or rejoining an endpoint cannot reopen this connection. No driver task is
+/// needed: each half owns one cancellation-safe notification future.
+pub struct SimStream {
+    inner: DuplexStream,
+    closed: Arc<AtomicBool>,
+    on_close: Pin<Box<tokio::sync::futures::OwnedNotified>>,
+}
+
+impl SimStream {
+    fn new(inner: DuplexStream, connection: &SimConn) -> Self {
+        Self {
+            inner,
+            closed: connection.closed.clone(),
+            // notify_waiters reaches futures created before the notification,
+            // even before their first poll. Construct eagerly, not after the
+            // open-state check: otherwise a close could land in that gap.
+            on_close: Box::pin(connection.notify_close.clone().notified_owned()),
+        }
+    }
+
+    fn poll_open(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        if self.closed.load(Ordering::SeqCst) || self.on_close.as_mut().poll(cx).is_ready() {
+            return Err(io::Error::new(
+                io::ErrorKind::ConnectionReset,
+                "simnet: connection reset",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl AsyncRead for SimStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for SimStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.inner).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.inner.is_write_vectored()
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
 }
 
 impl SimConn {
@@ -569,14 +651,14 @@ impl SimConn {
 }
 
 impl Conn for SimConn {
-    type SendHalf = DuplexStream;
-    type RecvHalf = DuplexStream;
+    type SendHalf = SimStream;
+    type RecvHalf = SimStream;
 
     fn remote_id(&self) -> PeerId {
         self.remote
     }
 
-    async fn open_bi(&self) -> anyhow::Result<(DuplexStream, DuplexStream)> {
+    async fn open_bi(&self) -> anyhow::Result<(SimStream, SimStream)> {
         if self.closed.load(Ordering::SeqCst) {
             anyhow::bail!(
                 "simnet: open_bi on closed conn {} -> {}",
@@ -591,12 +673,18 @@ impl Conn for SimConn {
         let (local_send, remote_recv) = tokio::io::duplex(PIPE_CAPACITY);
         let (remote_send, local_recv) = tokio::io::duplex(PIPE_CAPACITY);
         self.open_tx
-            .send((remote_send, remote_recv))
+            .send((
+                SimStream::new(remote_send, self),
+                SimStream::new(remote_recv, self),
+            ))
             .map_err(|_| anyhow::anyhow!("simnet: open_bi: remote end dropped"))?;
-        Ok((local_send, local_recv))
+        Ok((
+            SimStream::new(local_send, self),
+            SimStream::new(local_recv, self),
+        ))
     }
 
-    async fn accept_bi(&self) -> Option<(DuplexStream, DuplexStream)> {
+    async fn accept_bi(&self) -> Option<(SimStream, SimStream)> {
         if self.closed.load(Ordering::SeqCst) {
             return None;
         }
@@ -621,6 +709,124 @@ fn hex_prefix(id: &PeerId) -> String {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[derive(Default)]
+    struct WakeCount(std::sync::atomic::AtomicUsize);
+
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(arc_self: &Arc<Self>) {
+            arc_self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_between_open_check_and_listener_poll_is_not_lost() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let (mut send, mut recv) = dialer.open_bi().await.unwrap();
+        let (_s_send, _s_recv) = acceptor.accept_bi().await.unwrap();
+        // Split poll_open at exactly its flag-check/listener-poll boundary.
+        // Both listeners already exist but neither has registered a waker.
+        assert!(!send.closed.load(Ordering::SeqCst));
+        assert!(!recv.closed.load(Ordering::SeqCst));
+        dialer.close(0, b"close in registration gap");
+        let wake = Arc::new(WakeCount::default());
+        let waker = futures::task::waker_ref(&wake);
+        let mut context = Context::from_waker(&waker);
+        assert!(send.on_close.as_mut().poll(&mut context).is_ready());
+        assert!(recv.on_close.as_mut().poll(&mut context).is_ready());
+        assert!(send.write_all(b"late").await.is_err());
+        assert!(recv.read(&mut [0]).await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_wakes_blocked_read_and_write_and_discards_buffered_bytes() {
+        use std::future::Future as _;
+        use std::task::Context;
+
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let (mut c_send, mut c_recv) = dialer.open_bi().await.unwrap();
+        let (mut s_send, mut s_recv) = acceptor.accept_bi().await.unwrap();
+        c_send.write_all(&vec![b'x'; PIPE_CAPACITY]).await.unwrap();
+        let wake = Arc::new(WakeCount::default());
+        let waker = futures::task::waker_ref(&wake);
+        let mut context = Context::from_waker(&waker);
+        let mut buf = [0; 1];
+        let mut read = Box::pin(c_recv.read_exact(&mut buf));
+        let mut write = Box::pin(c_send.write_all(b"y"));
+        assert!(read.as_mut().poll(&mut context).is_pending());
+        assert!(write.as_mut().poll(&mut context).is_pending());
+        dialer.close(0, b"reset");
+        assert_eq!(
+            wake.0.load(Ordering::SeqCst),
+            2,
+            "both parked I/O tasks must wake"
+        );
+        assert_eq!(
+            read.await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert_eq!(
+            write.await.unwrap_err().kind(),
+            std::io::ErrorKind::ConnectionReset
+        );
+        assert!(
+            s_recv.read_exact(&mut buf).await.is_err(),
+            "buffered bytes survived reset"
+        );
+        assert!(s_send.write_all(b"late").await.is_err());
+        assert!(s_send.flush().await.is_err());
+        assert!(s_send.shutdown().await.is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn crash_and_partition_keep_old_streams_closed_after_recovery() {
+        for partition in [false, true] {
+            // Test-only endpoint seeds and network seed.
+            let net = SimNet::new(
+                19,
+                SimConfig {
+                    latency: Duration::ZERO..Duration::ZERO,
+                },
+            );
+            let client_key = SigningKey::from_bytes(&[1; 32]);
+            let server_key = SigningKey::from_bytes(&[2; 32]);
+            let client = net.join(&client_key);
+            let mut server = net.join(&server_key);
+            let a = client.transport.local_id();
+            let b = server.transport.local_id();
+            let old = client
+                .transport
+                .dial(b, crate::protocol::PILE_SYNC_ALPN)
+                .await
+                .unwrap();
+            let accepted = server.incoming.recv().await.unwrap().conn;
+            let (_old_send, mut old_recv) = old.open_bi().await.unwrap();
+            let (mut old_server_send, _old_server_recv) = accepted.accept_bi().await.unwrap();
+            old_server_send.write_all(b"old").await.unwrap();
+            if partition {
+                net.partition(a, b);
+                net.heal(a, b);
+            } else {
+                net.crash(b);
+                server = net.join(&server_key);
+            }
+            let mut bytes = [0; 3];
+            assert!(old_recv.read_exact(&mut bytes).await.is_err());
+            assert!(old_server_send.write_all(b"old").await.is_err());
+            assert!(old.open_bi().await.is_err());
+            let fresh = client
+                .transport
+                .dial(b, crate::protocol::PILE_SYNC_ALPN)
+                .await
+                .unwrap();
+            let accepted = server.incoming.recv().await.unwrap().conn;
+            let (_send, mut recv) = fresh.open_bi().await.unwrap();
+            let (mut send, _recv) = accepted.accept_bi().await.unwrap();
+            send.write_all(b"new").await.unwrap();
+            recv.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(&bytes, b"new");
+        }
+    }
 
     /// The close/drop contract the protocol's evict-and-retry paths
     /// rely on (and that iroh QUIC provides in production): a conn
