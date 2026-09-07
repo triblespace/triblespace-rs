@@ -685,13 +685,19 @@ impl Conn for SimConn {
     }
 
     async fn accept_bi(&self) -> Option<(SimStream, SimStream)> {
+        // Capture close before checking the flag, and keep it in the select
+        // while waiting for either the queue lock or the next stream.
+        let on_close = self.notify_close.notified();
         if self.closed.load(Ordering::SeqCst) {
             return None;
         }
-        let mut rx = self.accept_rx.lock().await;
         tokio::select! {
-            stream = rx.recv() => stream,
-            _ = self.notify_close.notified() => None,
+            biased;
+            _ = on_close => None,
+            stream = async {
+                let mut rx = self.accept_rx.lock().await;
+                rx.recv().await
+            } => stream,
         }
     }
 
@@ -868,6 +874,45 @@ mod tests {
         assert!(
             dialer.open_bi().await.is_err(),
             "open_bi after close errors"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_while_accept_waits_for_queue_lock_is_not_lost() {
+        for queued_stream in [false, true] {
+            let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+            let _stream = if queued_stream {
+                Some(dialer.open_bi().await.unwrap())
+            } else {
+                None
+            };
+            let queue = acceptor.accept_rx.lock().await;
+            let accept = acceptor.accept_bi();
+            tokio::pin!(accept);
+            assert!(futures::poll!(&mut accept).is_pending());
+            dialer.close(0, b"close while queue lock held");
+            drop(queue);
+            assert!(
+                matches!(futures::poll!(&mut accept), Poll::Ready(None)),
+                "accept must remember close and prefer it over a queued stream"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn close_wakes_accept_without_waiting_for_queue_lock() {
+        let (dialer, acceptor) = SimConn::pair([1; 32], [2; 32]);
+        let _queue = acceptor.accept_rx.lock().await;
+        let mut accept = Box::pin(acceptor.accept_bi());
+        let wake = Arc::new(WakeCount::default());
+        let waker = futures::task::waker_ref(&wake);
+        let mut context = Context::from_waker(&waker);
+        assert!(accept.as_mut().poll(&mut context).is_pending());
+        dialer.close(0, b"close before queue lock released");
+        assert_eq!(wake.0.load(Ordering::SeqCst), 1);
+        assert!(
+            matches!(accept.as_mut().poll(&mut context), Poll::Ready(None)),
+            "closing must cancel even a mutex-blocked accept"
         );
     }
 
