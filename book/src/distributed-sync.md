@@ -240,6 +240,67 @@ not consult C or READ(C), and creates a durable WANT only when the caller asks
 the `WantStore` to record `Blob(H)`. Provider leases are bounded soft state and
 may disappear without changing semantic data or local retention.
 
+### Directory proof-node reuse experiment
+
+`provider/directory_model.rs` is a wire-free comparison of signed entry leases
+and signed immutable inventory roots. Its `shared_proofs.rs` extension retains
+the same membership/lease PATCH repair and the same final inclusion verifier.
+Only the proof transfer changes: each root-bound membership carries an ordered
+list of node digests; a receiver fetches missing native `PatchNode` bodies from
+that selected support's proof and retains at most 4,096 validated nodes in a
+`PATCH<32>`. It neither asks for a full inventory nor consults a global member
+registry. The parent's complete-topology placement oracle remains an explicitly
+synthetic comparison, not an implementation of distributed responsibility.
+
+Node presence supplies bytes, never authority. An all-hit proof must still
+match the provider, member, signed range, exact inventory root and live lease,
+and must pass the entire canonical node walk. The cache is populated only after
+successful membership admission. Original signed absolute expiry survives
+forwarding and cache reuse; changing the inventory requires new root-to-member
+associations. The model assumes one trusted zero-skew absolute clock and
+already-selected first-byte responsibility ranges; it does not solve either
+clock recovery or dynamic ownership discovery.
+
+The first Stars run (2026-09-07 23:24 UTC, base `d0db6da2`, rustc 1.98.0,
+unoptimized tests with debug information disabled) used 256 deterministic opaque
+members and then added one member. The partial receiver selected 132 of the
+original members, then 133. Both representations produced identical content and
+lease roots, active sets, signature counts, repair-request counts and complete
+proof-validation work:
+
+| Phase | New root/member bindings | Verified nodes / shared references | Shared node bodies | Shared body bytes | Inline proof bytes | Shared proof bytes |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cold | 256 | 673 | 323 | 46,751 | 1,779,936 | 78,879 |
+| Unchanged renewal | 0 | 0 | 0 | 0 | 0 | 0 |
+| One-member growth | 257 | 677 | 3 | 7,007 | 1,787,137 | 29,024 |
+| Partial cold | 132 | 350 | 168 | 27,587 | 918,474 | 44,295 |
+| Partial growth | 133 | 354 | 3 | 7,007 | 925,675 | 18,564 |
+
+These are concrete model field bytes, **not measured network traffic**. Each
+visited node contributes its actual key/representative width and fanout using
+the existing collection node response field layout; a test cross-checks actual
+codec output for its supported 32-byte keys. The model's inventory keys are 64
+bytes. Inline paths send one body per verified node. Shared paths send one
+32-byte reference per node, one explicit 32-byte request per missing body, and
+that body; both include one path-length byte per support. Common signed lease,
+root/member, membership/lease repair and transport framing bytes are excluded,
+as are latency and any cache-miss request scheduling effects.
+
+Every phase admitted one signed lease. Even unchanged renewal verified that
+new signature, though it sent no membership support. Growth still checked
+41,806 child summaries across the complete 677-node proofs and stored 257 new
+root-bound entries; the three new bodies are a byte-reuse result, not reduced
+validation or membership churn. Reconstructing the original independent `Vec`
+paths also makes no resident-memory or allocation saving claim. A partial
+receiver retains only selected leaf bodies, but branch representatives and
+sibling summaries still disclose information outside its responsibility.
+
+Run `cargo test --locked --offline -p triblespace-net --lib
+provider::directory_model -- --nocapture` for the eleven focused tests. Lease
+expiry despite cache hits, root grafting, malformed miss bodies, eviction, and
+the original budget invariants are covered. There is no production wire, host, routing,
+persistence, or deployment change in this experiment.
+
 ## Routing is process state
 
 `Peer::new(store, key, config)` starts a production host immediately, as a

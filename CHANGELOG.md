@@ -21,6 +21,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   when another discovered provider succeeds. These paused-time simulation
   tests change no production protocol or persistence behavior.
 
+- Extend the test-only DHT directory model with bounded immutable PATCH proof
+  node reuse across signed inventory roots. Compare actual node/fanout byte
+  counts, digest references and cache-miss requests against independent paths
+  for cold transfer, unchanged renewal, growth and partial responsibility.
+  Preserve full proof verification, every root-bound membership change, and
+  original lease expiry; no provider wire, host, routing or persistence change.
+
 - Recheck Pile shared-replay parse failures once under an exclusive file lock
   with a fresh observed length. This distinguishes an in-flight append from a
   persistent malformed record without retrying writes or truncating data, and
