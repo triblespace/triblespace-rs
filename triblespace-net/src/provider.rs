@@ -435,7 +435,9 @@ impl ProviderPublisher {
         lane: PublicationLane,
     ) -> Option<ProviderPublication> {
         loop {
-            let key = *pending.leases.iter_ordered().next()?;
+            let key = pending
+                .leases
+                .first_infix_range(&[], &[0; 32], &[u8::MAX; 32])?;
             pending.leases.remove(&key);
             if let Some(identity) = resident.leases.get(&key).copied() {
                 return Some(ProviderPublication {
@@ -1567,6 +1569,69 @@ mod tests {
         assert_eq!(stats.entries, 16 * crate::routing::K);
         assert!(stats.frames <= stats.entries);
         assert!(stats.max_entries_per_frame <= 16);
+    }
+
+    #[test]
+    fn pending_publication_descent_matches_ordered_selection_with_stale_entries() {
+        let mut pending = ProviderSet::default();
+        let mut resident = ProviderSet::default();
+        for index in 0..1024 {
+            let key = deterministic_bytes("provider-descent-test-key", index);
+            pending
+                .leases
+                .replace(&PatchEntry::with_value(&key, [0; 32]));
+            if index % 3 == 0 {
+                resident
+                    .leases
+                    .replace(&PatchEntry::with_value(&key, [1; 32]));
+            }
+        }
+        let expected: Vec<_> = resident.leases.iter_ordered().copied().collect();
+        let actual: Vec<_> = std::iter::from_fn(|| {
+            ProviderPublisher::pop_pending(&mut pending, &resident, PublicationLane::Incremental)
+        })
+        .map(|work| {
+            assert_eq!(work.identity, [1; 32]);
+            assert_eq!(work.lane, PublicationLane::Incremental);
+            work.key
+        })
+        .collect();
+        assert_eq!(actual, expected);
+        assert!(pending.leases.is_empty());
+    }
+
+    #[test]
+    #[ignore = "manual pending-publication selection comparison"]
+    fn pending_publication_selection_probe() {
+        let count = scale_parameter("TRIBLESPACE_PROVIDER_SCALE_KEYS", 10_000);
+        let mut original = ProviderSet::default();
+        for index in 0..count {
+            let key = deterministic_bytes("provider-descent-test-key", index);
+            original.leases.replace(&PatchEntry::with_value(&key, key));
+        }
+        let expected = original.leases.iter_ordered().copied().collect::<Vec<_>>();
+        for direct in [false, true, true, false] {
+            let mut pending = original.clone();
+            let start = Instant::now();
+            for expected_key in &expected {
+                let key = if direct {
+                    pending
+                        .leases
+                        .first_infix_range(&[], &[0; 32], &[255; 32])
+                        .unwrap()
+                } else {
+                    *pending.leases.iter_ordered().next().unwrap()
+                };
+                assert_eq!(&key, expected_key);
+                pending.leases.remove(&key);
+                black_box(key);
+            }
+            assert!(pending.leases.is_empty());
+            println!(
+                "pending_selection direct={direct} keys={count} seconds={:.6}",
+                start.elapsed().as_secs_f64()
+            );
+        }
     }
 
     /// Deterministic, opt-in scale probe for the provider directory, publisher,

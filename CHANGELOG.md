@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Select the next pending provider publication by direct ordered PATCH descent
+  instead of constructing and sorting a full iterator for one key. Preserve
+  lexical order, stale-entry removal, lane fairness, and current resident values;
+  the long-lived renewal traversal is unchanged.
+
 - Add a test-only DHT restart experiment using the real XOR routing and lookup
   machine. Save authenticated endpoint identities as a bounded canonical PATCH
   set in native bytes, restore only candidates, and compare cold/warm discovery,
