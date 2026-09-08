@@ -495,7 +495,10 @@ store snapshot; no collection descriptor, repair overlay, or proof is involved. 
 successful landing satisfies the request, while a DHT miss or failed proof
 leaves it pending. `Merge(C,a,b)` and `Derive(D,input)` let one process state
 demand while a network or worker process fulfills it. WANT grants no READ,
-WRITE, retention, or membership semantics.
+WRITE, or collection membership. Retained WANT records do keep their resident
+direct blob references alive through the normal record-root GC rules. GC never
+fetches missing references merely to retain them; dropping WANT records is an
+explicit rewrite/retention-policy choice.
 
 ## Wire surface
 
@@ -547,3 +550,59 @@ The result is two orthogonal elemental loops: gossip plus READ(C)-gated PATCH
 repair says *what changed in a collection*, while KDF(H) discovery plus mutual
 bearer proof retrieves only the immutable bytes the local lattice resolver
 decides to use.
+
+## Directory representation experiment
+
+The live receiver-local `ProviderDirectory` uses four BTree indexes: membership
+values, providers by exact locator, expiry order, and XOR responsibility order.
+`provider/patch_directory.rs` is a **test-only** alternative with two PATCHes:
+
+- `!(locator XOR local_endpoint) | !provider`, segmented `32 | 32`, owns the
+  deadline/token value. Segment counts answer membership and exact-locator
+  cardinalities; the first ordered key identifies the farthest responsibility.
+- `deadline_ns | locator | provider` orders expiry. Keeping the original
+  locator/provider order here preserves tie-breaking under the bounded prune
+  budget, not merely the eventual set of live results.
+
+No wire, lease, trust, publication, persistence or live-directory policy changes.
+Differential tests compare every retained value, deadline, capacity decision,
+exact-key result and farthest member against the existing implementation across
+24,000 deterministic mixed operations and targeted expiry/fanout boundaries.
+
+Stars measurements on 2026-09-07 used exact prototype `512513bf`, rustc 1.98.0,
+and fresh processes for each representation. Each table cell is **PATCH / BTree**;
+times are seconds. GET traverses every locator once; insert and renewal visit
+every locator/provider pair. RSS is the post-insertion minus pre-insertion
+process reading, excluding the already-built deterministic input corpus.
+
+| Locators × providers | RSS delta MiB | Insert | GET | Renew |
+| --- | ---: | ---: | ---: | ---: |
+| 100,000 × 1 | 32.68 / 84.91 | 0.0647 / 0.1291 | 0.0370 / 0.0410 | 0.1752 / 0.0628 |
+| 10,000 × 3 | 10.61 / 17.46 | 0.0321 / 0.0235 | 0.00686 / 0.00457 | 0.0512 / 0.00880 |
+| 10,000 × 16 | 47.84 / 79.64 | 0.2948 / 0.1488 | 0.0239 / 0.0219 | 0.2679 / 0.0486 |
+| 1,000,000 × 1 | 302.55 / 845.20 | 1.0831 / 2.2850 | 0.5901 / 0.7602 | 2.3755 / 1.4508 |
+
+These are single samples, not confidence intervals or full release/network
+measurements. Only `triblespace-core` and `triblespace-net` received test-profile
+overrides `opt-level=3`, `debug-assertions=false`, `overflow-checks=false`;
+dependencies otherwise retained the same test profile. Both compared modes
+used those identical settings, eight build jobs, debug information disabled,
+incremental off, and no RUSTFLAGS. Debug-only timings were much worse for PATCH
+because its invariant audits are intentionally expensive; they are not a sound
+basis for the production comparison. Both profiles passed the differential tests.
+
+The memory saving is substantial, but immutable membership replacement and
+deadline reindexing make renewal slower, and multi-provider insertion can also
+lose. This prototype is retained for evaluation, **not promoted to the live
+directory**. A proposed `Cell` lease-value shortcut was rejected before edits:
+shared PATCH leaves require `Send + Sync` for cross-thread ownership. Adding an
+unsafe ownership promise or per-leaf synchronization just to optimize these
+already-fast local operations would add a new tradeoff, not finish this one.
+
+Reproduce with `cargo test --locked --offline -p triblespace-net --lib
+--features sim provider::patch_directory`; the ignored
+`patch_directory_scale_probe` accepts `TRIBLESPACE_DIRECTORY_REPRESENTATION`
+(`patch` or `btree`), `TRIBLESPACE_DIRECTORY_KEYS`, and
+`TRIBLESPACE_DIRECTORY_PROVIDERS`. Run each mode in its own process and state the
+profile settings with any result. Corpus shape, allocator state, CPU profile,
+and fanout matter; this is not a measurement of DHT announcement throughput.

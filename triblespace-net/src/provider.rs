@@ -21,6 +21,10 @@ use crate::transport::PeerId;
 #[path = "provider/directory_model.rs"]
 mod directory_model;
 
+#[cfg(test)]
+#[path = "provider/patch_directory.rs"]
+mod patch_directory;
+
 /// Opaque rendezvous key for one exact collection or bearer identity.
 pub(crate) type ProviderKey = [u8; 32];
 pub(crate) type ProviderToken = [u8; 32];
