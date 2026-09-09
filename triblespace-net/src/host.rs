@@ -1626,8 +1626,7 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                 wiring
                     .health
                     .with_peer(target.collection, target.peer, |health| {
-                        health.in_flight = true;
-                        health.last_started_at = Some(now);
+                        health.started(now);
                     });
                 let transport = transport.clone();
                 let pool = pool.clone();
@@ -1807,17 +1806,17 @@ async fn reconcile_collection_peer<T: Transport>(
         let now = crate::clock::mono_now();
         let records_received = delta.records.len() as u64;
         let proofs_received = delta.authorization_evidence.len() as u64;
-        if records_received != 0 || proofs_received != 0 {
-            health.last_progress_at = Some(now);
-        }
-        health.comparison = Some(RepairComparison {
-            observed_at: delta.compared_at,
-            local: delta.local.into(),
-            remote: delta.remote.into(),
-            records_received,
-            proofs_received,
-            more: delta.more,
-        });
+        health.compared(
+            RepairComparison {
+                observed_at: delta.compared_at,
+                local: delta.local.into(),
+                remote: delta.remote.into(),
+                records_received,
+                proofs_received,
+                more: delta.more,
+            },
+            now,
+        );
     });
     let mut admissions = AdmissionBatcher::new(events);
     for proof in delta.authorization_evidence {

@@ -65,11 +65,18 @@ pub enum RepairFailure {
 pub struct RepairHealth {
     pub peer: PeerId,
     pub in_flight: bool,
+    /// First scheduled attempt while this peer observation is retained. Retries
+    /// cannot extend the grace period of a peer that has never answered.
+    pub first_started_at: Option<Mono>,
     pub last_started_at: Option<Mono>,
     pub last_completed_at: Option<Mono>,
     /// Last validated nonempty repair delta; not a durability receipt. Repeated
     /// downloads can advance this while store admission remains blocked.
     pub last_progress_at: Option<Mono>,
+    /// First authorized comparison, or a change in its remote frontier. Local
+    /// writes and repeated identical remote replies never advance this clock.
+    /// This is evidence of a changing remote frontier, not proof of gap closure.
+    pub last_remote_change_at: Option<Mono>,
     pub last_failure_at: Option<Mono>,
     pub last_failure: Option<RepairFailure>,
     pub comparison: Option<RepairComparison>,
@@ -80,9 +87,11 @@ impl RepairHealth {
         Self {
             peer,
             in_flight: false,
+            first_started_at: None,
             last_started_at: None,
             last_completed_at: None,
             last_progress_at: None,
+            last_remote_change_at: None,
             last_failure_at: None,
             last_failure: None,
             comparison: None,
@@ -91,6 +100,25 @@ impl RepairHealth {
 
     fn last_event_at(&self) -> Option<Mono> {
         self.last_started_at.max(self.last_completed_at)
+    }
+
+    pub(crate) fn started(&mut self, at: Mono) {
+        self.in_flight = true;
+        self.first_started_at.get_or_insert(at);
+        self.last_started_at = Some(at);
+    }
+
+    pub(crate) fn compared(&mut self, comparison: RepairComparison, completed_at: Mono) {
+        if self
+            .comparison
+            .is_none_or(|previous| previous.remote != comparison.remote)
+        {
+            self.last_remote_change_at = Some(comparison.observed_at);
+        }
+        if comparison.records_received != 0 || comparison.proofs_received != 0 {
+            self.last_progress_at = Some(completed_at);
+        }
+        self.comparison = Some(comparison);
     }
 }
 
@@ -424,6 +452,62 @@ mod tests {
                 .comparison(collection, peer, now, Duration::from_secs(180)),
             ComparisonState::Different,
         );
+    }
+
+    #[test]
+    fn local_advances_and_identical_remote_replies_do_not_extend_remote_progress_grace() {
+        let now = crate::clock::mono_now();
+        let mut health = RepairHealth::new([4; 32]);
+        health.started(now);
+        let first_comparison = now + Duration::from_secs(1);
+        let comparison = RepairComparison {
+            observed_at: first_comparison,
+            local: frontier(5, 2),
+            remote: frontier(6, 1),
+            records_received: 0,
+            proofs_received: 0,
+            more: false,
+        };
+        health.compared(comparison, first_comparison);
+        assert_eq!(health.last_remote_change_at, Some(first_comparison));
+
+        let later = now + Duration::from_secs(601);
+        health.started(later);
+        health.compared(
+            RepairComparison {
+                observed_at: later,
+                local: frontier(7, 3),
+                ..comparison
+            },
+            later,
+        );
+        assert_eq!(health.first_started_at, Some(now));
+        assert_eq!(health.last_started_at, Some(later));
+        assert_eq!(health.last_remote_change_at, Some(first_comparison));
+        assert_eq!(health.comparison.unwrap().local, frontier(7, 3));
+        assert_eq!(health.last_progress_at, None);
+
+        let changed = later + Duration::from_secs(1);
+        health.compared(
+            RepairComparison {
+                observed_at: changed,
+                remote: frontier(8, 2),
+                ..health.comparison.unwrap()
+            },
+            changed,
+        );
+        assert_eq!(health.last_remote_change_at, Some(changed));
+    }
+
+    #[test]
+    fn unanswered_attempts_keep_the_first_attempt_for_grace() {
+        let now = crate::clock::mono_now();
+        let mut health = RepairHealth::new([4; 32]);
+        health.started(now);
+        health.started(now + Duration::from_secs(601));
+        assert_eq!(health.first_started_at, Some(now));
+        assert_eq!(health.last_remote_change_at, None);
+        assert_eq!(health.comparison, None);
     }
 
     #[test]
