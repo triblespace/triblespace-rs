@@ -34,8 +34,11 @@ use crate::collection_activation::{
     CollectionReadBootstrapError, CollectionRepairOverlay, CollectionRepairOverlayError,
     collection_read_bootstrap_proofs, collection_repair_overlay,
 };
-use crate::collection_session::{pull_collection, serve_collection_repair};
+use crate::collection_session::{manifest, pull_collection, serve_collection_repair};
 use crate::collection_wire::{MAX_COLLECTION_READ_BOOTSTRAP_PROOFS, OP_COLLECTION_REPAIR};
+use crate::health::{
+    CollectionHealth, Health, HealthSnapshot, RepairComparison, RepairFailure, StoreHealth,
+};
 use crate::identity::iroh_secret;
 use crate::inventory::ReconcileQos;
 use crate::protocol::{
@@ -662,6 +665,7 @@ pub struct NetSender {
     snapshot: SnapshotSlot,
     cap: tokio::sync::watch::Receiver<Option<Arc<dyn NetCapability>>>,
     id: EndpointId,
+    health: Health,
 }
 
 impl NetSender {
@@ -669,19 +673,74 @@ impl NetSender {
         self.id
     }
 
+    /// Read bounded runtime evidence without starting work or refreshing its age.
+    pub fn health(&self) -> Arc<HealthSnapshot> {
+        self.health.snapshot()
+    }
+
+    pub(crate) fn observe_store(&self, update: impl FnOnce(&mut StoreHealth)) {
+        self.health.update(|health| update(&mut health.store));
+    }
+
+    pub(crate) fn observe_direction(&self, direction: crate::inventory::ReconcileDirection) {
+        self.health
+            .update(|health| health.direction = Some(direction));
+    }
+
+    pub(crate) fn observe_active_collections(&self, active: &ActiveCollections) {
+        self.health.update(|health| {
+            health
+                .collections
+                .retain(|entry| active.get(&entry.collection.raw).is_some());
+            for raw in active.iter_ordered() {
+                if !health
+                    .collections
+                    .iter()
+                    .any(|entry| entry.collection.raw == *raw)
+                {
+                    health.collections.push(CollectionHealth {
+                        collection: CollectionHandle::new(*raw),
+                        local_frontier: None,
+                        last_local_change_at: None,
+                        peers: Vec::new(),
+                    });
+                }
+            }
+            health
+                .collections
+                .sort_unstable_by_key(|entry| entry.collection.raw);
+        });
+    }
+
     pub(crate) fn current_snapshot(&self) -> Option<SharedSnapshot> {
         self.snapshot.lock().unwrap().clone()
     }
 
     pub(crate) fn update_snapshot(&self, snapshot: StoreSnapshot, active: &ActiveCollections) {
+        self.observe_active_collections(active);
+        let snapshot = Arc::new(snapshot);
         let mut notices = snapshot.notices();
         for raw in active.iter_ordered() {
             if !notices.iter().any(|(collection, _)| collection.raw == *raw) {
                 notices.push((CollectionHandle::new(*raw), [0; 32]));
             }
         }
-        let retired = self.snapshot.lock().unwrap().replace(Arc::new(snapshot));
+        let retired = self.snapshot.lock().unwrap().replace(snapshot.clone());
         drop(retired);
+        let now = crate::clock::mono_now();
+        self.health.update(|health| {
+            health.store.serving_snapshot = true;
+            health.store.last_snapshot_published_at = Some(now);
+            for entry in &mut health.collections {
+                let frontier = snapshot
+                    .collection(entry.collection)
+                    .map(|collection| manifest(&collection.repair).into());
+                if entry.local_frontier != frontier {
+                    entry.last_local_change_at = Some(now);
+                    entry.local_frontier = frontier;
+                }
+            }
+        });
         let _ = self
             .cmd_tx
             .send(NetCommand::SnapshotChanged(SnapshotNotice {
@@ -695,6 +754,15 @@ impl NetSender {
     }
 
     pub fn clear_snapshot(&self) {
+        self.health.update(|health| {
+            if health.store.serving_snapshot {
+                health.store.withdrawn_at = Some(crate::clock::mono_now());
+            }
+            health.store.serving_snapshot = false;
+            for collection in &mut health.collections {
+                collection.local_frontier = None;
+            }
+        });
         let had_snapshot = self.snapshot.lock().unwrap().take().is_some();
         if had_snapshot {
             let _ = self
@@ -757,6 +825,7 @@ pub struct HostWiring {
     evt_tx: tokio::sync::mpsc::Sender<NetEventBatch>,
     snapshot: SnapshotSlot,
     cap_tx: tokio::sync::watch::Sender<Option<Arc<dyn NetCapability>>>,
+    health: Health,
 }
 
 #[cfg(test)]
@@ -775,12 +844,14 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
     let (evt_tx, evt_rx) = tokio::sync::mpsc::channel(crate::channel::MAX_ADMISSION_BRIDGE_BATCHES);
     let snapshot = Arc::new(Mutex::new(None));
     let (cap_tx, cap_rx) = tokio::sync::watch::channel(None);
+    let health = Health::new(id);
     (
         NetSender {
             cmd_tx,
             snapshot: snapshot.clone(),
             cap: cap_rx,
             id,
+            health: health.clone(),
         },
         NetReceiver { evt_rx },
         HostWiring {
@@ -788,6 +859,7 @@ pub fn wire(id: EndpointId) -> (NetSender, NetReceiver, HostWiring) {
             evt_tx,
             snapshot,
             cap_tx,
+            health,
         },
     )
 }
@@ -871,11 +943,14 @@ struct RepairOutcome {
     target: RepairTarget,
     success: bool,
     more: bool,
+    completed_at: crate::clock::Mono,
+    failure: Option<RepairFailure>,
 }
 
 struct PublicationOutcome {
     work: ProviderPublication,
     result: PublicationResult,
+    completed_at: crate::clock::Mono,
 }
 
 /// The host owns at most one descriptor fetch per explicitly active collection,
@@ -1081,6 +1156,12 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         mut incoming,
     } = harness;
     let my_id = transport.local_id();
+    wiring.health.update(|health| {
+        let now = crate::clock::mono_now();
+        health.direction = Some(config.qos.direction);
+        health.started_at = Some(now);
+        health.observed_at = Some(now);
+    });
     let configured: Vec<_> = config
         .peers
         .iter()
@@ -1296,6 +1377,16 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
         while let Ok(outcome) = repair_rx.try_recv() {
             in_flight.remove(&outcome.target);
+            wiring
+                .health
+                .with_peer(outcome.target.collection, outcome.target.peer, |health| {
+                    health.in_flight = false;
+                    health.last_completed_at = Some(outcome.completed_at);
+                    if let Some(failure) = outcome.failure {
+                        health.last_failure_at = Some(outcome.completed_at);
+                        health.last_failure = Some(failure);
+                    }
+                });
             if !current_roots.contains_key(&outcome.target.collection.raw) {
                 failures.remove(&outcome.target);
                 continue;
@@ -1350,6 +1441,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
         }
         while let Ok(outcome) = publication_rx.try_recv() {
             publications_in_flight.remove(&outcome.work.key);
+            wiring.health.update(|health| {
+                health
+                    .publication
+                    .completed(outcome.completed_at, outcome.result);
+            });
             match outcome.result {
                 PublicationResult::Published => {
                     remote_acknowledged_attempts = remote_acknowledged_attempts.saturating_add(1);
@@ -1527,28 +1623,39 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
                     continue;
                 };
                 in_flight.insert(target);
+                wiring
+                    .health
+                    .with_peer(target.collection, target.peer, |health| {
+                        health.in_flight = true;
+                        health.last_started_at = Some(now);
+                    });
                 let transport = transport.clone();
                 let pool = pool.clone();
                 let events = wiring.evt_tx.clone();
                 let repair_tx = repair_tx.clone();
+                let health = wiring.health.clone();
                 tokio::spawn(async move {
                     let result = tokio::time::timeout(
                         REPAIR_DEADLINE,
-                        reconcile_collection_peer(&transport, &pool, target, local, &events),
+                        reconcile_collection_peer(
+                            &transport, &pool, target, local, &events, &health,
+                        ),
                     )
                     .await;
-                    let (success, more) = match result {
-                        Ok(Ok(more)) => (true, more),
+                    let (success, more, failure) = match result {
+                        Ok(Ok(more)) => (true, more, None),
                         Ok(Err(error)) => {
                             debug!(%error, "collection repair failed");
-                            (false, false)
+                            (false, false, Some(RepairFailure::Failed))
                         }
-                        Err(_) => (false, false),
+                        Err(_) => (false, false, Some(RepairFailure::Deadline)),
                     };
                     let _ = repair_tx.send(RepairOutcome {
                         target,
                         success,
                         more,
+                        completed_at: crate::clock::mono_now(),
+                        failure,
                     });
                 });
             }
@@ -1565,6 +1672,9 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             }
             publication_budget.consume_attempt();
             publication_attempts = publication_attempts.saturating_add(1);
+            wiring
+                .health
+                .update(|health| health.publication.last_started_at = Some(now));
             if publication_budget.is_exhausted() && !publication_budget_reported {
                 warn!(
                     limit = publication_limit.expect("a finite budget can be exhausted"),
@@ -1577,7 +1687,11 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             let token = provider_lease_token(work.identity, key, my_id);
             tokio::spawn(async move {
                 let result = client.announce_key(key, token).await;
-                let _ = publication_tx.send(PublicationOutcome { work, result });
+                let _ = publication_tx.send(PublicationOutcome {
+                    work,
+                    result,
+                    completed_at: crate::clock::mono_now(),
+                });
             });
         }
 
@@ -1609,6 +1723,23 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
             next_publication_progress = now + PROVIDER_PROGRESS_PERIOD;
         }
 
+        let progress = publisher.progress();
+        wiring.health.update(|health| {
+            health.observed_at = Some(crate::clock::mono_now());
+            let publication = &mut health.publication;
+            publication.resident = progress.resident;
+            publication.startup_pending = progress.startup_pending;
+            publication.incremental_pending = progress.incremental_pending;
+            publication.retry_pending = progress.retry_pending;
+            publication.renewal_remaining = progress.renewal_remaining;
+            publication.in_flight = publications_in_flight.len();
+            publication.topology_paused = progress.topology_paused;
+            publication.budget_exhausted = publication_budget.is_exhausted();
+            publication.attempts = publication_attempts;
+            publication.acknowledged = remote_acknowledged_attempts;
+            publication.rejected = remote_rejected_attempts;
+            publication.unavailable = unavailable_attempts;
+        });
         tokio::time::sleep(HOST_POLL_PERIOD).await;
     }
 }
@@ -1656,6 +1787,7 @@ async fn reconcile_collection_peer<T: Transport>(
     target: RepairTarget,
     local: Arc<CollectionSnapshot>,
     events: &tokio::sync::mpsc::Sender<NetEventBatch>,
+    health: &Health,
 ) -> anyhow::Result<bool> {
     let connection = pool_get(transport, pool, target.peer).await?;
     let delta = match pull_collection(
@@ -1671,6 +1803,22 @@ async fn reconcile_collection_peer<T: Transport>(
             return Err(error);
         }
     };
+    health.with_peer(target.collection, target.peer, |health| {
+        let now = crate::clock::mono_now();
+        let records_received = delta.records.len() as u64;
+        let proofs_received = delta.authorization_evidence.len() as u64;
+        if records_received != 0 || proofs_received != 0 {
+            health.last_progress_at = Some(now);
+        }
+        health.comparison = Some(RepairComparison {
+            observed_at: delta.compared_at,
+            local: delta.local.into(),
+            remote: delta.remote.into(),
+            records_received,
+            proofs_received,
+            more: delta.more,
+        });
+    });
     let mut admissions = AdmissionBatcher::new(events);
     for proof in delta.authorization_evidence {
         admissions.push(NetEvent::CapabilityProof(proof)).await?;

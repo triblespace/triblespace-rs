@@ -25,6 +25,9 @@ use crate::transport::Conn;
 /// Evidence missing from the caller's immutable local observation.
 #[derive(Clone, Debug)]
 pub(crate) struct CollectionRepairDelta {
+    pub(crate) compared_at: crate::clock::Mono,
+    pub(crate) local: CollectionRepairManifest,
+    pub(crate) remote: CollectionRepairManifest,
     pub(crate) records: Vec<CollectionRecord>,
     pub(crate) authorization_evidence: Vec<CapabilityProof>,
     pub(crate) more: bool,
@@ -137,7 +140,7 @@ fn node_response_wire_len(response: &PatchNodeResponse<Vec<u8>>) -> usize {
     }
 }
 
-fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairManifest {
+pub(crate) fn manifest(overlay: &CollectionRepairOverlay) -> CollectionRepairManifest {
     CollectionRepairManifest {
         wake_root: overlay.wake_root(),
         records: overlay.records().summary(),
@@ -206,6 +209,9 @@ where
             bail!("remote does not retain the requested collection")
         }
     };
+    // A long repair must not make its older pinned manifest appear fresh at
+    // completion. This is the observation instant, not the completion instant.
+    let compared_at = crate::clock::mono_now();
 
     let mut remaining_requests = MAX_SERVER_REPAIR_COMMANDS - 1;
     let mut response_bytes = 0_usize;
@@ -231,6 +237,9 @@ where
     send.shutdown().await?;
     require_eof(recv).await?;
     Ok(CollectionRepairDelta {
+        compared_at,
+        local: manifest(local),
+        remote,
         records,
         authorization_evidence,
         more: authorization_more || record_more,
@@ -689,6 +698,8 @@ mod tests {
         let client_snapshot = client_store.snapshot().unwrap();
         let client =
             collection_repair_overlay(&client_snapshot, client_collection.handle()).unwrap();
+        let expected_remote = manifest(&server);
+        let expected_local = manifest(&client);
         let (server_io, client_io) = tokio::io::duplex(1 << 20);
         let (mut server_recv, mut server_send) = tokio::io::split(server_io);
         let (mut client_recv, mut client_send) = tokio::io::split(client_io);
@@ -713,6 +724,9 @@ mod tests {
             .unwrap();
         assert_eq!(delta.records.len(), 1);
         assert!(delta.authorization_evidence.is_empty());
+        assert_eq!(delta.local, expected_local);
+        assert_eq!(delta.remote, expected_remote);
+        assert_ne!(delta.local, delta.remote);
         server_task.await.unwrap();
     }
 

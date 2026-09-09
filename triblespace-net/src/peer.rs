@@ -285,6 +285,7 @@ where
         wake_plane: Option<CollectionWakePlane>,
         host: HostState,
     ) -> Self {
+        sender.observe_direction(qos.direction);
         let mut peer = Self {
             store: Arc::new(Mutex::new(Some(store))),
             host: Arc::new(Mutex::new(SharedHost {
@@ -325,6 +326,12 @@ where
 
     pub fn id(&self) -> EndpointId {
         self.sender.id()
+    }
+
+    /// Inspect local runtime evidence without refreshing the store, starting a
+    /// lazy host, issuing probes, or changing the observation's age.
+    pub fn health(&self) -> Arc<crate::health::HealthSnapshot> {
+        self.sender.health()
     }
 
     /// Stock gossip wake plane for a production iroh peer.
@@ -373,6 +380,7 @@ where
             self.active_dirty |= self.active.get(&collection.raw).is_none();
             self.active.insert(&PatchEntry::new(&collection.raw));
         }
+        self.sender.observe_active_collections(&self.active);
         self.refresh();
     }
 
@@ -421,7 +429,19 @@ where
         if !self.host_is_running() {
             return Ok(());
         }
+        self.sender.observe_store(|health| {
+            health.last_refresh_started_at = Some(crate::clock::mono_now());
+        });
         let result = self.refresh_checked(instant);
+        self.sender.observe_store(|health| {
+            let now = crate::clock::mono_now();
+            health.last_refresh_completed_at = Some(now);
+            health.pending_flush = self.pending_network_flush;
+            if result.is_err() {
+                health.last_failure_at = Some(now);
+                health.last_failure = Some(crate::health::StoreFailure::Refresh);
+            }
+        });
         if result.is_err() {
             self.sender.clear_snapshot();
             self.last_store_snapshot = None;
@@ -492,10 +512,16 @@ where
                 }
             }
         }
+        self.sender
+            .observe_store(|health| health.pending_flush = self.pending_network_flush);
         if self.pending_network_flush {
             match store.flush() {
                 Ok(()) => {
                     self.pending_network_flush = false;
+                    self.sender.observe_store(|health| {
+                        health.last_flush_at = Some(crate::clock::mono_now());
+                        health.pending_flush = false;
+                    });
                     tracing::debug!(
                         received,
                         received_batches,
@@ -503,6 +529,10 @@ where
                     );
                 }
                 Err(error) => {
+                    self.sender.observe_store(|health| {
+                        health.last_failure_at = Some(crate::clock::mono_now());
+                        health.last_failure = Some(crate::health::StoreFailure::Flush);
+                    });
                     tracing::warn!(
                         ?error,
                         received,
@@ -516,6 +546,10 @@ where
             let snapshot = match store.snapshot_at(instant) {
                 Ok(snapshot) => snapshot,
                 Err(error) => {
+                    self.sender.observe_store(|health| {
+                        health.last_failure_at = Some(crate::clock::mono_now());
+                        health.last_failure = Some(crate::health::StoreFailure::Snapshot);
+                    });
                     tracing::warn!(
                         ?error,
                         "store snapshot unavailable; keeping prior collection view"
@@ -523,6 +557,9 @@ where
                     return Ok(());
                 }
             };
+            self.sender.observe_store(|health| {
+                health.last_snapshot_observed_at = Some(crate::clock::mono_now());
+            });
             let previous_snapshot = self.sender.current_snapshot();
             let changes = if previous_snapshot.is_none() {
                 StoreChanges::ALL
@@ -888,6 +925,9 @@ mod tests {
         let mut store = MemoryRepo::default();
         let handle = store.put::<UnknownBlob, _>(bytes.clone()).unwrap();
         let mut peer = Peer::lazy(store, key, foreground_config());
+        let health = peer.health();
+        assert_eq!(health.observed_at, None);
+        assert_eq!(health.direction, Some(ReconcileDirection::ReadOnly));
         let before = peer.snapshot().unwrap();
 
         assert_eq!(
@@ -1312,6 +1352,9 @@ mod tests {
         peer.close().unwrap();
 
         assert!(observer.current_snapshot().is_none());
+        let health = observer.health();
+        assert!(!health.store.serving_snapshot);
+        assert!(health.store.withdrawn_at.is_some());
         assert_eq!(
             futures::executor::block_on(frozen.get::<Bytes, UnknownBlob>(handle)).unwrap(),
             bytes
@@ -1391,7 +1434,14 @@ mod tests {
         let before = observer.current_snapshot().unwrap();
 
         for _ in 0..100 {
+            let refresh_started = crate::clock::mono_now();
             peer.refresh();
+            let health = peer.health();
+            assert!(health.store.last_snapshot_observed_at >= Some(refresh_started));
+            assert_eq!(
+                health.observed_at, None,
+                "store reads cannot forge a host tick"
+            );
         }
 
         let after = observer.current_snapshot().unwrap();
@@ -1427,6 +1477,34 @@ mod tests {
             .map(|collection| collection.collection())
             .collect::<std::collections::HashSet<_>>();
         assert_eq!(active, collections.into_iter().collect());
+        let health = peer.health();
+        assert_eq!(health.collections.len(), 4);
+        assert!(
+            health
+                .collections
+                .iter()
+                .all(|entry| entry.local_frontier.is_some())
+        );
+    }
+
+    #[test]
+    fn health_retains_active_collection_without_a_serving_view() {
+        let key = SigningKey::from_bytes(&[93; 32]);
+        let id = EndpointId::from_bytes(&key.verifying_key().to_bytes()).unwrap();
+        let (sender, receiver, _wiring) = host::wire(id);
+        let mut peer = Peer::with_wiring(
+            MemoryRepo::default(),
+            ReconcileQos::default(),
+            sender,
+            receiver,
+        );
+        let missing = CollectionHandle::new([0x53; 32]);
+        peer.activate_collection(missing);
+        let health = peer.health();
+        assert_eq!(health.collections.len(), 1);
+        assert_eq!(health.collections[0].collection, missing);
+        assert_eq!(health.collections[0].local_frontier, None);
+        assert_eq!(health.observed_at, None);
     }
 
     #[tokio::test]
