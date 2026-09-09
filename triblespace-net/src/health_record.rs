@@ -204,18 +204,28 @@ pub fn conditions(
     let expected = publication.resident > 0 && !publication.budget_exhausted;
     // Renewal is paced over hours. Silence while idle is not a failed probe;
     // only a continuous observed failure episode earns a stall warning.
-    let failed = publication
-        .unacknowledged_since
-        .is_some_and(|at| at <= now && now.duration_since(at) > PROGRESS_GRACE);
+    let outstanding = pending > 0 || publication.in_flight > 0;
+    let no_progress_since = publication.unacknowledged_since.or_else(|| {
+        outstanding
+            .then_some(
+                publication
+                    .last_started_at
+                    .max(publication.last_acknowledged_at)
+                    .or(health.started_at),
+            )
+            .flatten()
+    });
+    let failed =
+        no_progress_since.is_some_and(|at| at <= now && now.duration_since(at) > PROGRESS_GRACE);
     conditions.push(Condition {
         component: Component::Dht,
         collection: None,
         peer: None,
         state: if !expected {
             State::Unknown
-        } else if acknowledged && pending == 0 {
+        } else if acknowledged && !outstanding {
             State::Current
-        } else if acknowledged || (pending > 0 && !failed) {
+        } else if acknowledged || (outstanding && !failed) {
             State::Progressing
         } else if failed {
             State::Stalled
@@ -498,6 +508,23 @@ mod tests {
             .unwrap();
         assert_eq!(dht.state, State::Current);
         assert!(!dht.alert);
+    }
+
+    #[test]
+    fn a_publication_that_never_completes_cannot_stay_progressing_forever() {
+        let at = crate::clock::mono_now();
+        let mut health = observed(at);
+        health.publication.resident = 1;
+        health.publication.in_flight = 1;
+        health.publication.last_started_at = Some(at);
+        let now = at + PROGRESS_GRACE + Duration::from_secs(1);
+        let conditions = super::conditions(&health, now);
+        let dht = conditions
+            .iter()
+            .find(|c| c.component == Component::Dht)
+            .unwrap();
+        assert_eq!(dht.state, State::Stalled);
+        assert!(dht.alert);
     }
 
     fn condition(state: State, alert: bool) -> Condition {
