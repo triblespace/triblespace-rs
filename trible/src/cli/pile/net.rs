@@ -8,7 +8,9 @@ use ed25519_dalek::SigningKey;
 use iroh_base::{EndpointAddr, EndpointId};
 use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::collection::CollectionHandle;
+use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::repo::pile::Pile;
+use triblespace_net::health_record::{self, Recorder, REPORT_EVERY, REPORT_VALID_FOR};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
@@ -75,6 +77,16 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
+    /// Show locally recorded swarm health; never performs a network probe.
+    ///
+    /// These are time-bounded observations of known participants, not a claim
+    /// about every possible replica or the availability of every blob.
+    Health {
+        pile: PathBuf,
+        /// Reporting author, not the daemon's transport identity.
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// Repair explicitly named collections with peers.
     Sync {
         pile: PathBuf,
@@ -96,6 +108,11 @@ pub enum Command {
         /// Retries and renewals consume the same budget as first publication.
         #[arg(long, value_name = "ATTEMPTS")]
         provider_publication_budget: Option<u64>,
+        /// Publish local, expiring swarm-health observations signed by this
+        /// existing key. The transport key is not implicitly a reporting author.
+        /// The health collection is not automatically activated for sync.
+        #[arg(long, value_name = "PATH")]
+        health_key: Option<PathBuf>,
         /// Stop after at most N seconds.
         #[arg(long, value_name = "SECS")]
         duration: Option<u64>,
@@ -108,6 +125,7 @@ pub enum Command {
 pub fn run(command: Command) -> Result<()> {
     match command {
         Command::Identity { key } => run_identity(key),
+        Command::Health { pile, key } => run_health(pile, key),
         Command::Sync {
             pile,
             peers,
@@ -115,6 +133,7 @@ pub fn run(command: Command) -> Result<()> {
             collections,
             direction,
             provider_publication_budget,
+            health_key,
             duration,
             quiescent_for,
         } => run_sync(
@@ -126,6 +145,7 @@ pub fn run(command: Command) -> Result<()> {
                 direction: direction.into(),
             },
             provider_publication_budget,
+            health_key,
             duration,
             quiescent_for,
         ),
@@ -151,6 +171,7 @@ fn run_sync(
     collection_values: Vec<String>,
     qos: ReconcileQos,
     provider_publication_budget: Option<u64>,
+    health_key_path: Option<PathBuf>,
     duration: Option<u64>,
     quiescent_for: Option<u64>,
 ) -> Result<()> {
@@ -160,7 +181,40 @@ fn run_sync(
         .iter()
         .map(|value| parse_collection(value))
         .collect::<Result<Vec<_>>>()?;
-    let pile = open_pile(&pile_path)?;
+    let mut pile = open_pile(&pile_path)?;
+    let reporting_key = health_key_path
+        .map(|path| load_existing_key(Some(path), &pile_path))
+        .transpose()?;
+    let mut recorder = Recorder::new(key.verifying_key());
+    let health_collection = if let Some(signer) = reporting_key.as_ref() {
+        let authority = signer.verifying_key();
+        let collection = pile
+            .collection::<triblespace_core::blob::encodings::simplearchive::SimpleArchive>(
+                health_record::COLLECTION_NAME,
+                CollectionPolicy::new(
+                    AdmissionPolicy::direct(authority),
+                    AdmissionPolicy::direct(authority),
+                ),
+            )?;
+        // Publish before endpoint startup: failure to start must not look like
+        // a monitor that was never configured at all.
+        let mut fragment = recorder.record(
+            triblespace_core::clock::epoch_now(),
+            REPORT_VALID_FOR,
+            [health_record::Condition {
+                component: health_record::Component::Host,
+                collection: None,
+                peer: None,
+                state: health_record::State::Unknown,
+                alert: false,
+            }],
+        )?;
+        fragment += health_record::vocabulary();
+        pile.commit(collection, signer, fragment)?;
+        Some(collection)
+    } else {
+        None
+    };
     let mut peer = Peer::new(
         pile,
         key,
@@ -174,6 +228,11 @@ fn run_sync(
 
     eprintln!("node: {}", peer.id());
     eprintln!("active collections: {}", collections.len());
+    if health_collection.is_some() {
+        eprintln!("local swarm health: every 60s; report expires after 180s");
+    } else {
+        eprintln!("local swarm health: not recording (set --health-key)");
+    }
     eprintln!(
         "direction: {}",
         match qos.direction {
@@ -203,6 +262,7 @@ fn run_sync(
     let mut reconciler = triblespace_net::reconcile::Reconciler::new();
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
+    let mut next_health = std::time::Instant::now();
     let mut wants_fulfilled_total = 0_u64;
     let mut wants_pending = 0_usize;
     let mut last_pending_logged = None;
@@ -212,40 +272,173 @@ fn run_sync(
         .build()
         .map_err(|error| anyhow!("reconcile runtime: {error}"))?;
 
-    loop {
-        if duration_limit.is_some_and(|limit| started.elapsed() >= limit) {
-            break;
-        }
-        if quiescent_limit.is_some_and(|limit| {
-            peer.last_event_at().elapsed() >= limit && last_want_progress.elapsed() >= limit
-        }) {
-            break;
+    let result = (|| -> Result<()> {
+        loop {
+            if duration_limit.is_some_and(|limit| started.elapsed() >= limit) {
+                break;
+            }
+            if quiescent_limit.is_some_and(|limit| {
+                peer.last_event_at().elapsed() >= limit && last_want_progress.elapsed() >= limit
+            }) {
+                break;
+            }
+
+            peer.refresh();
+            if let (Some(collection), Some(signer)) = (health_collection, reporting_key.as_ref()) {
+                if std::time::Instant::now() >= next_health {
+                    let health = peer.health();
+                    let fragment = recorder.record(
+                        triblespace_core::clock::epoch_now(),
+                        REPORT_VALID_FOR,
+                        health_record::conditions(&health, triblespace_core::clock::mono_now()),
+                    )?;
+                    peer.store().commit(collection, signer, fragment)?;
+                    next_health = std::time::Instant::now() + REPORT_EVERY;
+                }
+            }
+            if next_reconcile <= std::time::Instant::now() {
+                let stats = runtime.block_on(reconciler.tick(&mut peer));
+                next_reconcile = std::time::Instant::now() + reconcile_every;
+                wants_fulfilled_total += stats.fulfilled as u64;
+                wants_pending = stats.pending;
+                if stats.fulfilled > 0 {
+                    last_want_progress = std::time::Instant::now();
+                }
+                if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {
+                    eprintln!(
+                        "  wants: {} seen, {} fulfilled this pass ({} total), {} pending",
+                        stats.wants, stats.fulfilled, wants_fulfilled_total, stats.pending,
+                    );
+                    last_pending_logged = Some(stats.pending);
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
 
-        peer.refresh();
-        if next_reconcile <= std::time::Instant::now() {
-            let stats = runtime.block_on(reconciler.tick(&mut peer));
-            next_reconcile = std::time::Instant::now() + reconcile_every;
-            wants_fulfilled_total += stats.fulfilled as u64;
-            wants_pending = stats.pending;
-            if stats.fulfilled > 0 {
-                last_want_progress = std::time::Instant::now();
-            }
-            if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {
-                eprintln!(
-                    "  wants: {} seen, {} fulfilled this pass ({} total), {} pending",
-                    stats.wants, stats.fulfilled, wants_fulfilled_total, stats.pending,
-                );
-                last_pending_logged = Some(stats.pending);
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-
-    eprintln!("wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending");
-    peer.into_store()
+        eprintln!(
+            "wants: {wants_fulfilled_total} fulfilled this run; {wants_pending} still pending"
+        );
+        Ok(())
+    })();
+    let close = peer
+        .into_store()
         .close()
-        .map_err(|error| anyhow!("close pile: {error}"))
+        .map_err(|error| anyhow!("close pile: {error}"));
+    result.and(close)
+}
+
+fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
+    use health_record::{attrs, KIND_REPORT};
+    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+    use triblespace_core::blob::encodings::succinctarchive::{
+        OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
+    };
+    use triblespace_core::collection::lww_register::{LwwIndex, LwwRegisterBlob};
+    use triblespace_core::macros::{find, pattern};
+    use triblespace_core::metadata;
+    use triblespace_core::prelude::*;
+
+    let signer = load_existing_key(key_path, &pile_path)?;
+    let authority = signer.verifying_key();
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(authority),
+        AdmissionPolicy::direct(authority),
+    );
+    let mut pile = open_pile(&pile_path)?;
+    let result = (|| -> Result<()> {
+        let source =
+            pile.collection::<SimpleArchive>(health_record::COLLECTION_NAME, policy.clone())?;
+        let facts = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
+        let latest = pile.derive::<LwwRegisterBlob>(
+            source,
+            (attrs::node.id(), metadata::created_at.id()),
+            policy,
+        )?;
+        // Pile is local-only: missing report bytes cannot start acquisition.
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        runtime.block_on(async {
+            drop(pile.maintain(facts).await?);
+            drop(pile.maintain(latest).await?);
+            Ok::<_, anyhow::Error>(())
+        })?;
+        let snapshot = pile.snapshot()?;
+        let facts = snapshot
+            .collection(facts)?
+            .view::<UnionArchive<OrderedUniverse>>()?;
+        let latest = snapshot.collection(latest)?.view::<LwwIndex>()?;
+        let now = snapshot.instant().to_tai_duration().total_nanoseconds();
+        let mut count = 0;
+        for (report, endpoint, created, expires) in find!(
+            (report: Id, endpoint: ed25519_dalek::VerifyingKey,
+             created: (i128, i128), expires: (i128, i128)),
+            and!(
+                pattern!(&facts, [
+                    { ?report @ metadata::tag: &KIND_REPORT, attrs::node: _?node,
+                      metadata::created_at: ?created, metadata::expires_at: ?expires },
+                    { _?node @ attrs::endpoint: ?endpoint },
+                ]),
+                latest.has(report),
+            )
+        ) {
+            count += 1;
+            let age = now.saturating_sub(created.0).max(0) / 1_000_000_000;
+            let expired = now >= expires.0;
+            println!(
+                "node {}: {} (report {age}s ago)",
+                hex::encode(endpoint.as_bytes()),
+                if expired {
+                    "STALE — current health unknown"
+                } else {
+                    "fresh observation"
+                }
+            );
+            if expired {
+                continue;
+            }
+            for (condition, component, state) in find!(
+                (condition: Id, component: Id, state: Id),
+                pattern!(&facts, [
+                    { report @ attrs::condition: ?condition },
+                    { ?condition @ metadata::tag: ?component, attrs::state: ?state },
+                ])
+            ) {
+                let label = match component {
+                    health_record::HOST => "host",
+                    health_record::STORE => "store",
+                    health_record::COLLECTION => "collection",
+                    health_record::DHT => "DHT publication",
+                    _ => continue,
+                };
+                let state = match state {
+                    health_record::CURRENT => "current",
+                    health_record::PROGRESSING => "catching up",
+                    health_record::UNKNOWN => "unknown",
+                    health_record::STALLED => "stalled",
+                    _ => continue,
+                };
+                let collection = find!(c: CollectionHandle, pattern!(&facts, [{ condition @ attrs::collection: ?c }])).next();
+                let remote = find!(key: ed25519_dalek::VerifyingKey, pattern!(&facts, [{ condition @ attrs::peer: ?key }])).next();
+                let collection = collection
+                    .map(|c| format!(" {}", &hex::encode(c.raw)[..12]))
+                    .unwrap_or_default();
+                let remote = remote
+                    .map(|key| format!(" ↔ {}", &hex::encode(key.as_bytes())[..12]))
+                    .unwrap_or_default();
+                println!("  {label}{collection}{remote}: {state}");
+            }
+        }
+        if count == 0 {
+            println!(
+                "Swarm health: not observed. Enable sync --health-key with this reporting key."
+            );
+        }
+        println!(
+            "Scope: recent known-participant record/proof comparisons; no all-swarm or all-blob availability claim."
+        );
+        Ok(())
+    })();
+    let close = pile.close().map_err(anyhow::Error::from);
+    result.and(close)
 }
 
 #[cfg(test)]
@@ -270,6 +463,34 @@ mod tests {
         let raw = [0xAB; 32];
         assert_eq!(parse_collection(&hex::encode(raw)).unwrap().raw, raw);
         assert!(parse_collection("not-a-handle").is_err());
+    }
+
+    #[test]
+    fn health_reporting_requires_an_explicit_author_key() {
+        let handle = hex::encode([0xCD; 32]);
+        let Command::Sync { health_key, .. } =
+            Command::try_parse_from(["net", "sync", "test.pile", "--collection", &handle]).unwrap()
+        else {
+            panic!("sync expected")
+        };
+        assert!(health_key.is_none());
+        let Command::Sync { health_key, .. } = Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--health-key",
+            "observer.key",
+        ])
+        .unwrap() else {
+            panic!("sync expected")
+        };
+        assert_eq!(health_key, Some(PathBuf::from("observer.key")));
+        assert!(matches!(
+            Command::try_parse_from(["net", "health", "test.pile"]).unwrap(),
+            Command::Health { .. }
+        ));
     }
 
     #[test]

@@ -1,0 +1,452 @@
+//! Local, append-only observations of a network host, not another sync protocol.
+//!
+//! A reporter publishes into a deliberately unreplicated collection. A reader
+//! selects the latest report per observer, checks its expiry, then queries the
+//! conditions it names. Thus broken replication cannot hide its own warning.
+//! Reports are observations, not promises about an entire unknown swarm or the
+//! residency of every blob. All IDs below were minted with `trible genid` on
+//! 2026-09-09; attributes use encoding-derived, not literal-pinned identities.
+
+use std::collections::BTreeMap;
+use std::time::Duration;
+
+use ed25519_dalek::VerifyingKey;
+use hifitime::Epoch;
+use triblespace_core::collection::CollectionHandle;
+use triblespace_core::macros::{attributes, entity, id_hex};
+use triblespace_core::metadata;
+use triblespace_core::prelude::*;
+
+pub const COLLECTION_NAME: &str = "swarm-health";
+pub const DEFAULT_SCOPE_ID: Id = id_hex!("CF3A399CA5EB9BAAD5EF283002F5A4D3");
+pub const KIND_REPORT: Id = id_hex!("D470B317FA1790BDB89C3D47921A4EEC");
+pub const KIND_CONDITION: Id = id_hex!("6B8ECE083B6F850837A71FFE3ED155DA");
+pub const KIND_ALERT: Id = id_hex!("50A83054AEDA2C4696137E4B61BC0701");
+pub const KIND_RECOVERED: Id = id_hex!("83A44BA6C6BE2B782521A19418C0C9ED");
+pub const HOST: Id = id_hex!("2F1E16D4B71DA46FB54F6A77E40E7BCA");
+pub const STORE: Id = id_hex!("166B05676A0FE4BC203378C4E71B60EE");
+pub const COLLECTION: Id = id_hex!("2FB954F7D9CC495DF420C9842E042409");
+pub const DHT: Id = id_hex!("5E9E10B93F3D2C8A44AE94269B3E5EB8");
+pub const CURRENT: Id = id_hex!("7550149E20D8658EB657FA51808D6797");
+pub const PROGRESSING: Id = id_hex!("439306D0EA812CC42BA0113545FBBF4B");
+pub const UNKNOWN: Id = id_hex!("1627047B72FDB5B071ABBC51C664909E");
+pub const STALLED: Id = id_hex!("1DE9C9CA3F8A012F4EF2BDBA468BB9A5");
+
+pub mod attrs {
+    use super::*;
+
+    attributes! {
+        /// Observer anchor; its endpoint key is a separate queryable fact.
+        "7021AD1FB8034F9ADB2A817B06B65498" as node: inlineencodings::GenId;
+        "B96FB346494598B4EC8ADAF66DE8BE33" as endpoint: inlineencodings::ED25519PublicKey;
+        /// One reporter process lifetime, not a replicated mutable generation.
+        "54C94AC6FE045AA34AEF42BD522DBFA6" as session: inlineencodings::GenId;
+        "FC4308E9B8914E09E38455F49FA0EA69" as collection: inlineencodings::Handle<blobencodings::SimpleArchive>;
+        "898F9988C3C1628C3289C1D37174FF9B" as peer: inlineencodings::ED25519PublicKey;
+        /// Report -> current condition episode (repeated).
+        "1564F6960F06D906CD895A9D3C8522F4" as condition: inlineencodings::GenId;
+        "FA15D65DEA8480F799AD9210D516DF16" as state: inlineencodings::GenId;
+    }
+}
+
+/// One component of a local observation; no global health bit is inferred.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+pub enum Component {
+    Host,
+    Store,
+    Collection,
+    Dht,
+}
+
+impl Component {
+    pub fn tag(self) -> Id {
+        match self {
+            Self::Host => HOST,
+            Self::Store => STORE,
+            Self::Collection => COLLECTION,
+            Self::Dht => DHT,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum State {
+    Current,
+    Progressing,
+    Unknown,
+    Stalled,
+}
+
+impl State {
+    pub fn tag(self) -> Id {
+        match self {
+            Self::Current => CURRENT,
+            Self::Progressing => PROGRESSING,
+            Self::Unknown => UNKNOWN,
+            Self::Stalled => STALLED,
+        }
+    }
+}
+
+/// One fresh measurement supplied by the network observer, not loaded state.
+#[derive(Clone, Debug)]
+pub struct Condition {
+    pub component: Component,
+    pub collection: Option<CollectionHandle>,
+    pub peer: Option<VerifyingKey>,
+    pub state: State,
+    /// An actionable condition, after any startup/recovery grace period.
+    pub alert: bool,
+}
+
+/// Conservative reporting policy for a continuously running replica. These
+/// durations are observer policy, not part of the collection or wire algebra.
+pub const REPORT_EVERY: Duration = Duration::from_secs(60);
+pub const REPORT_VALID_FOR: Duration = Duration::from_secs(180);
+pub const HOST_MAX_AGE: Duration = Duration::from_secs(30);
+/// Two complete repair deadlines allow a cold/startup repair to finish.
+pub const PROGRESS_GRACE: Duration = Duration::from_secs(600);
+
+/// Interpret bounded runtime evidence, without causing any network work.
+///
+/// Comparisons are per recently observed participant, never an assertion that
+/// every node in a globally enumerable swarm has the same data. A received
+/// delta is not durable progress: only an observed local frontier change can
+/// postpone a stalled-collection warning.
+pub fn conditions(
+    health: &crate::health::HealthSnapshot,
+    now: crate::clock::Mono,
+) -> Vec<Condition> {
+    use crate::health::ComparisonState;
+
+    let within = |at: Option<crate::clock::Mono>, duration| {
+        at.is_some_and(|at| at <= now && now.duration_since(at) <= duration)
+    };
+    let starting = within(health.started_at, PROGRESS_GRACE);
+    let host_fresh = health.is_fresh(now, HOST_MAX_AGE);
+    let mut conditions = vec![Condition {
+        component: Component::Host,
+        collection: None,
+        peer: None,
+        state: if host_fresh {
+            State::Current
+        } else {
+            State::Unknown
+        },
+        alert: !host_fresh && health.started_at.is_some(),
+    }];
+    let store_current = health.store.serving_snapshot
+        && !health.store.pending_flush
+        && within(health.store.last_snapshot_observed_at, HOST_MAX_AGE)
+        && health.store.last_failure_at <= health.store.last_snapshot_observed_at;
+    conditions.push(Condition {
+        component: Component::Store,
+        collection: None,
+        peer: None,
+        state: if store_current {
+            State::Current
+        } else {
+            State::Unknown
+        },
+        alert: !store_current && !starting,
+    });
+
+    for collection in &health.collections {
+        let local_progress = within(collection.last_local_change_at, PROGRESS_GRACE);
+        if collection.peers.is_empty()
+            || health.direction.is_some_and(|direction| !direction.pulls())
+        {
+            conditions.push(Condition {
+                component: Component::Collection,
+                collection: Some(collection.collection),
+                peer: None,
+                state: State::Unknown,
+                alert: !starting && health.direction.is_some_and(|direction| direction.pulls()),
+            });
+        }
+        for peer in &collection.peers {
+            let comparison =
+                health.comparison(collection.collection, peer.peer, now, REPORT_VALID_FOR);
+            let state = match comparison {
+                ComparisonState::Matching => State::Current,
+                ComparisonState::Different if local_progress || starting => State::Progressing,
+                ComparisonState::Different => State::Stalled,
+                ComparisonState::Unknown if local_progress => State::Progressing,
+                ComparisonState::Unknown | ComparisonState::NotApplicable => State::Unknown,
+            };
+            let measured_recently = within(
+                peer.comparison.map(|comparison| comparison.observed_at),
+                PROGRESS_GRACE,
+            );
+            // Unrelated local writes cannot disguise a peer that never answers.
+            let alert = comparison != ComparisonState::NotApplicable
+                && !starting
+                && (state == State::Stalled || !measured_recently);
+            conditions.push(Condition {
+                component: Component::Collection,
+                collection: Some(collection.collection),
+                peer: Some(
+                    VerifyingKey::from_bytes(peer.peer.as_bytes())
+                        .expect("transport peer keys are validated Ed25519 points"),
+                ),
+                state,
+                alert,
+            });
+        }
+    }
+
+    let publication = &health.publication;
+    let acknowledged = within(publication.last_acknowledged_at, PROGRESS_GRACE);
+    let pending =
+        publication.startup_pending + publication.incremental_pending + publication.retry_pending;
+    let expected = publication.resident > 0 && !publication.budget_exhausted;
+    // Renewal is paced over hours. Silence while idle is not a failed probe;
+    // only a continuous observed failure episode earns a stall warning.
+    let failed = publication
+        .unacknowledged_since
+        .is_some_and(|at| at <= now && now.duration_since(at) > PROGRESS_GRACE);
+    conditions.push(Condition {
+        component: Component::Dht,
+        collection: None,
+        peer: None,
+        state: if !expected {
+            State::Unknown
+        } else if acknowledged && pending == 0 {
+            State::Current
+        } else if acknowledged || (pending > 0 && !failed) {
+            State::Progressing
+        } else if failed {
+            State::Stalled
+        } else {
+            State::Unknown
+        },
+        alert: expected && failed,
+    });
+    conditions
+}
+
+type Subject = (Component, Option<[u8; 32]>, Option<[u8; 32]>);
+
+#[derive(Clone)]
+struct Episode {
+    state: State,
+    alert: bool,
+    facts: Fragment,
+}
+
+/// Turns a process's own observations into facts. Only unchanged condition
+/// episodes are retained in memory, so periodic heartbeats do not generate a
+/// new Orient alert each time. Nothing is reconstructed into a shadow catalog.
+pub struct Recorder {
+    node: Fragment,
+    session: Id,
+    episodes: BTreeMap<Subject, Episode>,
+}
+
+impl Recorder {
+    pub fn new(endpoint: VerifyingKey) -> Self {
+        Self {
+            node: entity! { attrs::endpoint: &endpoint },
+            session: genid().forget(),
+            episodes: BTreeMap::new(),
+        }
+    }
+
+    /// Construct one heartbeat and its current conditions. Callers publish
+    /// this whole fragment with their explicit local reporting signer.
+    ///
+    /// The report itself is the stale-report attention event once expires_at
+    /// passes. A fresh report uses its ALERT/RECOVERED condition IDs instead.
+    /// Readers never need to invent an event identity or hash one for lookup.
+    pub fn record(
+        &mut self,
+        at: Epoch,
+        valid_for: Duration,
+        conditions: impl IntoIterator<Item = Condition>,
+    ) -> anyhow::Result<Fragment> {
+        let created = point(at)?;
+        let expires =
+            point(at + hifitime::Duration::from_total_nanoseconds(valid_for.as_nanos() as i128))?;
+        let mut next = BTreeMap::new();
+        for condition in conditions {
+            let subject = (
+                condition.component,
+                condition.collection.map(|handle| handle.raw),
+                condition.peer.map(|key| key.to_bytes()),
+            );
+            let previous = self.episodes.get(&subject);
+            let episode = match previous {
+                Some(previous)
+                    if previous.state == condition.state && previous.alert == condition.alert =>
+                {
+                    previous.clone()
+                }
+                _ => {
+                    // Recovery is evidence of a previously reported failure,
+                    // not an alert on an ordinary healthy startup.
+                    let recovered =
+                        previous.is_some_and(|episode| episode.alert) && !condition.alert;
+                    let tags = [
+                        Some(KIND_CONDITION),
+                        Some(condition.component.tag()),
+                        condition.alert.then_some(KIND_ALERT),
+                        recovered.then_some(KIND_RECOVERED),
+                    ];
+                    Episode {
+                        state: condition.state,
+                        alert: condition.alert,
+                        facts: entity! {
+                            metadata::tag*: tags.into_iter().flatten(),
+                            attrs::node: self.node.clone(),
+                            attrs::session: &self.session,
+                            attrs::collection?: condition.collection,
+                            attrs::peer?: condition.peer,
+                            attrs::state: &condition.state.tag(),
+                            metadata::started_at: created,
+                        },
+                    }
+                }
+            };
+            next.insert(subject, episode);
+        }
+        self.episodes = next;
+        Ok(entity! {
+            metadata::tag: &KIND_REPORT,
+            attrs::node: self.node.clone(),
+            attrs::session: &self.session,
+            metadata::created_at: created,
+            metadata::expires_at: expires,
+            attrs::condition*: self.episodes.values().map(|episode| episode.facts.clone()),
+        })
+    }
+}
+
+fn point(epoch: Epoch) -> anyhow::Result<Inline<inlineencodings::NsTAIInterval>> {
+    (epoch, epoch)
+        .try_to_inline()
+        .map_err(|error| anyhow::anyhow!("encode health observation time: {error:?}"))
+}
+
+/// Queryable names for health tags, published alongside the first report.
+pub fn vocabulary() -> Fragment {
+    let mut facts = Fragment::empty();
+    for (id, name) in [
+        (KIND_REPORT, "swarm health report"),
+        (KIND_CONDITION, "swarm health condition"),
+        (KIND_ALERT, "needs attention"),
+        (KIND_RECOVERED, "recovered"),
+        (HOST, "network event loop"),
+        (STORE, "local serving snapshot"),
+        (COLLECTION, "collection record/proof repair"),
+        (DHT, "DHT provider publication"),
+        (CURRENT, "current"),
+        (PROGRESSING, "catching up"),
+        (UNKNOWN, "unknown"),
+        (STALLED, "stalled"),
+    ] {
+        facts += entity! { ExclusiveId::force_ref(&id) @ metadata::name: name };
+    }
+    facts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use triblespace_core::macros::{find, pattern};
+
+    fn condition(state: State, alert: bool) -> Condition {
+        Condition {
+            component: Component::Host,
+            collection: None,
+            peer: None,
+            state,
+            alert,
+        }
+    }
+
+    fn conditions(facts: &Fragment, tag: Id) -> Vec<Id> {
+        find!(id: Id, pattern!(facts.facts(), [{
+            ?id @ metadata::tag: &KIND_CONDITION, metadata::tag: &tag,
+        }]))
+        .collect()
+    }
+
+    #[test]
+    fn heartbeat_changes_report_but_not_alert_episode() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let first = recorder
+            .record(
+                at,
+                Duration::from_secs(180),
+                [condition(State::Stalled, true)],
+            )
+            .unwrap();
+        let next = recorder
+            .record(
+                at + 60.0,
+                Duration::from_secs(180),
+                [condition(State::Stalled, true)],
+            )
+            .unwrap();
+        assert_ne!(first.root(), next.root());
+        assert_eq!(
+            conditions(&first, KIND_ALERT),
+            conditions(&next, KIND_ALERT)
+        );
+        assert_eq!(conditions(&first, KIND_ALERT).len(), 1);
+    }
+
+    #[test]
+    fn recovery_is_once_per_episode_and_restart_is_not_recovery() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let initial = recorder
+            .record(
+                at,
+                Duration::from_secs(180),
+                [condition(State::Current, false)],
+            )
+            .unwrap();
+        assert!(conditions(&initial, KIND_RECOVERED).is_empty());
+        recorder
+            .record(
+                at + 1.0,
+                Duration::from_secs(180),
+                [condition(State::Stalled, true)],
+            )
+            .unwrap();
+        let recovery = recorder
+            .record(
+                at + 2.0,
+                Duration::from_secs(180),
+                [condition(State::Current, false)],
+            )
+            .unwrap();
+        let heartbeat = recorder
+            .record(
+                at + 3.0,
+                Duration::from_secs(180),
+                [condition(State::Current, false)],
+            )
+            .unwrap();
+        assert_eq!(conditions(&recovery, KIND_RECOVERED).len(), 1);
+        assert_eq!(
+            conditions(&recovery, KIND_RECOVERED),
+            conditions(&heartbeat, KIND_RECOVERED)
+        );
+        let failure = recorder
+            .record(
+                at + 4.0,
+                Duration::from_secs(180),
+                [condition(State::Stalled, true)],
+            )
+            .unwrap();
+        assert_ne!(
+            conditions(&failure, KIND_ALERT),
+            conditions(&recovery, KIND_RECOVERED)
+        );
+    }
+}
