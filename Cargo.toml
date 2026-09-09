@@ -133,6 +133,7 @@ unexpected_cfgs = { level = "warn", check-cfg = ['cfg(nightly)', 'cfg(kani)'] }
 # immutable external-buffer registration so mmap-backed storage can be exposed
 # to Metal without an upload when a caller has a suitable layout and lifetime.
 [patch.crates-io]
+netwatch = { git = "https://github.com/erlkonig-ai/net-tools.git", rev = "10ab7b328809103be74f6ca24258249715fae52b" }
 cubecl-runtime = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 cubecl-wgpu = { git = "https://github.com/erlkonig-ai/cubecl.git", rev = "75635270eed8cfacd1cd0f171f2f6b45a5e65b9c" }
 
