@@ -14,14 +14,19 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 ### Added
 
 - Add local `pile net health` and opt-in `pile net sync --health-key` reporting
-  into an expiring private collection. Distinguish missing, stale, and future
-  reports from fresh observations without initiating any network probe.
+  as timestamped facts in a private collection. Distinguish missing, stale,
+  and future reports from fresh observations without initiating any network
+  probe.
 
 - Add explicit `pile net sync --collection HANDLE` activation for
   collection-scoped repair. Repeat `--collection` to activate more than one
   exact descriptor.
 
 ### Changed
+
+- Let health readers select `--max-age SECONDS` (default 180, or
+  `TRIBLESPACE_HEALTH_MAX_AGE_SECS`). Reports carry only `created_at`;
+  legacy producer expiry annotations do not affect freshness.
 
 - Name the new `LATEST_STATES_MAPPING_V1` algorithm in collection inspection,
   replacing the retired unshipped observed-only mapping name.

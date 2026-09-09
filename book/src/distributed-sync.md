@@ -565,10 +565,16 @@ The long-running CLI can publish these observations as native facts using
 `pile net sync --health-key <existing-author-key>`. The private `swarm-health`
 collection is deliberately not activated for replication, so a broken network
 cannot prevent the local reader from seeing its own warning. A new report is
-published every minute and expires after three. Conditions use stable episode
-identities until their state changes; a reader can acknowledge an alert once
-without acknowledging each heartbeat. Report expiry itself supplies a new
-attention event even when the daemon stops appending entirely.
+published every minute with `created_at` only: freshness is reader policy, not
+a producer-asserted lifetime. `pile net health --max-age <SECONDS>` accepts a
+maximum sample age (default 180 seconds, also configurable through
+`TRIBLESPACE_HEALTH_MAX_AGE_SECS`). Readers use the creation interval's upper
+bound plus that duration and ignore any legacy `expires_at` annotations;
+future-created reports remain unknown, and zero accepts no arrived sample as
+fresh. Conditions use stable episode identities until their state changes; a
+reader can acknowledge an alert once without acknowledging each heartbeat.
+When the reader's age limit is reached, the report itself supplies an attention
+event even when the daemon stops appending entirely.
 
 These reports distinguish unknown, progressing, matching, and stalled work,
 with a ten-minute repair/publication grace period. A stale host loop is detected

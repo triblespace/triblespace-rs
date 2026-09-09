@@ -9,9 +9,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Expose bounded local swarm-health observations from existing collection
   repair, serving-snapshot, event-loop, and DHT-publication work. Opt-in
-  `trible pile net sync --health-key` publishes expiring private native facts;
+  `trible pile net sync --health-key` publishes timestamped private native facts;
   `pile net health` reads them locally. Stable alert/recovery episodes avoid
   heartbeat spam; no new wire protocol, eager blob probe, or global health claim.
+
+- Make swarm-health sample age a reader policy: reports carry `created_at`
+  without producer expiry. `pile net health --max-age SECONDS` and
+  `TRIBLESPACE_HEALTH_MAX_AGE_SECS` select the maximum age (default 180 seconds),
+  ignoring legacy expiry annotations while keeping future reports unknown.
 
 - Constrain the netwatch dependency to the tested patched version so a newer
   registry candidate cannot silently bypass the root's multi-sender wakeup fix.

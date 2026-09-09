@@ -1,8 +1,9 @@
 //! Local, append-only observations of a network host, not another sync protocol.
 //!
 //! A reporter publishes into a deliberately unreplicated collection. A reader
-//! selects the latest report per observer, checks its expiry, then queries the
-//! conditions it names. Thus broken replication cannot hide its own warning.
+//! selects the latest report per observer, applies its own maximum sample age,
+//! then queries the conditions it names. Thus broken replication cannot hide
+//! its own warning.
 //! Reports are observations, not promises about an entire unknown swarm or the
 //! residency of every blob. All IDs below were minted with `trible genid` on
 //! 2026-09-09; attributes use encoding-derived, not literal-pinned identities.
@@ -102,7 +103,8 @@ pub struct Condition {
 /// Conservative reporting policy for a continuously running replica. These
 /// durations are observer policy, not part of the collection or wire algebra.
 pub const REPORT_EVERY: Duration = Duration::from_secs(60);
-pub const REPORT_VALID_FOR: Duration = Duration::from_secs(180);
+/// Default reader/comparison policy, not a lifetime asserted by the reporter.
+pub const DEFAULT_MAX_AGE: Duration = Duration::from_secs(180);
 pub const HOST_MAX_AGE: Duration = Duration::from_secs(30);
 /// Two complete repair deadlines allow a cold/startup repair to finish.
 pub const PROGRESS_GRACE: Duration = Duration::from_secs(600);
@@ -169,7 +171,7 @@ pub fn conditions(
             let remote_progress = within(peer.last_remote_change_at, PROGRESS_GRACE);
             let peer_starting = within(peer.first_started_at, PROGRESS_GRACE);
             let comparison =
-                health.comparison(collection.collection, peer.peer, now, REPORT_VALID_FOR);
+                health.comparison(collection.collection, peer.peer, now, DEFAULT_MAX_AGE);
             let state = match comparison {
                 ComparisonState::Matching => State::Current,
                 ComparisonState::Different if remote_progress || peer_starting => {
@@ -269,18 +271,16 @@ impl Recorder {
     /// Construct one heartbeat and its current conditions. Callers publish
     /// this whole fragment with their explicit local reporting signer.
     ///
-    /// The report itself is the stale-report attention event once expires_at
-    /// passes. A fresh report uses its ALERT/RECOVERED condition IDs instead.
+    /// The report records only its creation time. Readers decide when its age
+    /// makes it a stale-report attention event; producer expiry annotations do
+    /// not control that policy. A fresh report uses its ALERT/RECOVERED IDs.
     /// Readers never need to invent an event identity or hash one for lookup.
     pub fn record(
         &mut self,
         at: Epoch,
-        valid_for: Duration,
         conditions: impl IntoIterator<Item = Condition>,
     ) -> anyhow::Result<Fragment> {
         let created = point(at)?;
-        let expires =
-            point(at + hifitime::Duration::from_total_nanoseconds(valid_for.as_nanos() as i128))?;
         let mut next = BTreeMap::new();
         for condition in conditions {
             let subject = (
@@ -334,7 +334,6 @@ impl Recorder {
             attrs::node*: self.node.clone(),
             attrs::session: &self.session,
             metadata::created_at: created,
-            metadata::expires_at: expires,
             attrs::condition*: current,
         })
     }
@@ -558,23 +557,54 @@ mod tests {
     }
 
     #[test]
+    fn healthy_heartbeats_only_record_creation_time_and_remain_quiet() {
+        let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
+        let mut recorder = Recorder::new(endpoint);
+        let at = Epoch::from_unix_seconds(1_700_000_000.0);
+        let first = recorder
+            .record(at, [condition(State::Current, false)])
+            .unwrap();
+        let next = recorder
+            .record(at + 60.0, [condition(State::Current, false)])
+            .unwrap();
+        assert_ne!(first.root(), next.root());
+        assert_eq!(
+            conditions(&first, KIND_CONDITION),
+            conditions(&next, KIND_CONDITION)
+        );
+        assert_eq!(conditions(&first, KIND_CONDITION).len(), 1);
+        for (facts, created) in [(&first, at), (&next, at + 60.0)] {
+            let report = facts.root().expect("one report root");
+            let created = created.to_tai_duration().total_nanoseconds();
+            assert_eq!(
+                find!(at: (i128, i128), pattern!(facts.facts(), [{
+                    report @ metadata::created_at: ?at,
+                }]))
+                .collect::<Vec<_>>(),
+                vec![(created, created)]
+            );
+            assert!(
+                find!(expiry: (i128, i128), pattern!(facts.facts(), [{
+                    report @ metadata::expires_at: ?expiry,
+                }]))
+                .next()
+                .is_none()
+            );
+            assert!(conditions(facts, KIND_ALERT).is_empty());
+            assert!(conditions(facts, KIND_RECOVERED).is_empty());
+        }
+    }
+
+    #[test]
     fn heartbeat_changes_report_but_not_alert_episode() {
         let endpoint = ed25519_dalek::SigningKey::from_bytes(&[4; 32]).verifying_key();
         let mut recorder = Recorder::new(endpoint);
         let at = Epoch::from_unix_seconds(1_700_000_000.0);
         let first = recorder
-            .record(
-                at,
-                Duration::from_secs(180),
-                [condition(State::Stalled, true)],
-            )
+            .record(at, [condition(State::Stalled, true)])
             .unwrap();
         let next = recorder
-            .record(
-                at + 60.0,
-                Duration::from_secs(180),
-                [condition(State::Stalled, true)],
-            )
+            .record(at + 60.0, [condition(State::Stalled, true)])
             .unwrap();
         assert_ne!(first.root(), next.root());
         assert_eq!(
@@ -590,33 +620,17 @@ mod tests {
         let mut recorder = Recorder::new(endpoint);
         let at = Epoch::from_unix_seconds(1_700_000_000.0);
         let initial = recorder
-            .record(
-                at,
-                Duration::from_secs(180),
-                [condition(State::Current, false)],
-            )
+            .record(at, [condition(State::Current, false)])
             .unwrap();
         assert!(conditions(&initial, KIND_RECOVERED).is_empty());
         recorder
-            .record(
-                at + 1.0,
-                Duration::from_secs(180),
-                [condition(State::Stalled, true)],
-            )
+            .record(at + 1.0, [condition(State::Stalled, true)])
             .unwrap();
         let recovery = recorder
-            .record(
-                at + 2.0,
-                Duration::from_secs(180),
-                [condition(State::Current, false)],
-            )
+            .record(at + 2.0, [condition(State::Current, false)])
             .unwrap();
         let heartbeat = recorder
-            .record(
-                at + 3.0,
-                Duration::from_secs(180),
-                [condition(State::Current, false)],
-            )
+            .record(at + 3.0, [condition(State::Current, false)])
             .unwrap();
         assert_eq!(conditions(&recovery, KIND_RECOVERED).len(), 1);
         assert_eq!(
@@ -624,22 +638,14 @@ mod tests {
             conditions(&heartbeat, KIND_RECOVERED)
         );
         let failure = recorder
-            .record(
-                at + 4.0,
-                Duration::from_secs(180),
-                [condition(State::Stalled, true)],
-            )
+            .record(at + 4.0, [condition(State::Stalled, true)])
             .unwrap();
         assert_ne!(
             conditions(&failure, KIND_ALERT),
             conditions(&recovery, KIND_RECOVERED)
         );
         let unknown = recorder
-            .record(
-                at + 5.0,
-                Duration::from_secs(180),
-                [condition(State::Unknown, false)],
-            )
+            .record(at + 5.0, [condition(State::Unknown, false)])
             .unwrap();
         assert!(conditions(&unknown, KIND_RECOVERED).is_empty());
     }

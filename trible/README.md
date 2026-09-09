@@ -143,9 +143,12 @@ self-contained proof lands inertly and can authorize a later retry; it never
 changes admission for the immutable current session or creates blob WANTs.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
-- `pile net health <PILE> [--key REPORTING_KEY]` — read local expiring health
-  observations without network probes. Add `--health-key REPORTING_KEY` to
-  `pile net sync` to publish them once a minute, with three-minute validity.
+- `pile net health <PILE> [--key REPORTING_KEY] [--max-age SECONDS]` — read local
+  timestamped health observations without network probes. The reader accepts
+  a maximum age of 180 seconds by default; set `--max-age` or
+  `TRIBLESPACE_HEALTH_MAX_AGE_SECS` to change it. Future reports stay unknown,
+  and any producer expiry annotations are ignored. Add
+  `--health-key REPORTING_KEY` to `pile net sync` to publish once a minute.
   This is an existing durable reporting-author key, independent of the
   transport key. The private `swarm-health` collection is not activated for
   replication automatically. Reports distinguish a live host, serving

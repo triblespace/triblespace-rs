@@ -10,7 +10,7 @@ use iroh_tickets::endpoint::EndpointTicket;
 use triblespace_core::collection::CollectionHandle;
 use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, CollectionStoreExt};
 use triblespace_core::repo::pile::Pile;
-use triblespace_net::health_record::{self, Recorder, REPORT_EVERY, REPORT_VALID_FOR};
+use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
@@ -86,6 +86,14 @@ pub enum Command {
         /// Reporting author, not the daemon's transport identity.
         #[arg(long)]
         key: Option<PathBuf>,
+        /// Maximum report age accepted by this reader; producer expiry is ignored.
+        #[arg(
+            long,
+            value_name = "SECONDS",
+            env = "TRIBLESPACE_HEALTH_MAX_AGE_SECS",
+            default_value_t = DEFAULT_MAX_AGE.as_secs()
+        )]
+        max_age: u64,
     },
     /// Repair explicitly named collections with peers.
     Sync {
@@ -108,7 +116,7 @@ pub enum Command {
         /// Retries and renewals consume the same budget as first publication.
         #[arg(long, value_name = "ATTEMPTS")]
         provider_publication_budget: Option<u64>,
-        /// Publish local, expiring swarm-health observations signed by this
+        /// Publish local, timestamped swarm-health observations signed by this
         /// existing key. The transport key is not implicitly a reporting author.
         /// The health collection is not automatically activated for sync.
         #[arg(long, value_name = "PATH")]
@@ -125,7 +133,7 @@ pub enum Command {
 pub fn run(command: Command) -> Result<()> {
     match command {
         Command::Identity { key } => run_identity(key),
-        Command::Health { pile, key } => run_health(pile, key),
+        Command::Health { pile, key, max_age } => run_health(pile, key, max_age),
         Command::Sync {
             pile,
             peers,
@@ -199,7 +207,6 @@ fn run_sync(
         // a monitor that was never configured at all.
         let mut fragment = recorder.record(
             triblespace_core::clock::epoch_now(),
-            REPORT_VALID_FOR,
             [health_record::Condition {
                 component: health_record::Component::Host,
                 collection: None,
@@ -228,7 +235,7 @@ fn run_sync(
     eprintln!("node: {}", peer.id());
     eprintln!("active collections: {}", collections.len());
     if health_collection.is_some() {
-        eprintln!("local swarm health: every 60s; report expires after 180s");
+        eprintln!("local swarm health: every 60s; freshness is reader policy");
     } else {
         eprintln!("local swarm health: not recording (set --health-key)");
     }
@@ -288,7 +295,6 @@ fn run_sync(
                     let health = peer.health();
                     let fragment = recorder.record(
                         triblespace_core::clock::epoch_now(),
-                        REPORT_VALID_FOR,
                         health_record::conditions(&health, triblespace_core::clock::mono_now()),
                     )?;
                     peer.store().commit(collection, signer, fragment)?;
@@ -326,7 +332,7 @@ fn run_sync(
     result.and(close)
 }
 
-fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
+fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>, max_age: u64) -> Result<()> {
     use health_record::{attrs, KIND_REPORT};
     use triblespace_core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
@@ -365,22 +371,25 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
         let latest = snapshot.collection(latest)?.view::<LwwIndex>()?;
         let now = snapshot.instant().to_tai_duration().total_nanoseconds();
         let mut count = 0;
-        for (report, node, session, endpoint, created, expires) in find!(
+        for (report, node, session, endpoint, created) in find!(
             (report: Id, node: Id, session: Id, endpoint: ed25519_dalek::VerifyingKey,
-             created: (i128, i128), expires: (i128, i128)),
+             created: (i128, i128)),
             and!(
                 pattern!(&facts, [
                     { ?report @ metadata::tag: &KIND_REPORT, attrs::node: ?node,
                       attrs::session: ?session,
-                      metadata::created_at: ?created, metadata::expires_at: ?expires },
+                      metadata::created_at: ?created },
                     { ?node @ attrs::endpoint: ?endpoint },
                 ]),
                 latest.has(report),
             )
         ) {
             count += 1;
-            let age = now.saturating_sub(created.0).max(0) / 1_000_000_000;
-            let fresh = created.1 <= now && now < expires.0 && created.1 < expires.0;
+            let age = now.saturating_sub(created.1).max(0) / 1_000_000_000;
+            let stale_at = created
+                .1
+                .saturating_add(i128::from(max_age) * 1_000_000_000);
+            let fresh = created.1 <= now && now < stale_at;
             println!(
                 "node {}: {} (report {age}s ago)",
                 hex::encode(endpoint.as_bytes()),
@@ -493,6 +502,25 @@ mod tests {
             Command::try_parse_from(["net", "health", "test.pile"]).unwrap(),
             Command::Health { .. }
         ));
+    }
+
+    #[test]
+    fn health_max_age_accepts_nonnegative_seconds_only() {
+        for seconds in ["0", "60", "180", "18446744073709551615"] {
+            let Command::Health { max_age, .. } =
+                Command::try_parse_from(["net", "health", "test.pile", "--max-age", seconds])
+                    .unwrap()
+            else {
+                panic!("health expected")
+            };
+            assert_eq!(max_age, seconds.parse::<u64>().unwrap());
+        }
+        for invalid in ["-1", "1.5", "forever", "18446744073709551616"] {
+            assert!(
+                Command::try_parse_from(["net", "health", "test.pile", "--max-age", invalid])
+                    .is_err()
+            );
+        }
     }
 
     #[test]
