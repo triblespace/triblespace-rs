@@ -551,6 +551,34 @@ repair says *what changed in a collection*, while KDF(H) discovery plus mutual
 bearer proof retrieves only the immutable bytes the local lattice resolver
 decides to use.
 
+## Observing replica health
+
+`Peer::health()` and `NetSender::health()` expose a bounded immutable sample of
+work the host already performs. Sampling does not run a probe or advance the
+host's observation clock. Each repair comparison retains the local and remote
+record/authorization frontiers pinned when its authenticated manifest arrived.
+A comparison stops implying convergence when that sample is stale, the local
+frontier has changed, or the serving snapshot has been withdrawn. Receiving
+records is progress evidence, not proof they have already become admitted.
+
+The long-running CLI can publish these observations as native facts using
+`pile net sync --health-key <existing-author-key>`. The private `swarm-health`
+collection is deliberately not activated for replication, so a broken network
+cannot prevent the local reader from seeing its own warning. A new report is
+published every minute and expires after three. Conditions use stable episode
+identities until their state changes; a reader can acknowledge an alert once
+without acknowledging each heartbeat. Report expiry itself supplies a new
+attention event even when the daemon stops appending entirely.
+
+These reports distinguish unknown, progressing, matching, and stalled work,
+with a ten-minute repair/publication grace period. A stale host loop is detected
+separately from a fresh reporter. An idle DHT awaiting its ordinary eight-hour
+renewal is not a failed availability probe. Publication acknowledgement says
+only that a provider advertisement was accepted, not that a remote blob fetch
+works. Neither the observed participant set nor a pairwise matching frontier
+proves whole-swarm convergence. `pile net health` reads the local observations;
+Orient can consume the same maintained facts and presentation ledger.
+
 ## Directory representation experiment
 
 The live receiver-local `ProviderDirectory` uses four BTree indexes: membership

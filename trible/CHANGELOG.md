@@ -13,6 +13,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 
 ### Added
 
+- Add local `pile net health` and opt-in `pile net sync --health-key` reporting
+  into an expiring private collection. Distinguish missing, stale, and future
+  reports from fresh observations without initiating any network probe.
+
 - Add explicit `pile net sync --collection HANDLE` activation for
   collection-scoped repair. Repeat `--collection` to activate more than one
   exact descriptor.

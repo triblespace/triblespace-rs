@@ -111,8 +111,8 @@ pub const PROGRESS_GRACE: Duration = Duration::from_secs(600);
 ///
 /// Comparisons are per recently observed participant, never an assertion that
 /// every node in a globally enumerable swarm has the same data. A received
-/// delta is not durable progress: only an observed local frontier change can
-/// postpone a stalled-collection warning.
+/// delta is not a durability receipt. Repeated identical replies and unrelated
+/// local writes cannot postpone a stalled-peer warning.
 pub fn conditions(
     health: &crate::health::HealthSnapshot,
     now: crate::clock::Mono,
@@ -152,7 +152,6 @@ pub fn conditions(
     });
 
     for collection in &health.collections {
-        let local_progress = within(collection.last_local_change_at, PROGRESS_GRACE);
         if collection.peers.is_empty()
             || health.direction.is_some_and(|direction| !direction.pulls())
         {
@@ -165,13 +164,16 @@ pub fn conditions(
             });
         }
         for peer in &collection.peers {
+            let remote_progress = within(peer.last_remote_change_at, PROGRESS_GRACE);
+            let peer_starting = within(peer.first_started_at, PROGRESS_GRACE);
             let comparison =
                 health.comparison(collection.collection, peer.peer, now, REPORT_VALID_FOR);
             let state = match comparison {
                 ComparisonState::Matching => State::Current,
-                ComparisonState::Different if local_progress || starting => State::Progressing,
+                ComparisonState::Different if remote_progress || peer_starting => {
+                    State::Progressing
+                }
                 ComparisonState::Different => State::Stalled,
-                ComparisonState::Unknown if local_progress => State::Progressing,
                 ComparisonState::Unknown | ComparisonState::NotApplicable => State::Unknown,
             };
             let measured_recently = within(
@@ -180,13 +182,13 @@ pub fn conditions(
             );
             // Unrelated local writes cannot disguise a peer that never answers.
             let alert = comparison != ComparisonState::NotApplicable
-                && !starting
+                && !peer_starting
                 && (state == State::Stalled || !measured_recently);
             conditions.push(Condition {
                 component: Component::Collection,
                 collection: Some(collection.collection),
                 peer: Some(
-                    VerifyingKey::from_bytes(peer.peer.as_bytes())
+                    VerifyingKey::from_bytes(&peer.peer)
                         .expect("transport peer keys are validated Ed25519 points"),
                 ),
                 state,
@@ -246,7 +248,7 @@ pub struct Recorder {
 impl Recorder {
     pub fn new(endpoint: VerifyingKey) -> Self {
         Self {
-            node: entity! { attrs::endpoint: &endpoint },
+            node: entity! { attrs::endpoint: endpoint },
             session: genid().forget(),
             episodes: BTreeMap::new(),
         }
@@ -284,8 +286,9 @@ impl Recorder {
                 _ => {
                     // Recovery is evidence of a previously reported failure,
                     // not an alert on an ordinary healthy startup.
-                    let recovered =
-                        previous.is_some_and(|episode| episode.alert) && !condition.alert;
+                    let recovered = previous.is_some_and(|episode| episode.alert)
+                        && !condition.alert
+                        && condition.state == State::Current;
                     let tags = [
                         Some(KIND_CONDITION),
                         Some(condition.component.tag()),
@@ -297,7 +300,7 @@ impl Recorder {
                         alert: condition.alert,
                         facts: entity! {
                             metadata::tag*: tags.into_iter().flatten(),
-                            attrs::node: self.node.clone(),
+                            attrs::node*: self.node.clone(),
                             attrs::session: &self.session,
                             attrs::collection?: condition.collection,
                             attrs::peer?: condition.peer,
@@ -310,13 +313,17 @@ impl Recorder {
             next.insert(subject, episode);
         }
         self.episodes = next;
+        let mut current = Fragment::empty();
+        for episode in self.episodes.values() {
+            current += episode.facts.clone();
+        }
         Ok(entity! {
             metadata::tag: &KIND_REPORT,
-            attrs::node: self.node.clone(),
+            attrs::node*: self.node.clone(),
             attrs::session: &self.session,
             metadata::created_at: created,
             metadata::expires_at: expires,
-            attrs::condition*: self.episodes.values().map(|episode| episode.facts.clone()),
+            attrs::condition*: current,
         })
     }
 }
@@ -353,6 +360,145 @@ pub fn vocabulary() -> Fragment {
 mod tests {
     use super::*;
     use triblespace_core::macros::{find, pattern};
+
+    fn observed(at: crate::clock::Mono) -> crate::health::HealthSnapshot {
+        crate::health::HealthSnapshot {
+            node: iroh_base::SecretKey::from_bytes(&[5; 32]).public().into(),
+            direction: Some(crate::inventory::ReconcileDirection::Bidirectional),
+            started_at: Some(at),
+            observed_at: Some(at),
+            store: crate::health::StoreHealth {
+                last_snapshot_observed_at: Some(at),
+                serving_snapshot: true,
+                ..Default::default()
+            },
+            collections: Vec::new(),
+            publication: crate::health::PublicationHealth::default(),
+        }
+    }
+
+    #[test]
+    fn fresh_reporting_cannot_disguise_an_unpolled_host() {
+        let at = crate::clock::mono_now();
+        let health = observed(at);
+        let conditions = super::conditions(&health, at + Duration::from_secs(31));
+        let host = conditions
+            .iter()
+            .find(|c| c.component == Component::Host)
+            .unwrap();
+        assert_eq!(host.state, State::Unknown);
+        assert!(host.alert);
+    }
+
+    #[test]
+    fn fresh_local_writes_and_identical_remote_replies_cannot_hide_a_stalled_pair() {
+        use crate::health::{CollectionHealth, Health, RepairComparison, RepairFrontier};
+        use crate::patch_repair::PatchSummary;
+
+        let at = crate::clock::mono_now();
+        let now = at + PROGRESS_GRACE + Duration::from_secs(1);
+        let mut sample = observed(at);
+        sample.observed_at = Some(now);
+        sample.store.last_snapshot_observed_at = Some(now);
+        let collection = Inline::new([3; 32]);
+        let remote_key = ed25519_dalek::SigningKey::from_bytes(&[7; 32])
+            .verifying_key()
+            .to_bytes();
+        let frontier = |byte, count| RepairFrontier {
+            wake_root: [byte; 32],
+            records: PatchSummary::new(Some([byte; 32]), count).unwrap(),
+            authorization_evidence: PatchSummary::new(None, 0).unwrap(),
+        };
+        let local = frontier(5, 10);
+        sample.collections.push(CollectionHealth {
+            collection,
+            local_frontier: Some(local),
+            last_local_change_at: Some(now),
+            peers: Vec::new(),
+        });
+        let health = Health::new(sample.node);
+        health.update(|value| *value = sample);
+        health.with_peer(collection, remote_key, |peer| {
+            peer.started(at);
+            peer.compared(
+                RepairComparison {
+                    observed_at: at,
+                    local: frontier(4, 9),
+                    remote: frontier(6, 1),
+                    records_received: 0,
+                    proofs_received: 0,
+                    more: false,
+                },
+                at,
+            );
+            peer.compared(
+                RepairComparison {
+                    observed_at: now,
+                    local,
+                    ..peer.comparison.unwrap()
+                },
+                now,
+            );
+        });
+        let conditions = super::conditions(&health.snapshot(), now);
+        let pair = conditions
+            .iter()
+            .find(|c| c.component == Component::Collection)
+            .unwrap();
+        assert_eq!(pair.state, State::Stalled);
+        assert!(pair.alert);
+    }
+
+    #[test]
+    fn idle_dht_renewal_is_unknown_not_a_failed_probe() {
+        let at = crate::clock::mono_now();
+        let now = at + Duration::from_secs(3600);
+        let mut health = observed(at);
+        health.observed_at = Some(now);
+        health.store.last_snapshot_observed_at = Some(now);
+        health.publication.resident = 1;
+        health.publication.last_acknowledged_at = Some(at);
+        health.publication.renewal_remaining = 1;
+        let conditions = super::conditions(&health, now);
+        let dht = conditions
+            .iter()
+            .find(|c| c.component == Component::Dht)
+            .unwrap();
+        assert_eq!(dht.state, State::Unknown);
+        assert!(!dht.alert);
+    }
+
+    #[test]
+    fn continuous_publication_failure_expires_its_grace_then_ack_recovers() {
+        let at = crate::clock::mono_now();
+        let mut health = observed(at);
+        health.publication.resident = 1;
+        health.publication.retry_pending = 1;
+        health.publication.unacknowledged_since = Some(at);
+        let soon = super::conditions(&health, at + Duration::from_secs(10));
+        assert!(
+            !soon
+                .iter()
+                .find(|c| c.component == Component::Dht)
+                .unwrap()
+                .alert
+        );
+        let now = at + PROGRESS_GRACE + Duration::from_secs(1);
+        let late = super::conditions(&health, now);
+        let dht = late.iter().find(|c| c.component == Component::Dht).unwrap();
+        assert_eq!(dht.state, State::Stalled);
+        assert!(dht.alert);
+        health.publication.last_acknowledged_at = Some(now);
+        health.publication.unacknowledged_since = None;
+        health.publication.retry_pending = 0;
+        let recovered = super::conditions(&health, now);
+        let dht = recovered
+            .iter()
+            .find(|c| c.component == Component::Dht)
+            .unwrap();
+        assert_eq!(dht.state, State::Current);
+        assert!(!dht.alert);
+    }
 
     fn condition(state: State, alert: bool) -> Condition {
         Condition {
@@ -448,5 +594,13 @@ mod tests {
             conditions(&failure, KIND_ALERT),
             conditions(&recovery, KIND_RECOVERED)
         );
+        let unknown = recorder
+            .record(
+                at + 5.0,
+                Duration::from_secs(180),
+                [condition(State::Unknown, false)],
+            )
+            .unwrap();
+        assert!(conditions(&unknown, KIND_RECOVERED).is_empty());
     }
 }

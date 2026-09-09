@@ -188,14 +188,13 @@ fn run_sync(
     let mut recorder = Recorder::new(key.verifying_key());
     let health_collection = if let Some(signer) = reporting_key.as_ref() {
         let authority = signer.verifying_key();
-        let collection = pile
-            .collection::<triblespace_core::blob::encodings::simplearchive::SimpleArchive>(
-                health_record::COLLECTION_NAME,
-                CollectionPolicy::new(
-                    AdmissionPolicy::direct(authority),
-                    AdmissionPolicy::direct(authority),
-                ),
-            )?;
+        let collection = pile.collection(
+            health_record::COLLECTION_NAME,
+            CollectionPolicy::new(
+                AdmissionPolicy::direct(authority),
+                AdmissionPolicy::direct(authority),
+            ),
+        )?;
         // Publish before endpoint startup: failure to start must not look like
         // a monitor that was never configured at all.
         let mut fragment = recorder.record(
@@ -329,7 +328,6 @@ fn run_sync(
 
 fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
     use health_record::{attrs, KIND_REPORT};
-    use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
     use triblespace_core::blob::encodings::succinctarchive::{
         OrderedUniverse, SuccinctArchiveBlob, UnionArchive,
     };
@@ -346,8 +344,7 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
     );
     let mut pile = open_pile(&pile_path)?;
     let result = (|| -> Result<()> {
-        let source =
-            pile.collection::<SimpleArchive>(health_record::COLLECTION_NAME, policy.clone())?;
+        let source = pile.collection(health_record::COLLECTION_NAME, policy.clone())?;
         let facts = pile.derive::<SuccinctArchiveBlob>(source, (), policy.clone())?;
         let latest = pile.derive::<LwwRegisterBlob>(
             source,
@@ -368,38 +365,43 @@ fn run_health(pile_path: PathBuf, key_path: Option<PathBuf>) -> Result<()> {
         let latest = snapshot.collection(latest)?.view::<LwwIndex>()?;
         let now = snapshot.instant().to_tai_duration().total_nanoseconds();
         let mut count = 0;
-        for (report, endpoint, created, expires) in find!(
-            (report: Id, endpoint: ed25519_dalek::VerifyingKey,
+        for (report, node, session, endpoint, created, expires) in find!(
+            (report: Id, node: Id, session: Id, endpoint: ed25519_dalek::VerifyingKey,
              created: (i128, i128), expires: (i128, i128)),
             and!(
                 pattern!(&facts, [
-                    { ?report @ metadata::tag: &KIND_REPORT, attrs::node: _?node,
+                    { ?report @ metadata::tag: &KIND_REPORT, attrs::node: ?node,
+                      attrs::session: ?session,
                       metadata::created_at: ?created, metadata::expires_at: ?expires },
-                    { _?node @ attrs::endpoint: ?endpoint },
+                    { ?node @ attrs::endpoint: ?endpoint },
                 ]),
                 latest.has(report),
             )
         ) {
             count += 1;
             let age = now.saturating_sub(created.0).max(0) / 1_000_000_000;
-            let expired = now >= expires.0;
+            let fresh = created.1 <= now && now < expires.0 && created.1 < expires.0;
             println!(
                 "node {}: {} (report {age}s ago)",
                 hex::encode(endpoint.as_bytes()),
-                if expired {
-                    "STALE — current health unknown"
-                } else {
+                if now < created.1 {
+                    "UNKNOWN — report is in the future"
+                } else if fresh {
                     "fresh observation"
+                } else {
+                    "STALE — current health unknown"
                 }
             );
-            if expired {
+            if !fresh {
                 continue;
             }
             for (condition, component, state) in find!(
                 (condition: Id, component: Id, state: Id),
                 pattern!(&facts, [
                     { report @ attrs::condition: ?condition },
-                    { ?condition @ metadata::tag: ?component, attrs::state: ?state },
+                    { ?condition @ metadata::tag: &health_record::KIND_CONDITION,
+                      metadata::tag: ?component, attrs::node: &node,
+                      attrs::session: &session, attrs::state: ?state },
                 ])
             ) {
                 let label = match component {

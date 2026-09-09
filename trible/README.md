@@ -143,6 +143,14 @@ self-contained proof lands inertly and can authorize a later retry; it never
 changes admission for the immutable current session or creates blob WANTs.
 
 - `pile net identity [--key PATH]` — print this node's iroh identity (auto-generates a key if missing).
+- `pile net health <PILE> [--key REPORTING_KEY]` — read local expiring health
+  observations without network probes. Add `--health-key REPORTING_KEY` to
+  `pile net sync` to publish them once a minute, with three-minute validity.
+  This is an existing durable reporting-author key, independent of the
+  transport key. The private `swarm-health` collection is not activated for
+  replication automatically. Reports distinguish a live host, serving
+  snapshot, per-peer collection comparison, and DHT publication; matching
+  records do not establish that every referenced blob is available.
 - `pile net sync <PILE> --collection HANDLE [--collection HANDLE ...] [--peers ID_OR_TICKET,...] [--key PATH] [--direction bidirectional|read-only|write-only]` — activate the named collections and run periodic repair. `read-only` pulls but does not serve collection repair, while `write-only` serves admitted readers but does not pull collection repair. Every direction still services ordinary exact-blob WANTs. `--duration SECS` and `--quiescent-for SECS` provide optional process-lifecycle bounds.
 
 The exact repair state is the product of the collection's native-record and

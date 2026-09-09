@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Expose bounded local swarm-health observations from existing collection
+  repair, serving-snapshot, event-loop, and DHT-publication work. Opt-in
+  `trible pile net sync --health-key` publishes expiring private native facts;
+  `pile net health` reads them locally. Stable alert/recovery episodes avoid
+  heartbeat spam; no new wire protocol, eager blob probe, or global health claim.
+
+- Constrain the netwatch dependency to the tested patched version so a newer
+  registry candidate cannot silently bypass the root's multi-sender wakeup fix.
+
 - Distinguish Iroh handshake/registration from host dispatch with opt-in
   connection-handoff tracing. Keep RPC spans scoped to future polls rather
   than holding entered spans across awaits; no wire or admission change.
