@@ -1118,11 +1118,17 @@ async fn host_loop<T: Transport>(harness: Harness<T>, config: PeerConfig, wiring
     };
     tokio::spawn(async move {
         while let Some(accepted) = incoming.recv().await {
+            debug!(
+                target: "triblespace_net::handoff",
+                peer = %hex::encode(accepted.conn.remote_id()),
+                "host received forwarded connection"
+            );
             if accepted.alpn != PILE_SYNC_ALPN {
                 accepted.conn.close(1, b"unknown protocol");
                 continue;
             }
             let Ok(permit) = handler.inbound_connections.clone().try_acquire_owned() else {
+                debug!(target: "triblespace_net::handoff", "host inbound connection limit reached");
                 accepted.conn.close(1, b"inbound connection limit exceeded");
                 continue;
             };
@@ -1990,6 +1996,7 @@ impl SnapshotHandler {
         let peer_id = connection.remote_id();
         let span = info_span!("connection", peer = %hex::encode(&peer_id[..4]));
         async move {
+            debug!(target: "triblespace_net::handoff", "host connection handler started");
             let peer = match VerifyingKey::from_bytes(&peer_id) {
                 Ok(peer) => peer,
                 Err(error) => {
@@ -2003,18 +2010,23 @@ impl SnapshotHandler {
                 let accepted = tokio::select! {
                     stream = connection.accept_bi() => stream,
                     () = tokio::time::sleep(CONNECTION_IDLE_DEADLINE) => {
+                        debug!(target: "triblespace_net::handoff", "host connection idle deadline reached");
                         connection.close(0, b"connection idle timeout");
                         return;
                     }
                 };
                 let Some((mut send, mut recv)) = accepted else {
+                    debug!(target: "triblespace_net::handoff", "host connection accept ended");
                     return;
                 };
+                tracing::trace!(target: "triblespace_net::handoff", "host accepted RPC stream");
                 let Ok(connection_permit) = per_connection.clone().try_acquire_owned() else {
+                    debug!(target: "triblespace_net::handoff", "host per-connection request limit reached");
                     connection.close(1, b"request concurrency exceeded");
                     return;
                 };
                 let Ok(global_permit) = self.inbound_requests.clone().try_acquire_owned() else {
+                    debug!(target: "triblespace_net::handoff", "host global request limit reached");
                     connection.close(1, b"global request concurrency exceeded");
                     return;
                 };
@@ -2034,7 +2046,7 @@ impl SnapshotHandler {
                         let _ = send.shutdown().await;
                         drop((connection_permit, global_permit));
                     }
-                    .in_current_span(),
+                    .instrument(debug_span!("stream", op = tracing::field::Empty).or_current()),
                 );
             }
         }
@@ -2049,8 +2061,8 @@ impl SnapshotHandler {
         recv: &mut C::RecvHalf,
     ) -> anyhow::Result<()> {
         let op = recv_u8(recv).await?;
-        let span = debug_span!("stream", op = op_name(op));
-        let _entered = span.enter();
+        tracing::Span::current().record("op", op_name(op));
+        tracing::trace!(target: "triblespace_net::handoff", op = op_name(op), "host received RPC opcode");
         match op {
             OP_COLLECTION_REPAIR => {
                 if !self.serve_collections {

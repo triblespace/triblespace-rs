@@ -163,6 +163,23 @@ The full model, wire formats, authorization boundaries, and CLI surface live
 in the book's [Distributed Sync](https://docs.rs/triblespace/latest/triblespace/)
 chapter.
 
+## Diagnosing connection handoff
+
+For a bounded connection-level investigation, enable:
+
+```sh
+export RUST_LOG=warn,triblespace_net=info,triblespace_net::handoff=debug,iroh::_events::conn::connected=debug,iroh::_events::conn::closed=debug
+```
+
+Iroh's `connected` event precedes socket-actor registration. The handoff target
+distinguishes awaiting connection completion, registration, forwarding, and
+host dispatch; an acknowledged QUIC handshake alone does not establish that a
+request reached the handler. These events contain transport metadata, not
+collection handles, blob capabilities, or request bodies. Per-stream arrival
+and opcode events require `triblespace_net::handoff=trace` and are off in the
+filter above. Keep the global `warn` fallback so dependency failures remain
+visible without enabling broad packet-level tracing.
+
 ## Crate layout
 
 - `collection_activation` — per-collection record and authorization-evidence PATCHes

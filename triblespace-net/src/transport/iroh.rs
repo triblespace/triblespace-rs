@@ -10,7 +10,7 @@ use std::{collections::BTreeMap, sync::Arc};
 use futures::StreamExt;
 use iroh_base::{EndpointAddr, EndpointId};
 use tokio::sync::mpsc;
-use tracing::warn;
+use tracing::{Instrument as _, debug, warn};
 
 use super::{Alpn, Conn, Harness, Incoming, PeerId, Transport};
 use crate::host::PeerConfig;
@@ -102,10 +102,20 @@ impl Transport for IrohTransport {
             .cloned()
             .unwrap_or_else(|| EndpointAddr::from(id));
         let ep = self.ep.clone();
-        let connect = self
-            ._alive
-            ._runtime
-            .spawn(async move { ep.connect(addr, alpn).await });
+        let connect = self._alive._runtime.spawn(async move {
+            debug!(target: "triblespace_net::handoff", peer = %id, "iroh outbound connection started");
+            let result = ep.connect(addr, alpn).await;
+            match &result {
+                Ok(connection) => debug!(
+                    target: "triblespace_net::handoff",
+                    peer = %id,
+                    connection = connection.stable_id(),
+                    "iroh outbound connection registered"
+                ),
+                Err(error) => debug!(target: "triblespace_net::handoff", peer = %id, %error, "iroh outbound connection failed"),
+            }
+            result
+        });
         let conn = connect
             .await
             .map_err(|e| anyhow::anyhow!("connect task: {e}"))?
@@ -187,23 +197,61 @@ impl std::fmt::Debug for ForwardHandler {
 }
 
 impl iroh::protocol::ProtocolHandler for ForwardHandler {
+    async fn on_accepting(
+        &self,
+        accepting: iroh::endpoint::Accepting,
+    ) -> Result<iroh::endpoint::Connection, iroh::protocol::AcceptError> {
+        // ALPN selection precedes this hook, but a successful QUIC handshake
+        // does not yet mean iroh has registered the connection with its socket
+        // actor. Keep that handoff visible without changing its cancellation
+        // or acceptance semantics.
+        let span = tracing::debug_span!(
+            target: "triblespace_net::handoff",
+            "iroh_accept",
+            alpn = %String::from_utf8_lossy(self.alpn),
+            remote = ?accepting.remote_addr(),
+        )
+        .or_current();
+        async move {
+            debug!(target: "triblespace_net::handoff", "awaiting iroh connection completion");
+            let connection = accepting.await?;
+            debug!(
+                target: "triblespace_net::handoff",
+                peer = %connection.remote_id(),
+                connection = connection.stable_id(),
+                "iroh connection registered; protocol handler ready"
+            );
+            Ok(connection)
+        }
+        .instrument(span)
+        .await
+    }
+
     async fn accept(
         &self,
         connection: iroh::endpoint::Connection,
     ) -> Result<(), iroh::protocol::AcceptError> {
+        let peer = connection.remote_id();
+        let connection_id = connection.stable_id();
         let incoming = Incoming {
             alpn: self.alpn,
             conn: IrohConn(connection),
         };
         match self.tx.try_send(incoming) {
-            Ok(()) => {}
+            Ok(()) => debug!(
+                target: "triblespace_net::handoff",
+                %peer,
+                connection = connection_id,
+                "iroh connection forwarded to host"
+            ),
             Err(tokio::sync::mpsc::error::TrySendError::Full(incoming)) => {
-                warn!("inbound connection queue full; rejecting connection");
+                warn!(%peer, connection = connection_id, "inbound connection queue full; rejecting connection");
                 incoming
                     .conn
                     .close(1, b"inbound connection queue capacity exceeded");
             }
             Err(tokio::sync::mpsc::error::TrySendError::Closed(incoming)) => {
+                debug!(target: "triblespace_net::handoff", %peer, "inbound host queue closed");
                 incoming
                     .conn
                     .close(1, b"inbound connection handler stopped");

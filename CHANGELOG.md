@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Distinguish Iroh handshake/registration from host dispatch with opt-in
+  connection-handoff tracing. Keep RPC spans scoped to future polls rather
+  than holding entered spans across awaits; no wire or admission change.
+
 - Clarify that exact repair includes native MERGE/DERIVE records, and that
   bearer-handle discovery does not encrypt or hide guessable blob content.
 

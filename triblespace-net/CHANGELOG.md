@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add opt-in `triblespace_net::handoff` tracing across Iroh acceptance,
+  socket registration, forwarding, and host dispatch. Stream/opcode events
+  require trace level and never include request payloads or blob capabilities.
+
 - Add collection-scoped anti-entropy over one direct stream. Each request
   may carry native READ(C) bootstrap proofs and, once admitted from pinned
   local proof evidence, pins the exact product of the native record and
