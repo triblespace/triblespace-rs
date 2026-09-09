@@ -133,7 +133,9 @@ pub fn conditions(
         } else {
             State::Unknown
         },
-        alert: !host_fresh && health.started_at.is_some(),
+        alert: !host_fresh
+            && health.started_at.is_some()
+            && !within(health.started_at, HOST_MAX_AGE),
     }];
     let store_current = health.store.serving_snapshot
         && !health.store.pending_flush
@@ -390,7 +392,18 @@ mod tests {
     #[test]
     fn fresh_reporting_cannot_disguise_an_unpolled_host() {
         let at = crate::clock::mono_now();
-        let health = observed(at);
+        let mut health = observed(at);
+        health.observed_at = None;
+        let startup = super::conditions(&health, at + Duration::from_secs(1));
+        let host = startup
+            .iter()
+            .find(|c| c.component == Component::Host)
+            .unwrap();
+        assert_eq!(host.state, State::Unknown);
+        assert!(
+            !host.alert,
+            "give the loop time to publish its first observation"
+        );
         let conditions = super::conditions(&health, at + Duration::from_secs(31));
         let host = conditions
             .iter()
