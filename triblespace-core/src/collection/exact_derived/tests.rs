@@ -841,6 +841,77 @@ fn exact_ensure_acquires_explicit_foundational_support_without_want() {
 }
 
 #[test]
+fn exact_ensure_fetches_a_known_derive_output_without_recomputing() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    inner.put::<SimpleArchive, _>(source.clone()).unwrap();
+    let support = support(root, std::slice::from_ref(&source));
+    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
+    let output_data = data(&output);
+    let pending = CollectionRecord::Derive(CollectionDerive::new(
+        first.handle(),
+        data(&source),
+        output_data,
+    ));
+    inner.insert(pending).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&output);
+    reset_mapping_calls();
+    let snapshot = block_on(store.ensure_exact(first, &support)).unwrap();
+
+    assert_eq!(store.acquired, vec![output_data]);
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert!(
+        store.events.is_empty(),
+        "acquisition must not publish algebra"
+    );
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+    let observed = snapshot.collection_exact(first, &support).unwrap();
+    assert_eq!(observed.support(), &support);
+    assert_eq!(
+        observed.cover().data_members().collect::<Vec<_>>(),
+        vec![output_data],
+    );
+}
+
+#[test]
+fn passive_derived_snapshot_keeps_dangling_output_as_raw_evidence_only() {
+    let (mut inner, root, first, _second) = collections();
+    let source = archive(1, 1);
+    publish_root(&mut inner, root, &source, 42);
+    let support = support(root, std::slice::from_ref(&source));
+    let output = FirstEncoding::map(&(), &source, &inner.snapshot().unwrap()).unwrap();
+    let pending = CollectionRecord::Derive(CollectionDerive::new(
+        first.handle(),
+        data(&source),
+        data(&output),
+    ));
+    inner.insert(pending).unwrap();
+
+    let mut store = GuardStore::new(inner);
+    store.offer(&output);
+    reset_mapping_calls();
+    let snapshot = store.snapshot().unwrap();
+    assert_eq!(root.admitted(&snapshot).unwrap(), support);
+    let observed = snapshot.collection(first).unwrap();
+    assert!(observed.support().is_empty());
+    assert!(observed.cover().is_empty());
+    assert!(matches!(
+        snapshot.collection_exact(first, &support),
+        Err(CollectionRealizationError::IncompleteCover { .. })
+    ));
+    let selectors = BTreeSet::from([CollectionRecordSelector::DeriveTarget(first.handle())]);
+    assert_eq!(snapshot.select_records(&selectors).unwrap(), vec![pending]);
+    assert!(store.acquired.is_empty());
+    assert!(store.events.is_empty());
+    assert_eq!(FIRST_MAP_CALLS.get(), 0);
+    assert_eq!(SECOND_MAP_CALLS.get(), 0);
+    assert_eq!(snapshot.wants().unwrap().count(), 0);
+}
+
+#[test]
 fn exact_maintenance_recovers_a_pending_derive_with_a_missing_output() {
     let (mut inner, root, first, _second) = collections();
     let source = archive(1, 1);

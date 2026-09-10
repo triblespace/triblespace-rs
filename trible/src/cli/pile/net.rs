@@ -12,6 +12,7 @@ use triblespace_core::collection::{AdmissionPolicy, CollectionPolicy, Collection
 use triblespace_core::repo::pile::Pile;
 use triblespace_net::health_record::{self, Recorder, DEFAULT_MAX_AGE, REPORT_EVERY};
 use triblespace_net::peer::{Peer, PeerConfig, ReconcileDirection, ReconcileQos};
+use triblespace_net::reconcile::{Reconciler, ReplicationMode};
 
 fn open_pile(path: &PathBuf) -> Result<Pile> {
     crate::cli::pile::open_refreshed(path)
@@ -69,6 +70,26 @@ impl From<DirectionArg> for ReconcileDirection {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum ReplicationArg {
+    /// Repair records and fulfill explicit WANTs only (default).
+    Demand,
+    /// Also fetch the direct blob references of selected collection records.
+    Shallow,
+    /// Also conservatively walk their recursively referenced blobs.
+    Full,
+}
+
+impl From<ReplicationArg> for ReplicationMode {
+    fn from(mode: ReplicationArg) -> Self {
+        match mode {
+            ReplicationArg::Demand => Self::Demand,
+            ReplicationArg::Shallow => Self::Shallow,
+            ReplicationArg::Full => Self::Full,
+        }
+    }
+}
+
 #[derive(Parser)]
 pub enum Command {
     /// Show this node's network identity.
@@ -110,6 +131,12 @@ pub enum Command {
         /// Whether to pull collections, serve them, or do both.
         #[arg(long, value_enum, default_value = "bidirectional")]
         direction: DirectionArg,
+        /// Local blob acquisition for exactly the --collection selections.
+        /// READ grants alone never subscribe this process to hydration.
+        /// Select a producer-maintained reference-summary collection as well
+        /// to accelerate full walks; missing summaries leave them unfiltered.
+        #[arg(long, value_enum, default_value = "demand")]
+        replication: ReplicationArg,
         /// Maximum DHT provider-announcement attempts for this process.
         ///
         /// Zero disables announcements without disabling exact-blob serving.
@@ -140,6 +167,7 @@ pub fn run(command: Command) -> Result<()> {
             key,
             collections,
             direction,
+            replication,
             provider_publication_budget,
             health_key,
             duration,
@@ -152,6 +180,7 @@ pub fn run(command: Command) -> Result<()> {
             ReconcileQos {
                 direction: direction.into(),
             },
+            replication.into(),
             provider_publication_budget,
             health_key,
             duration,
@@ -178,6 +207,7 @@ fn run_sync(
     key_path: Option<PathBuf>,
     collection_values: Vec<String>,
     qos: ReconcileQos,
+    replication: ReplicationMode,
     provider_publication_budget: Option<u64>,
     health_key_path: Option<PathBuf>,
     duration: Option<u64>,
@@ -234,6 +264,7 @@ fn run_sync(
 
     eprintln!("node: {}", peer.id());
     eprintln!("active collections: {}", collections.len());
+    eprintln!("local replication: {replication:?}");
     if health_collection.is_some() {
         eprintln!("local swarm health: every 60s; freshness is reader policy");
     } else {
@@ -265,7 +296,7 @@ fn run_sync(
     let started = std::time::Instant::now();
     let duration_limit = duration.map(std::time::Duration::from_secs);
     let quiescent_limit = quiescent_for.map(std::time::Duration::from_secs);
-    let mut reconciler = triblespace_net::reconcile::Reconciler::new();
+    let mut reconciler = Reconciler::new().with_replication(replication, collections);
     let reconcile_every = std::time::Duration::from_secs(1);
     let mut next_reconcile = std::time::Instant::now();
     let mut next_health = std::time::Instant::now();
@@ -306,8 +337,20 @@ fn run_sync(
                 next_reconcile = std::time::Instant::now() + reconcile_every;
                 wants_fulfilled_total += stats.fulfilled as u64;
                 wants_pending = stats.pending;
-                if stats.fulfilled > 0 {
+                if stats.fulfilled > 0 || stats.replication.acquired > 0 {
                     last_want_progress = std::time::Instant::now();
+                }
+                if stats.replication.acquired > 0 || stats.replication.speculative_attempted > 0 {
+                    eprintln!(
+                        "  hydration: {} roots, {} pending, {} acquired; {} candidates, {} filtered, {} speculative reads, {} misses",
+                        stats.replication.roots,
+                        stats.replication.pending,
+                        stats.replication.acquired,
+                        stats.replication.candidates,
+                        stats.replication.filtered,
+                        stats.replication.speculative_attempted,
+                        stats.replication.speculative_misses,
+                    );
                 }
                 if stats.fulfilled > 0 || last_pending_logged != Some(stats.pending) {
                     eprintln!(
@@ -474,6 +517,35 @@ mod tests {
         let raw = [0xAB; 32];
         assert_eq!(parse_collection(&hex::encode(raw)).unwrap().raw, raw);
         assert!(parse_collection("not-a-handle").is_err());
+    }
+
+    #[test]
+    fn replication_is_explicit_and_defaults_to_demand() {
+        let handle = hex::encode([0xCD; 32]);
+        let parse = |mode: Option<&str>| {
+            let mut args = vec!["net", "sync", "test.pile", "--collection", handle.as_str()];
+            if let Some(mode) = mode {
+                args.extend(["--replication", mode]);
+            }
+            let Command::Sync { replication, .. } = Command::try_parse_from(args).unwrap() else {
+                panic!("sync expected")
+            };
+            ReplicationMode::from(replication)
+        };
+        assert_eq!(parse(None), ReplicationMode::Demand);
+        assert_eq!(parse(Some("demand")), ReplicationMode::Demand);
+        assert_eq!(parse(Some("shallow")), ReplicationMode::Shallow);
+        assert_eq!(parse(Some("full")), ReplicationMode::Full);
+        assert!(Command::try_parse_from([
+            "net",
+            "sync",
+            "test.pile",
+            "--collection",
+            &handle,
+            "--replication",
+            "everything",
+        ])
+        .is_err());
     }
 
     #[test]

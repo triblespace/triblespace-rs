@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- Add explicitly selected demand/shallow/full blob replication without changing
+  record repair, bearer authorization, or WANT semantics. Bound recursive work
+  with a resumable positive PATCH frontier and retry speculative misses without
+  persisting negative demand.
+- Add canonical unionable reference-summary collections over complete producer
+  closures. Consumers reuse resident or fetched outputs as support-scoped Bloom
+  negatives; they never derive summaries from incomplete local caches. Share the
+  existing opaque blob-locator KDF between the encoding and network layer, and
+  expose registration/maintenance plus replication selection in `trible`.
+
 - Expose bounded local swarm-health observations from existing collection
   repair, serving-snapshot, event-loop, and DHT-publication work. Opt-in
   `trible pile net sync --health-key` publishes timestamped private native facts;

@@ -59,6 +59,8 @@ mod operation_snapshot;
 /// Immutable collection-local READ and WRITE authorization ceilings.
 pub mod policy;
 pub mod records;
+/// Unionable summaries of complete producer-side referenced-blob closures.
+pub mod reference_summary;
 /// Stateless semantic admission, closure, provenance, and physical-cover view.
 pub mod resolution;
 /// Canonical `SimpleArchive` set-union collection kind.

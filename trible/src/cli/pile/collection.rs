@@ -37,18 +37,21 @@ use triblespace_core::blob::Blob;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::TryFromBlob;
 use triblespace_core::collection::records::{CollectionHandle, CollectionRecord};
+use triblespace_core::collection::reference_summary::{
+    ReferenceSummaryBlob, ReferenceSummaryLayout, REFERENCE_SUMMARY_MAPPING_V1,
+};
 use triblespace_core::collection::CollectionRead;
 use triblespace_core::collection::{
     descriptor, grant_collection_read, grant_collection_write, AdmissionPolicy, Collection,
     CollectionPolicy, CollectionStoreExt,
 };
-use triblespace_core::trible::Fragment;
 use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
 use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
+use triblespace_core::trible::Fragment;
 use triblespace_core::trible::TribleSet;
 
 use super::open_refreshed;
@@ -168,7 +171,8 @@ pub enum Command {
         source: String,
         /// What to derive. succinct and rank9 take no arguments; latest takes
         /// --observes; lww takes --identity and --orders; nvfp4 takes
-        /// --attribute and --dimension.
+        /// --attribute and --dimension. reference-summary takes --log2-bits
+        /// and --probes (defaults: 32 and 4).
         #[arg(value_enum)]
         kind: DeriveKind,
         /// latest: the attribute whose GenId values name the state observed
@@ -186,6 +190,12 @@ pub enum Command {
         /// nvfp4: the embedding dimension
         #[arg(long)]
         dimension: Option<usize>,
+        /// reference-summary: fixed bit universe, expressed as its base-two log
+        #[arg(long)]
+        log2_bits: Option<u8>,
+        /// reference-summary: fixed number of Bloom probes per locator
+        #[arg(long)]
+        probes: Option<u8>,
         /// Existing READ/WRITE-root signing key (default: beside the pile)
         #[arg(long)]
         key: Option<PathBuf>,
@@ -196,8 +206,9 @@ pub enum Command {
     /// A collection nobody has maintained is read by loading every commit it
     /// ever received and unioning them; a maintained one is read from a
     /// handful of merged members plus the commits since. Deterministic and
-    /// idempotent: run again, it publishes nothing new. It appends to the
-    /// pile and needs the ordinary signing key for the merges it signs.
+    /// idempotent: run again, it publishes nothing new. Equations are unsigned.
+    /// Reference summaries must be maintained only on a producer holding the
+    /// complete source blob closure; consumers fetch the existing results.
     Maintain {
         /// Path to the pile file to modify
         pile: PathBuf,
@@ -259,6 +270,8 @@ pub enum DeriveKind {
     Lww,
     /// NvFp4CosineSet over f32 embeddings in a SimpleArchive source
     Nvfp4,
+    /// Recursive blob-reference Bloom summary; maintain only with complete producer closure
+    ReferenceSummary,
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -293,6 +306,8 @@ pub fn run(cmd: Command) -> Result<()> {
             orders,
             attribute,
             dimension,
+            log2_bits,
+            probes,
             key,
         } => run_derive(
             pile,
@@ -304,6 +319,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 orders,
                 attribute,
                 dimension,
+                log2_bits,
+                probes,
             },
             key,
         ),
@@ -427,8 +444,12 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("Rank9AcceleratedSuccinctArchiveBlob")
     } else if id == <triblespace_core::collection::latest::LatestBlob as MetaDescribe>::id() {
         Some("LatestBlob")
-    } else if id == <triblespace_core::collection::lww_register::LwwRegisterBlob as MetaDescribe>::id() {
+    } else if id
+        == <triblespace_core::collection::lww_register::LwwRegisterBlob as MetaDescribe>::id()
+    {
         Some("LwwRegisterBlob")
+    } else if id == <ReferenceSummaryBlob as MetaDescribe>::id() {
+        Some("ReferenceSummaryBlob")
     } else if id == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         Some("PathSummaryBlob")
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| id == nvfp4) {
@@ -444,7 +465,9 @@ fn representation_name(id: Id) -> Option<&'static str> {
 fn nvfp4_embedding_set_id() -> Option<Id> {
     #[cfg(feature = "search")]
     {
-        Some(<triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding> as MetaDescribe>::id())
+        Some(<triblespace_search::nvfp4::NvFp4CosineSet<
+            triblespace_search::schemas::Embedding,
+        > as MetaDescribe>::id())
     }
     #[cfg(not(feature = "search"))]
     {
@@ -476,6 +499,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
 
     if id == SIMPLE_TO_SUCCINCT_MAPPING_V1 {
         Some("SIMPLE_TO_SUCCINCT_MAPPING_V1")
+    } else if id == REFERENCE_SUMMARY_MAPPING_V1 {
+        Some("REFERENCE_SUMMARY_MAPPING_V1")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE {
         Some("RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_LE")
     } else if id == RAW_TO_RANK9_ACCELERATED_MAPPING_V1_32_BE {
@@ -1209,9 +1234,12 @@ fn run_adopt(
             // A commit names its member by bare content hash; the member of a
             // SimpleArchive collection is a SimpleArchive.
             let data_handle: Inline<Handle<SimpleArchive>> = Inline::new(commit.data().raw);
-            let data: Blob<SimpleArchive> = snapshot
-                .get(data_handle)
-                .map_err(|error| anyhow!("read commit data {}: {error}", hex::encode(commit.data().raw)))?;
+            let data: Blob<SimpleArchive> = snapshot.get(data_handle).map_err(|error| {
+                anyhow!(
+                    "read commit data {}: {error}",
+                    hex::encode(commit.data().raw)
+                )
+            })?;
             let metadata: Blob<SimpleArchive> = match snapshot.get(commit.metadata()) {
                 Ok(blob) => blob,
                 Err(error) => {
@@ -1242,7 +1270,11 @@ fn run_adopt(
             "signer: {}",
             hex::encode_upper(signer.verifying_key().to_bytes())
         );
-        println!("commits: {} to adopt, {} skipped as invalid", prepared.len(), invalid);
+        println!(
+            "commits: {} to adopt, {} skipped as invalid",
+            prepared.len(),
+            invalid
+        );
         if dry_run {
             println!("dry run: nothing appended");
             return Ok(());
@@ -1254,7 +1286,10 @@ fn run_adopt(
                 .map_err(|error| anyhow!("adopt commit {:X}: {error}", record.fingerprint()))?;
             adopted.insert(commit.data().raw);
         }
-        println!("adopted: {} distinct data archive(s) now asserted in the target", adopted.len());
+        println!(
+            "adopted: {} distinct data archive(s) now asserted in the target",
+            adopted.len()
+        );
         Ok(())
     })();
     let close_res = pile
@@ -1844,6 +1879,9 @@ fn maintain_by_representation(
         go::<LatestBlob>(pile, snapshot, handle)
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
         go::<LwwRegisterBlob>(pile, snapshot, handle)
+    } else if representation == <ReferenceSummaryBlob as MetaDescribe>::id() {
+        eprintln!("reference summary: assuming complete producer-side blob closure");
+        go::<ReferenceSummaryBlob>(pile, snapshot, handle)
     } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle)
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
@@ -1940,12 +1978,13 @@ struct DeriveArguments {
     orders: Option<String>,
     attribute: Option<String>,
     dimension: Option<usize>,
+    log2_bits: Option<u8>,
+    probes: Option<u8>,
 }
 
 fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
     let text = value.ok_or_else(|| anyhow!("{flag} is required for this kind"))?;
-    Id::from_hex(text.trim())
-        .ok_or_else(|| anyhow!("{flag}: {text:?} is not a 32-hex-digit id"))
+    Id::from_hex(text.trim()).ok_or_else(|| anyhow!("{flag}: {text:?} is not a 32-hex-digit id"))
 }
 
 fn run_derive(
@@ -1995,7 +2034,8 @@ fn run_derive(
                     .handle()
             }
             DeriveKind::Rank9 => {
-                let source: Collection<SuccinctArchiveBlob> = open_source(&mut pile, source_handle)?;
+                let source: Collection<SuccinctArchiveBlob> =
+                    open_source(&mut pile, source_handle)?;
                 pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(source, (), policy)
                     .map_err(registered)?
                     .handle()
@@ -2003,9 +2043,11 @@ fn run_derive(
             DeriveKind::Latest => {
                 let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
                 let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
-                pile.derive::<triblespace_core::collection::latest::LatestBlob>(source, observes, policy)
-                    .map_err(registered)?
-                    .handle()
+                pile.derive::<triblespace_core::collection::latest::LatestBlob>(
+                    source, observes, policy,
+                )
+                .map_err(registered)?
+                .handle()
             }
             DeriveKind::Lww => {
                 let identity = parse_attribute_id("--identity", arguments.identity.as_deref())?;
@@ -2020,6 +2062,16 @@ fn run_derive(
                 .handle()
             }
             DeriveKind::Nvfp4 => derive_nvfp4(&mut pile, source_handle, &arguments, policy)?,
+            DeriveKind::ReferenceSummary => {
+                let layout = ReferenceSummaryLayout::new(
+                    arguments.log2_bits.unwrap_or(32),
+                    arguments.probes.unwrap_or(4),
+                )?;
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<ReferenceSummaryBlob>(source, layout, policy)
+                    .map_err(registered)?
+                    .handle()
+            }
         };
         Ok(handle)
     })();

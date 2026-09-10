@@ -7,30 +7,38 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anybytes::Bytes;
 use ed25519_dalek::SigningKey;
 use iroh_base::EndpointId;
+use triblespace_core::attribute::Attribute;
 use triblespace_core::blob::IntoBlob;
 use triblespace_core::blob::encodings::UnknownBlob;
 use triblespace_core::blob::encodings::simplearchive::SimpleArchive;
+use triblespace_core::blob::locator::blob_locator;
 use triblespace_core::capability::{
     Capability, CapabilityHandle, CapabilityMode, CapabilityProof, CapabilityResource,
 };
 use triblespace_core::clock::{self, VirtualClock};
+use triblespace_core::collection::reference_summary::{
+    ReferenceSummaryBlob, ReferenceSummaryLayout, ReferenceSummaryView,
+};
 use triblespace_core::collection::{
     AdmissionPolicy, Collection, CollectionCommit, CollectionHandle, CollectionPolicy,
-    CollectionRead, CollectionRecord, CollectionStore, CollectionStoreExt, read_capability,
-    write_capability,
+    CollectionRead, CollectionRecord, CollectionSnapshotExt, CollectionStore, CollectionStoreExt,
+    read_capability, write_capability,
 };
 use triblespace_core::inline::Inline;
 use triblespace_core::inline::encodings::hash::Handle;
+use triblespace_core::macros::entity;
 use triblespace_core::repo::memoryrepo::MemoryRepo;
 use triblespace_core::repo::{
-    BlobStorePut, CapabilityProofRead, CapabilityProofStore, SnapshotSource, StorageFlush,
-    WantRead, WantRequest, WantStore,
+    BlobStoreGet, BlobStoreList, BlobStorePut, CapabilityProofRead, CapabilityProofStore,
+    SnapshotSource, StorageFlush, WantRead, WantRequest, WantStore,
 };
 use triblespace_core::trible::TribleSet;
 use triblespace_net::host::{self, PeerConfig};
 use triblespace_net::inventory::{ReconcileDirection, ReconcileQos};
 use triblespace_net::peer::Peer;
-use triblespace_net::reconcile::{ReconcileStats, Reconciler};
+use triblespace_net::reconcile::{
+    RECONCILE_SPECULATIVE_FETCHES_PER_TICK, ReconcileStats, Reconciler, ReplicationMode,
+};
 use triblespace_net::transport::sim::{SimConfig, SimNet};
 
 fn key(byte: u8) -> SigningKey {
@@ -743,6 +751,7 @@ fn durable_bearer_want_materializes_without_any_collection() {
                 attempted: 2,
                 fulfilled: 1,
                 pending: 1,
+                replication: Default::default(),
             },
             "the exact resident H resolves globally while a wrong H stays pending"
         );
@@ -752,5 +761,686 @@ fn durable_bearer_want_materializes_without_any_collection() {
             snapshot.wants().unwrap().map(Result::unwrap).collect()
         };
         assert_eq!(wants, BTreeSet::from([wanted, absent]));
+    }));
+}
+
+#[test]
+fn demand_shallow_full_preserve_exact_wants_and_only_hydrate_selected_record_roots() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    for mode in [
+        ReplicationMode::Demand,
+        ReplicationMode::Shallow,
+        ReplicationMode::Full,
+    ] {
+        clock.reset();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap();
+        let local = tokio::task::LocalSet::new();
+        runtime.block_on(local.run_until(async {
+            let net = SimNet::new(0xC011_EC80, SimConfig::default());
+            let server_key = key(81);
+            let reader_key = key(82);
+            let policy_key = key(83);
+            let inert_writer = key(84);
+            let policy = CollectionPolicy::new(
+                AdmissionPolicy::direct(policy_key.verifying_key()),
+                AdmissionPolicy::direct(policy_key.verifying_key()),
+            );
+            let mut server_store = MemoryRepo::default();
+            let collection = register(&mut server_store, policy.clone());
+            let unrelated = server_store.collection("not-selected", policy).unwrap();
+            let leaf = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"recursive leaf".to_vec()))
+                .unwrap();
+            let child = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(leaf.raw.to_vec()))
+                .unwrap();
+            let unaligned = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"unaligned only".to_vec()))
+                .unwrap();
+            // Hydration is structural, without an encoding dispatch. The
+            // first complete word is a child; the handle at offset 33 is not.
+            let mut data_bytes = child.raw.to_vec();
+            data_bytes.push(7);
+            data_bytes.extend_from_slice(&unaligned.raw);
+            let metadata = server_store
+                .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+                .unwrap();
+            let data_bytes = (0_u64..1_000_000)
+                .find_map(|nonce| {
+                    let mut bytes = data_bytes.clone();
+                    bytes.extend_from_slice(&nonce.to_le_bytes());
+                    let hash = *blake3::hash(&bytes).as_bytes();
+                    (hash < collection.handle().raw && hash < metadata.raw).then_some(bytes)
+                })
+                .expect("a deterministic fixture with data first in scan order");
+            let data = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(data_bytes))
+                .unwrap();
+            let record = CollectionRecord::Commit(CollectionCommit::sign(
+                &inert_writer,
+                collection.handle(),
+                Inline::new(data.raw),
+                metadata,
+            ));
+            server_store.insert(record).unwrap();
+            let unrelated_data = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"unselected payload".to_vec()))
+                .unwrap();
+            let unrelated_record = CollectionRecord::Commit(CollectionCommit::sign(
+                &policy_key,
+                unrelated.handle(),
+                Inline::new(unrelated_data.raw),
+                metadata,
+            ));
+            server_store.insert(unrelated_record).unwrap();
+            let demand_child = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(b"not a recursive WANT".to_vec()))
+                .unwrap();
+            let demand_blob = server_store
+                .put::<UnknownBlob, _>(Bytes::from_source(demand_child.raw.to_vec()))
+                .unwrap();
+            let demand = WantRequest::blob(demand_blob);
+            let mut reader_store = MemoryRepo::default();
+            for descriptor in [collection.handle(), unrelated.handle()] {
+                let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                    &server_store.snapshot().unwrap(),
+                    Inline::new(descriptor.raw),
+                )
+                .unwrap();
+                reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+            }
+            reader_store.insert(record).unwrap();
+            reader_store.insert(unrelated_record).unwrap();
+            reader_store
+                .insert_proof(proof(
+                    &policy_key,
+                    &reader_key,
+                    read_capability(),
+                    unrelated.handle(),
+                ))
+                .unwrap();
+            reader_store.want(demand).unwrap();
+            let mut server = bring_up_with_publication_budget(
+                &net,
+                &server_key,
+                server_store,
+                Vec::new(),
+                ReconcileDirection::WriteOnly,
+                Some(0),
+            );
+            let mut reader = bring_up_with_publication_budget(
+                &net,
+                &reader_key,
+                reader_store,
+                vec![server_key.verifying_key().to_bytes()],
+                ReconcileDirection::ReadOnly,
+                Some(0),
+            );
+            // Neither endpoint activates C or obtains READ(C). Ordinary H
+            // discovery/bearer serving is sufficient for every acquisition.
+            advance(&clock, &mut [&mut server, &mut reader], 4).await;
+            let mut reconciler = Reconciler::with_backoff(
+                std::time::Duration::from_millis(100),
+                std::time::Duration::from_secs(1),
+            )
+            .with_replication(mode, [collection.handle()])
+            .with_fetch_budget(std::time::Duration::from_secs(2));
+            let mut fulfilled = 0;
+            for _ in 0..120 {
+                let stats =
+                    reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+                fulfilled += stats.fulfilled;
+                assert!(
+                    stats.replication.speculative_attempted
+                        <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+                );
+                let complete = match mode {
+                    ReplicationMode::Demand => stats.pending == 0,
+                    ReplicationMode::Shallow => {
+                        stats.pending == 0 && stats.replication.pending == 0
+                    }
+                    ReplicationMode::Full => reader.try_local(leaf.raw).is_some(),
+                };
+                if complete {
+                    break;
+                }
+                advance(&clock, &mut [&mut server, &mut reader], 1).await;
+            }
+            assert_eq!(
+                fulfilled, 1,
+                "all modes service the same explicit exact WANT"
+            );
+            assert!(reader.try_local(demand_blob.raw).is_some());
+            assert!(
+                reader.try_local(demand_child.raw).is_none(),
+                "Full does not widen a plain Blob(H) WANT"
+            );
+            assert_eq!(
+                reader.try_local(data.raw).is_some(),
+                mode != ReplicationMode::Demand
+            );
+            assert_eq!(
+                reader.try_local(metadata.raw).is_some(),
+                mode != ReplicationMode::Demand
+            );
+            assert_eq!(
+                reader.try_local(child.raw).is_some(),
+                mode == ReplicationMode::Full
+            );
+            assert_eq!(
+                reader.try_local(leaf.raw).is_some(),
+                mode == ReplicationMode::Full
+            );
+            assert!(reader.try_local(unaligned.raw).is_none());
+            assert!(
+                reader.try_local(unrelated_data.raw).is_none(),
+                "a grant and unrelated records do not select their collection"
+            );
+            let snapshot = reader.snapshot().unwrap();
+            assert_eq!(snapshot.records().unwrap().count(), 2);
+            assert_eq!(snapshot.proofs().unwrap().count(), 1);
+            assert_eq!(
+                snapshot
+                    .wants()
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .collect::<Vec<_>>(),
+                [demand]
+            );
+            assert!(
+                !collection
+                    .writer_is_admitted(&snapshot, inert_writer.verifying_key())
+                    .unwrap()
+            );
+        }));
+    }
+}
+
+#[test]
+fn full_replication_retries_a_missing_child_after_unchanged_parent_progress() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC81, SimConfig::default());
+        let server_key = key(91);
+        let reader_key = key(92);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = register(&mut server_store, policy);
+        let leaf = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"late recursive leaf".to_vec()))
+            .unwrap();
+        let child_bytes = Bytes::from_source(leaf.raw.to_vec());
+        let child = *blake3::hash(child_bytes.as_ref()).as_bytes();
+        let metadata = server_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        // Put this small parent before the descriptor in scan order, so the
+        // first tick definitely observes its absent child before yielding.
+        let data = (0_u64..1_000_000)
+            .find_map(|nonce| {
+                let mut bytes = child.to_vec();
+                bytes.extend_from_slice(&nonce.to_le_bytes());
+                let hash = *blake3::hash(&bytes).as_bytes();
+                (hash < collection.handle().raw && hash < metadata.raw).then_some((hash, bytes))
+            })
+            .expect("a deterministic fixture with data first in scan order");
+        server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(data.1.clone()))
+            .unwrap();
+        let record = CollectionRecord::Commit(CollectionCommit::sign(
+            &server_key,
+            collection.handle(),
+            Inline::new(data.0),
+            metadata,
+        ));
+        let mut reader_store = MemoryRepo::default();
+        for handle in [collection.handle().raw, data.0, metadata.raw] {
+            let bytes = BlobStoreGet::get::<Bytes, UnknownBlob>(
+                &server_store.snapshot().unwrap(),
+                Inline::new(handle),
+            )
+            .unwrap();
+            reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+        }
+        reader_store.insert(record).unwrap();
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .with_replication(ReplicationMode::Full, [collection.handle()])
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        let first = reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+        assert_eq!(first.replication.pending, 0);
+        assert!(first.replication.speculative_misses > 0);
+        assert!(reader.try_local(child).is_none());
+        assert_eq!(
+            server
+                .store()
+                .put::<UnknownBlob, _>(child_bytes)
+                .unwrap()
+                .raw,
+            child
+        );
+        server.refresh();
+        for _ in 0..120 {
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert!(
+                stats.replication.speculative_attempted <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+            );
+            if reader.try_local(leaf.raw).is_some() {
+                break;
+            }
+        }
+        assert!(
+            reader.try_local(child).is_some(),
+            "the same parent must be rescanned after a miss"
+        );
+        assert!(
+            reader.try_local(leaf.raw).is_some(),
+            "late children become recursive sources"
+        );
+        let snapshot = reader.snapshot().unwrap();
+        assert_eq!(
+            snapshot
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<Vec<_>>(),
+            [record]
+        );
+        assert_eq!(snapshot.wants().unwrap().count(), 0);
+    }));
+}
+
+#[test]
+fn full_replication_reuses_a_known_summary_without_filtering_later_source_support() {
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC82, SimConfig::default());
+        let server_key = key(101);
+        let reader_key = key(102);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = register(&mut server_store, policy.clone());
+        let summaries = server_store
+            .derive::<ReferenceSummaryBlob>(collection, ReferenceSummaryLayout::default(), policy)
+            .unwrap();
+        let reference = Attribute::<Handle<UnknownBlob>>::named("summary-reuse-reference");
+        let absent = Inline::<Handle<UnknownBlob>>::new(
+            *blake3::hash(b"an absent aligned summary fixture word").as_bytes(),
+        );
+        let leaf_a = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"summary A leaf".to_vec()))
+            .unwrap();
+        let mut child_a_bytes = leaf_a.raw.to_vec();
+        child_a_bytes.extend_from_slice(&absent.raw);
+        let child_a = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(child_a_bytes))
+            .unwrap();
+        let commit_a = server_store
+            .commit(
+                collection,
+                &server_key,
+                entity! { reference*: [child_a, absent] },
+            )
+            .unwrap();
+        // Only this complete producer performs maintenance. The later
+        // consumer must acquire its known output, never derive a partial image.
+        let maintained = server_store.maintain(summaries).await.unwrap();
+        let produced = maintained.collection(summaries).unwrap();
+        assert_eq!(produced.support().len(), 1);
+        assert!(
+            produced
+                .support()
+                .contains(Inline::new(commit_a.data().raw))
+        );
+        assert_eq!(produced.cover().len(), 1);
+        let output = produced.cover().members().next().unwrap();
+        let produced_view = produced.view::<ReferenceSummaryView>().unwrap();
+        assert!(produced_view.contains_locator(blob_locator(child_a.raw)));
+        assert!(produced_view.contains_locator(blob_locator(leaf_a.raw)));
+        assert!(!produced_view.contains_locator(blob_locator(absent.raw)));
+        drop(produced);
+        drop(maintained);
+
+        // B appears after summary(A) was published. It is real selected
+        // support, but no known summary describes its separate closure.
+        let leaf_b = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"uncovered B leaf".to_vec()))
+            .unwrap();
+        let child_b = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(leaf_b.raw.to_vec()))
+            .unwrap();
+        let commit_b = server_store
+            .commit(collection, &server_key, entity! { reference: child_b })
+            .unwrap();
+        assert!(
+            !produced_view.contains_locator(blob_locator(child_b.raw)),
+            "a mistakenly global summary would hide B's existing child"
+        );
+        let omitted = BTreeSet::from([
+            commit_a.data().raw,
+            commit_b.data().raw,
+            output.raw,
+            child_a.raw,
+            leaf_a.raw,
+            child_b.raw,
+            leaf_b.raw,
+        ]);
+        let producer = server_store.snapshot().unwrap();
+        let records: BTreeSet<_> = producer.records().unwrap().map(Result::unwrap).collect();
+        assert_eq!(
+            records.len(),
+            3,
+            "two COMMITs and only the existing DERIVE(A)"
+        );
+        let mut reader_store = MemoryRepo::default();
+        for info in producer.blobs().map(Result::unwrap) {
+            if !omitted.contains(&info.handle.raw) {
+                let bytes = BlobStoreGet::get::<Bytes, _>(&producer, info.handle).unwrap();
+                reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+            }
+        }
+        for record in &records {
+            reader_store.insert(*record).unwrap();
+        }
+        let before = reader_store.snapshot().unwrap();
+        assert!(before.collection(summaries).unwrap().support().is_empty());
+        assert_eq!(before.wants().unwrap().count(), 0);
+        assert_eq!(before.proofs().unwrap().count(), 0);
+        for handle in &omitted {
+            assert!(
+                !before
+                    .contains_blob(Inline::<Handle<UnknownBlob>>::new(*handle))
+                    .unwrap()
+            );
+        }
+        drop(before);
+        drop(producer);
+
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .with_replication(
+            ReplicationMode::Full,
+            [collection.handle(), summaries.handle()],
+        )
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        let mut filtered = 0;
+        let mut acquired = 0;
+        for _ in 0..400 {
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert_eq!(stats.wants, 0);
+            assert_eq!(stats.attempted, 0);
+            assert_eq!(stats.fulfilled, 0);
+            assert_eq!(stats.pending, 0);
+            assert!(
+                stats.replication.speculative_attempted <= RECONCILE_SPECULATIVE_FETCHES_PER_TICK
+            );
+            filtered += stats.replication.filtered;
+            acquired += stats.replication.acquired;
+            if omitted
+                .iter()
+                .all(|handle| reader.try_local(*handle).is_some())
+                && filtered > 0
+            {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        for handle in &omitted {
+            assert!(
+                reader.try_local(*handle).is_some(),
+                "missing expected blob {handle:?}"
+            );
+        }
+        assert_eq!(
+            acquired,
+            omitted.len(),
+            "all acquisitions land existing exact-H bytes"
+        );
+        assert!(
+            filtered > 0,
+            "the fetched summary rejects absent aligned words locally"
+        );
+        assert!(reader.try_local(absent.raw).is_none());
+        let after = reader.snapshot().unwrap();
+        let observed = after.collection(summaries).unwrap();
+        assert_eq!(observed.support().len(), 1);
+        assert!(
+            observed
+                .support()
+                .contains(Inline::new(commit_a.data().raw))
+        );
+        assert!(
+            !observed
+                .support()
+                .contains(Inline::new(commit_b.data().raw))
+        );
+        assert_eq!(observed.cover().members().collect::<Vec<_>>(), [output]);
+        assert!(
+            !observed
+                .view::<ReferenceSummaryView>()
+                .unwrap()
+                .contains_locator(blob_locator(child_b.raw)),
+            "B was hydrated despite the older summary's negative answer"
+        );
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<BTreeSet<_>>(),
+            records
+        );
+        assert_eq!(after.wants().unwrap().count(), 0);
+        assert_eq!(after.proofs().unwrap().count(), 0);
+    }));
+}
+
+#[test]
+fn full_replication_does_not_apply_a_projected_summary_to_foundational_payloads() {
+    use triblespace_core::capability::policy::resource_policy;
+    use triblespace_core::collection::{
+        CollectionDerive, KIND_COLLECTION_DESCRIPTOR, KIND_COLLECTION_MAPPING, collection_mapping,
+        collection_representation, collection_source, mapping_algorithm,
+    };
+    use triblespace_core::metadata::{self, MetaDescribe};
+
+    let _guard = test_guard();
+    let clock = virtual_clock();
+    clock.reset();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .start_paused(true)
+        .build()
+        .unwrap();
+    let local = tokio::task::LocalSet::new();
+    runtime.block_on(local.run_until(async {
+        let net = SimNet::new(0xC011_EC83, SimConfig::default());
+        let server_key = key(111);
+        let reader_key = key(112);
+        let policy = CollectionPolicy::new(AdmissionPolicy::Open, AdmissionPolicy::Open);
+        let mut server_store = MemoryRepo::default();
+        let collection = register(&mut server_store, policy.clone());
+        let child = server_store
+            .put::<UnknownBlob, _>(Bytes::from_source(b"not in the projection".to_vec()))
+            .unwrap();
+        let reference = Attribute::<Handle<UnknownBlob>>::named("projected-summary-reference");
+        let commit = server_store
+            .commit(collection, &server_key, entity! { reference: child })
+            .unwrap();
+        // The constant-bottom map preserves union but intentionally discards
+        // every reference. Its ordinary descriptor/equation suffice here;
+        // no executable test mapping or production registry is necessary.
+        let projection = server_store
+            .register_collection::<SimpleArchive>(entity! {
+                metadata::tag: KIND_COLLECTION_DESCRIPTOR,
+                collection_source: collection.handle(),
+                collection_representation*: SimpleArchive::describe(),
+                resource_policy*: policy.fragment(),
+                collection_mapping*: entity! {
+                    metadata::tag: KIND_COLLECTION_MAPPING,
+                    mapping_algorithm*: entity! {
+                        metadata::name: "test-only SimpleArchive constant-bottom map",
+                    },
+                },
+            })
+            .unwrap();
+        let projected = server_store
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        server_store
+            .insert(CollectionRecord::Derive(CollectionDerive::new(
+                projection.handle(),
+                commit.data(),
+                Handle::<SimpleArchive>::to_hash(projected),
+            )))
+            .unwrap();
+        let summaries = server_store
+            .derive::<ReferenceSummaryBlob>(projection, ReferenceSummaryLayout::default(), policy)
+            .unwrap();
+        let producer = server_store.maintain(summaries).await.unwrap();
+        let observed = producer.collection(summaries).unwrap();
+        assert_eq!(
+            observed.support().collection().handle(),
+            collection.handle()
+        );
+        assert!(observed.support().contains(Inline::new(commit.data().raw)));
+        assert_eq!(observed.cover().len(), 1);
+        assert!(
+            !observed
+                .view::<ReferenceSummaryView>()
+                .unwrap()
+                .contains_locator(blob_locator(child.raw)),
+            "the correct summary of the empty projection cannot describe C's payload"
+        );
+        drop(observed);
+        let records: BTreeSet<_> = producer.records().unwrap().map(Result::unwrap).collect();
+        assert_eq!(records.len(), 3);
+        let mut reader_store = MemoryRepo::default();
+        for info in producer.blobs().map(Result::unwrap) {
+            if info.handle != child {
+                let bytes = BlobStoreGet::get::<Bytes, _>(&producer, info.handle).unwrap();
+                reader_store.put::<UnknownBlob, _>(bytes).unwrap();
+            }
+        }
+        for record in &records {
+            reader_store.insert(*record).unwrap();
+        }
+        drop(producer);
+        let mut server = bring_up_with_publication_budget(
+            &net,
+            &server_key,
+            server_store,
+            Vec::new(),
+            ReconcileDirection::WriteOnly,
+            Some(0),
+        );
+        let mut reader = bring_up_with_publication_budget(
+            &net,
+            &reader_key,
+            reader_store,
+            vec![server_key.verifying_key().to_bytes()],
+            ReconcileDirection::ReadOnly,
+            Some(0),
+        );
+        advance(&clock, &mut [&mut server, &mut reader], 4).await;
+        assert!(reader.try_local(child.raw).is_none());
+        let mut reconciler = Reconciler::with_backoff(
+            std::time::Duration::from_millis(100),
+            std::time::Duration::from_secs(1),
+        )
+        .with_replication(
+            ReplicationMode::Full,
+            [collection.handle(), projection.handle(), summaries.handle()],
+        )
+        .with_fetch_budget(std::time::Duration::from_secs(2));
+        for _ in 0..240 {
+            let stats =
+                reconcile_once(&clock, &mut reconciler, &mut reader, &mut [&mut server]).await;
+            assert_eq!(stats.wants, 0);
+            assert_eq!(
+                stats.replication.filtered, 0,
+                "no selected summary describes C directly"
+            );
+            if reader.try_local(child.raw).is_some() {
+                break;
+            }
+            advance(&clock, &mut [&mut server, &mut reader], 1).await;
+        }
+        assert!(
+            reader.try_local(child.raw).is_some(),
+            "foundational support is provenance, not permission to filter other physical bytes"
+        );
+        let after = reader.snapshot().unwrap();
+        assert_eq!(
+            after
+                .records()
+                .unwrap()
+                .map(Result::unwrap)
+                .collect::<BTreeSet<_>>(),
+            records
+        );
+        assert_eq!(after.wants().unwrap().count(), 0);
     }));
 }

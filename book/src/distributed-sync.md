@@ -500,6 +500,84 @@ direct blob references alive through the normal record-root GC rules. GC never
 fetches missing references merely to retain them; dropping WANT records is an
 explicit rewrite/retention-policy choice.
 
+### Local replication policy and reference summaries
+
+`Reconciler::with_replication(mode, collections)` selects local acquisition
+work, separately from Peer activation and collection authorization:
+
+| Mode | Blob acquisition |
+|---|---|
+| `Demand` (default) | Existing explicit WANTs only. |
+| `Shallow` | Also the direct blob references of the selected collection records. |
+| `Full` | Also recursively scan those roots at aligned 32-byte boundaries. |
+
+The selection is explicit: possessing READ authority does not subscribe a node
+to fetching another person's collection. Shallow hydration follows structurally
+valid records, including signed but WRITE-inert commits; obtaining bytes does
+not admit their claims. Exact WANTs and direct roots run before speculative
+recursive reads, sharing one time budget. The walker retains only positively
+reached `(root, blob)` pairs in a PATCH and one resumable byte cursor. Candidate
+work and speculative requests are bounded per pass; absent candidates do not
+become WANTs or an ever-growing negative frontier. Later sweeps retry them,
+because a DHT miss does not establish absence. Full mode does not recursively
+widen an explicit `WANT(H)` that lies outside the selected collection roots.
+
+A producer can maintain an ordinary `ReferenceSummaryBlob` collection to make
+negative recursive probes cheap. Its mapping scans the complete source blob
+closure and projects referenced handles through the same opaque `KDF(H)` used
+by discovery. Fixed Bloom geometry lives in the descriptor; member join is
+bit-set union. Canonical sparse positive-gap bytes or a shorter dense bit vector
+represent the same value, and a lazy cover view probes their logical union.
+No Peer subtype, new pile record, or network operation is involved.
+
+```rust,ignore
+use triblespace::core::collection::reference_summary::{
+    ReferenceSummaryBlob, ReferenceSummaryLayout,
+};
+
+let summaries = storage.derive::<ReferenceSummaryBlob>(
+    facts,
+    ReferenceSummaryLayout::default(),
+    summary_policy,
+)?;
+// Producer only: all recursively reachable attachments were stored before
+// the source COMMIT. This scan cannot infer that precondition on a replica.
+storage.maintain(summaries).await?;
+```
+
+The source archive's own handle is not automatically inserted: it is a
+materialization identity, not part of the referenced closure. Under the
+complete-producer precondition, projection therefore distributes over source
+union. An incomplete replica cannot distinguish an ordinary inline value from
+a missing reference, and **must not derive a replacement summary locally**.
+
+Consumers explicitly select the summary collection alongside its source. The
+same shallow acquisition obtains known `DERIVE`/`MERGE` outputs; ordinary
+passive collection observation then supplies a resident summary and its support.
+Only descendants of a source data root contained in that support may use its
+negative answers. An older summary cannot filter a newer, uncovered commit;
+the mapping must also read that foundational collection directly, rather than
+some intermediate projection which might have discarded references. Chained
+summaries remain valid collections, but this walker does not apply their
+negatives to the original commit bytes. Likewise,
+metadata, descriptors, and unrelated physical artifacts are not covered merely
+because they belong to the same collection. Missing summaries mean an unfiltered
+walk, not an empty closure. Positive matches still use ordinary exact-H DHT
+discovery and mutual bearer proof. Neither filter possession nor a positive
+answer is read authority.
+
+From the command line, register and maintain on the complete producer:
+
+```text
+trible pile collection derive DATA.pile facts reference-summary --log2-bits 32 --probes 4
+trible pile collection maintain DATA.pile SUMMARY_HANDLE
+```
+
+Then select both handles on a consumer's existing sync command with
+`--replication full`. Merely repairing a source collection does not repair the
+separate derived collection's records. These modes change physical residency,
+not collection identity, authorization, or the union semantics of repair.
+
 ## Wire surface
 
 Protocol version 24 keeps the direct operation set narrow:
@@ -520,7 +598,8 @@ The CLI selects explicit collections and bootstrap peers:
 ```text
 trible pile net sync DATA.pile \
     --collection COLLECTION_HANDLE [--collection COLLECTION_HANDLE ...] \
-    [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only]
+    [--peers ENDPOINT_TICKET ...] [--direction bidirectional|read-only|write-only] \
+    [--replication demand|shallow|full]
 ```
 
 Direction gates only the collection loop: `ReadOnly` pulls collection repair,

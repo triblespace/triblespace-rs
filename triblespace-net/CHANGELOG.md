@@ -9,6 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Add opt-in demand, shallow, and full acquisition policy to the external
+  `Reconciler`. Shallow hydrates selected structural collection-record roots;
+  full streams their aligned recursive references with bounded speculative
+  work and fair rescan passes. Explicit WANTs stay first, implicit dependencies
+  create no WANT records, and all bytes use the unchanged H-only bearer path.
+  Proof possession alone never selects a collection or grants semantic admission.
+
 - Add opt-in `triblespace_net::handoff` tracing across Iroh acceptance,
   socket registration, forwarding, and host dispatch. Stream/opcode events
   require trace level and never include request payloads or blob capabilities.

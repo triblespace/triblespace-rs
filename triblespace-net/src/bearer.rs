@@ -20,7 +20,6 @@ use triblespace_core::repo::BlobStoreList;
 use crate::protocol::RawHash;
 use crate::transport::PeerId;
 
-const LOCATOR_CONTEXT: &str = "triblespace.net/blob-locator/v1";
 const PROVIDER_PROOF_CONTEXT: &[u8] = b"triblespace.net/blob-provider-proof/v1\0";
 const REQUESTER_PROOF_CONTEXT: &[u8] = b"triblespace.net/blob-requester-proof/v1\0";
 
@@ -30,16 +29,7 @@ const REQUESTER_PROOF_CONTEXT: &[u8] = b"triblespace.net/blob-requester-proof/v1
 /// the same 256-bit content-address assumption used by the blob namespace.
 pub(crate) type BearerLocatorIndex = PATCH<32, IdentitySchema, RawHash>;
 
-/// Derive the opaque directory locator disclosed before either endpoint proves `H`.
-///
-/// The handle is a bearer read capability and must remain private. This
-/// domain-separated image may be sent to the provider directory; possession
-/// of the locator alone does not authorize an exact blob read.
-pub fn blob_locator(handle: RawHash) -> RawHash {
-    let mut hasher = blake3::Hasher::new_derive_key(LOCATOR_CONTEXT);
-    hasher.update(&handle);
-    *hasher.finalize().as_bytes()
-}
+pub use triblespace_core::blob::locator::blob_locator;
 
 /// Provider-first proof of knowledge, bound to both TLS endpoint identities.
 pub(crate) fn provider_proof(handle: RawHash, requester: PeerId, provider: PeerId) -> RawHash {

@@ -11,6 +11,8 @@
 mod cache;
 /// Built-in blob encoding types and their conversion implementations.
 pub mod encodings;
+/// Opaque discovery locators which do not disclose bearer blob handles.
+pub mod locator;
 mod memoryblobstore;
 
 use crate::inline::encodings::hash::Handle;
