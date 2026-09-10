@@ -155,6 +155,24 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Maintain one collection's cover: publish the MERGE equations that fold
+    /// its commits into fewer, larger members.
+    ///
+    /// A collection nobody has maintained is read by loading every commit it
+    /// ever received and unioning them; a maintained one is read from a
+    /// handful of merged members plus the commits since. Deterministic and
+    /// idempotent: run again, it publishes nothing new. It appends to the
+    /// pile and needs the ordinary signing key for the merges it signs.
+    Maintain {
+        /// Path to the pile file to modify
+        pile: PathBuf,
+        /// Collection name, or descriptor handle. Use `name:` or `blake3:` to
+        /// disambiguate a name that itself looks like a handle.
+        collection: String,
+        /// Existing durable signing-key file (default: beside the pile)
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// Grant one endpoint unbounded READ access to an existing collection.
     ///
     /// The signing key must be one of the collection descriptor's READ roots.
@@ -216,6 +234,11 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             dry_run,
         } => run_adopt(pile, from, into, key, dry_run),
+        Command::Maintain {
+            pile,
+            collection,
+            key,
+        } => run_maintain(pile, collection, key),
         Command::GrantRead {
             pile,
             collection,
@@ -1646,4 +1669,65 @@ mod tests {
         assert!(!names_collection(&records[0], collection(3)));
         assert!(!names_collection(&records[1], collection(1)));
     }
+}
+
+/// How many commit and merge records name one collection.
+fn cover_census(snapshot: &PileSnapshot, collection: CollectionHandle) -> Result<(usize, usize)> {
+    let mut commits = 0usize;
+    let mut merges = 0usize;
+    let records = snapshot
+        .records()
+        .map_err(|error| anyhow!("enumerate collection records: {error:?}"))?;
+    for record in records {
+        let record = record.map_err(|error| anyhow!("decode collection record: {error:?}"))?;
+        match &record {
+            CollectionRecord::Commit(commit) if commit.collection() == collection => commits += 1,
+            CollectionRecord::Merge(merge) if merge.collection() == collection => merges += 1,
+            _ => {}
+        }
+    }
+    Ok((commits, merges))
+}
+
+fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Result<()> {
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let _signer = triblespace_core::signing_key_file::load_existing(&key_path)
+        .map_err(|error| anyhow!("load signing key {}: {error}", key_path.display()))?;
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<()> {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let rows = enumerate(&snapshot)?;
+        let handle = resolve(&rows, &reference)?;
+        let collection: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
+            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+        let before = cover_census(&snapshot, handle)?;
+        drop(snapshot);
+        let started = std::time::Instant::now();
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let maintained = runtime
+            .block_on(async { pile.maintain(collection).await })
+            .map_err(|error| anyhow!("maintain collection: {error}"))?;
+        drop(maintained);
+        let elapsed = started.elapsed();
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot after maintenance: {error:?}"))?;
+        let after = cover_census(&snapshot, handle)?;
+        println!(
+            "maintained {} in {:.1} s: commits {} -> {}, merges {} -> {}",
+            hex::encode(handle.raw),
+            elapsed.as_secs_f64(),
+            before.0,
+            after.0,
+            before.1,
+            after.1,
+        );
+        Ok(())
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    res.and(close_res)
 }
