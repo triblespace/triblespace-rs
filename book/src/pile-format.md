@@ -62,9 +62,10 @@ pile.
 archives for every kind the current binary writes, which makes those kinds
 resolvable *there*. Content addressing makes the call idempotent, and the
 migration's census distinguishes "already resident" from "left to store" so a
-re-run reports honestly instead of repeating its worklist. Retired PEER and
-STORE_SCOPE kinds remain recognized by their pinned constants and decoder, but
-fresh piles neither write nor advertise those dead formats.
+re-run reports honestly instead of repeating its worklist. Retired PEER,
+STORE_SCOPE and pile-artifact-offer kinds remain recognized by their pinned
+constants and decoder, but fresh piles neither write nor advertise those dead
+formats.
 
 The arithmetic works out exactly. A signed commit contains six 32-byte fields,
 so `64 + 6 × 32 = 256`: one block, nothing wasted. A one-edge capability
@@ -155,8 +156,8 @@ The re-encode is semantic and in source order, which is what makes it faithful:
 - Collection records and capability proofs are grow-only sets, so order is
   irrelevant and re-insertion is idempotent.
 - Records that never carried live state are dropped and counted: inert legacy
-  V3 collection headers, retired PEER and STORE_SCOPE state, retired local
-  cells, and kinds no longer interpreted. This includes retired derivation
+  V3 collection headers, retired PEER, STORE_SCOPE and pile-artifact-offer
+  state, retired local cells, and kinds no longer interpreted. This includes retired derivation
   record generations whose old wire shape cannot express the current
   collection algebra. Current native `MERGE` and `DERIVE` records are grow-only
   materialized work and are preserved exactly; like every retained current

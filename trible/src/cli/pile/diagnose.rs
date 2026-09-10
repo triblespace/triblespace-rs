@@ -886,6 +886,7 @@ fn census(path: &Path) -> Result<()> {
             PileRecordContent::RetiredCollectionDeriveV4 { .. } => ("retired COLLECTION_DERIVE_V4", None),
             PileRecordContent::RetiredPeerEvidenceV1 => ("retired PEER_EVIDENCE_V1", None),
             PileRecordContent::RetiredStoreScopeV1 => ("retired STORE_SCOPE_V1", None),
+            PileRecordContent::RetiredArtifactOfferV1 => ("retired ARTIFACT_OFFER_V1", None),
             PileRecordContent::RetiredWantAssert { .. } => ("retired WANT_ASSERT", None),
             PileRecordContent::RetiredWantRetract { .. } => ("retired WANT_RETRACT", None),
             PileRecordContent::Opaque { kind, .. } => ("OPAQUE", Some(hex::encode_upper(kind.as_ref()))),

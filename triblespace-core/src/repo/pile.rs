@@ -1461,6 +1461,12 @@ pub enum PileRecordContent {
     /// dedicated variant keeps the old kind distinguishable from an unknown
     /// record without reconstructing repository state from it.
     RetiredStoreScopeV1,
+    /// One structurally valid retired pile-artifact-offer record.
+    ///
+    /// The kind was retired without reuse. Current replay treats it as inert
+    /// and semantic rewrites drop it, exactly like the retired team state, so
+    /// a pile that carries them still compacts.
+    RetiredArtifactOfferV1,
     /// One recognized legacy V3 collection header.
     ///
     /// Replay treats this as inert physical evidence. It is excluded from
@@ -1726,6 +1732,16 @@ fn decode_enveloped_record(bytes: &[u8], offset: usize) -> Result<PileRecord, Re
                 offset,
                 len,
                 content: PileRecordContent::RetiredStoreScopeV1,
+            })
+        }
+        record_kind::KIND_ARTIFACT_OFFER_V1 => {
+            // Physical layout only: the body carried an offer nobody reads any
+            // more, so replay spends no work interpreting it.
+            fixed_header()?;
+            Ok(PileRecord {
+                offset,
+                len,
+                content: PileRecordContent::RetiredArtifactOfferV1,
             })
         }
         record_kind::KIND_COLLECTION_COMMIT => {
@@ -2533,6 +2549,7 @@ enum Applied {
     },
     RetiredCapabilityProof,
     RetiredTeamState,
+    RetiredArtifactOffer,
     LegacyCollectionV3,
     RetiredCollectionDeriveV4,
     Opaque,
@@ -3367,6 +3384,7 @@ impl Pile {
             PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
                 Applied::RetiredTeamState
             }
+            PileRecordContent::RetiredArtifactOfferV1 => Applied::RetiredArtifactOffer,
             PileRecordContent::LegacyCollectionV3 { .. } => {
                 let header = legacy_collection_header
                     .expect("legacy collection record must retain its physical header");
@@ -4159,6 +4177,7 @@ impl Pile {
                     Some(Applied::CapabilityProof { .. }) => {}
                     Some(Applied::RetiredCapabilityProof) => {}
                     Some(Applied::RetiredTeamState) => {}
+                    Some(Applied::RetiredArtifactOffer) => {}
                     Some(Applied::LegacyCollectionV3) => {}
                     Some(Applied::RetiredCollectionDeriveV4) => {}
                     Some(Applied::Opaque) => {}
@@ -5098,32 +5117,29 @@ mod tests {
     }
 
     #[test]
-    fn retired_artifact_offer_envelope_is_opaque() {
+    fn retired_artifact_offer_envelope_is_a_known_inert_kind() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "retired-offer.pile");
         let mut retired = [0u8; ENVELOPE_HEADER_LEN];
         retired[..FRAME_MAGIC_LEN].copy_from_slice(&FRAME_MAGIC);
         retired[FRAME_MAGIC_LEN..FRAME_BODY_OFFSET - 32]
             .copy_from_slice(&ENVELOPE_HEADER_BLOCKS.to_le_bytes());
-        // Former pile-artifact-offer-v1 description handle, retired without
-        // reuse. Generic framing still supplies an exact boundary.
-        retired[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET].copy_from_slice(
-            &hex::decode("EA7B185AC83955D2249F4D8C83B6910D44D01C61B4E497C1B66E1B75C3ADCB6F")
-                .unwrap(),
-        );
+        // The pile-artifact-offer-v1 description handle, retired without
+        // reuse: a known inert frame, not an opaque one, so a pile that
+        // carries thousands of them still replays and compacts.
+        retired[FRAME_BODY_OFFSET - 32..FRAME_BODY_OFFSET]
+            .copy_from_slice(&record_kind::KIND_ARTIFACT_OFFER_V1);
         retired[FRAME_BODY_OFFSET..FRAME_BODY_OFFSET + 32].fill(4);
         append_test_bytes(&path, &retired);
 
         let mut pile = Pile::open(&path).unwrap();
-        assert_eq!(pile.opaque_record_count().unwrap(), 1);
+        assert_eq!(pile.opaque_record_count().unwrap(), 0);
         pile.close().unwrap();
 
         let mut records = PileRecords::open(&path).unwrap();
         assert!(matches!(
             records.next().unwrap().unwrap().content,
-            PileRecordContent::Opaque {
-                kind: OpaqueKind::Described(_)
-            }
+            PileRecordContent::RetiredArtifactOfferV1
         ));
         assert!(records.next().is_none());
     }

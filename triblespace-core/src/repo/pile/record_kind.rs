@@ -53,6 +53,12 @@ pub const KIND_PEER_EVIDENCE: RawInline =
 pub const KIND_STORE_SCOPE: RawInline =
     hex_literal::hex!("97C69C746D01741C8012A56F08D2C424E0291B5424EB9CD7637FD4A655C93DFB");
 
+/// Historical pile-artifact-offer kind, retired without reuse. Retained only
+/// so old piles can cross it as a known inert frame: replay ignores it and a
+/// retained rewrite drops it. Fresh piles do not publish or write this kind.
+pub const KIND_ARTIFACT_OFFER_V1: RawInline =
+    hex_literal::hex!("EA7B185AC83955D2249F4D8C83B6910D44D01C61B4E497C1B66E1B75C3ADCB6F");
+
 /// Historical blob-WANT assertion kind. Current replay treats it as inert;
 /// only explicit WANT cutover and semantic reframe consume it.
 pub const KIND_BLOB_WANT_ASSERT: RawInline =

@@ -52,9 +52,9 @@ fn census(path: &Path) -> Result<RecordCensus> {
             PileRecordContent::Want { .. } => census.current_wants += 1,
             PileRecordContent::RetiredWantAssert { .. }
             | PileRecordContent::RetiredWantRetract { .. } => census.retired_want_records += 1,
-            PileRecordContent::RetiredPeerEvidenceV1 | PileRecordContent::RetiredStoreScopeV1 => {
-                census.retired_team_records += 1
-            }
+            PileRecordContent::RetiredPeerEvidenceV1
+            | PileRecordContent::RetiredStoreScopeV1
+            | PileRecordContent::RetiredArtifactOfferV1 => census.retired_team_records += 1,
             PileRecordContent::Opaque { .. } => census.opaque += 1,
             _ => {}
         }
