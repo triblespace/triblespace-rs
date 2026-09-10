@@ -155,6 +155,41 @@ pub enum Command {
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
+    /// Register one derived collection over a source and print its exact handle.
+    ///
+    /// The kind picks the encoding and its mapping. The descriptor then carries
+    /// the source, the mapping and its arguments, which is everything `maintain`
+    /// and every reader need; nothing has to be told twice. As for `init`, the
+    /// existing signing key becomes the direct READ and WRITE root.
+    Derive {
+        /// Path to the pile file to update
+        pile: PathBuf,
+        /// Source collection: name, or descriptor handle
+        source: String,
+        /// What to derive. succinct and rank9 take no arguments; latest takes
+        /// --observes; lww takes --identity and --orders; nvfp4 takes
+        /// --attribute and --dimension.
+        #[arg(value_enum)]
+        kind: DeriveKind,
+        /// latest: the attribute whose GenId values name the state observed
+        #[arg(long)]
+        observes: Option<String>,
+        /// lww: the attribute carrying the register identity
+        #[arg(long)]
+        identity: Option<String>,
+        /// lww: the attribute carrying the register order coordinate
+        #[arg(long)]
+        orders: Option<String>,
+        /// nvfp4: the attribute carrying f32 embedding blobs
+        #[arg(long)]
+        attribute: Option<String>,
+        /// nvfp4: the embedding dimension
+        #[arg(long)]
+        dimension: Option<usize>,
+        /// Existing READ/WRITE-root signing key (default: beside the pile)
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
     /// Maintain one collection's cover: publish the MERGE equations that fold
     /// its commits into fewer, larger members.
     ///
@@ -211,6 +246,21 @@ pub enum Command {
     },
 }
 
+/// The derivations this binary can register from the command line.
+#[derive(Clone, Copy, Debug, clap::ValueEnum)]
+pub enum DeriveKind {
+    /// SuccinctArchiveBlob over a SimpleArchive source
+    Succinct,
+    /// Rank9AcceleratedSuccinctArchiveBlob over a SuccinctArchiveBlob source
+    Rank9,
+    /// LatestBlob over a SimpleArchive source
+    Latest,
+    /// LwwRegisterBlob over a SimpleArchive source
+    Lww,
+    /// NvFp4CosineSet over f32 embeddings in a SimpleArchive source
+    Nvfp4,
+}
+
 pub fn run(cmd: Command) -> Result<()> {
     match cmd {
         Command::Init { pile, name, key } => run_init(pile, name, key),
@@ -234,6 +284,29 @@ pub fn run(cmd: Command) -> Result<()> {
             key,
             dry_run,
         } => run_adopt(pile, from, into, key, dry_run),
+        Command::Derive {
+            pile,
+            source,
+            kind,
+            observes,
+            identity,
+            orders,
+            attribute,
+            dimension,
+            key,
+        } => run_derive(
+            pile,
+            source,
+            kind,
+            DeriveArguments {
+                observes,
+                identity,
+                orders,
+                attribute,
+                dimension,
+            },
+            key,
+        ),
         Command::Maintain {
             pile,
             collection,
@@ -1858,4 +1931,142 @@ fn maintain_nvfp4_embedding_set(
     _handle: CollectionHandle,
 ) -> Result<()> {
     unreachable!("the NVFP4 representation is only recognised with the search feature")
+}
+
+/// The optional per-kind arguments of `derive`, validated by the kind.
+struct DeriveArguments {
+    observes: Option<String>,
+    identity: Option<String>,
+    orders: Option<String>,
+    attribute: Option<String>,
+    dimension: Option<usize>,
+}
+
+fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
+    let text = value.ok_or_else(|| anyhow!("{flag} is required for this kind"))?;
+    Id::from_hex(text.trim())
+        .ok_or_else(|| anyhow!("{flag}: {text:?} is not a 32-hex-digit id"))
+}
+
+fn run_derive(
+    path: PathBuf,
+    source: String,
+    kind: DeriveKind,
+    arguments: DeriveArguments,
+    key: Option<PathBuf>,
+) -> Result<()> {
+    let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
+    let root = triblespace_core::signing_key_file::load_existing(&key_path).map_err(|error| {
+        anyhow!(
+            "load collection-root signing key {}: {error}",
+            key_path.display()
+        )
+    })?;
+    let policy = CollectionPolicy::new(
+        AdmissionPolicy::direct(root.verifying_key()),
+        AdmissionPolicy::direct(root.verifying_key()),
+    );
+
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<CollectionHandle> {
+        let source_handle = {
+            let snapshot = pile
+                .snapshot()
+                .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+            let rows = enumerate(&snapshot)?;
+            resolve(&rows, &source)?
+        };
+        fn open_source<E>(pile: &mut Pile, handle: CollectionHandle) -> Result<Collection<E>>
+        where
+            E: triblespace_core::collection::CollectionEncoding,
+        {
+            let snapshot = pile
+                .snapshot()
+                .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+            Collection::open(&snapshot, handle)
+                .map_err(|error| anyhow!("open source collection descriptor: {error}"))
+        }
+        let registered = |error| anyhow!("register derived collection: {error:?}");
+        let handle = match kind {
+            DeriveKind::Succinct => {
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<SuccinctArchiveBlob>(source, (), policy)
+                    .map_err(registered)?
+                    .handle()
+            }
+            DeriveKind::Rank9 => {
+                let source: Collection<SuccinctArchiveBlob> = open_source(&mut pile, source_handle)?;
+                pile.derive::<Rank9AcceleratedSuccinctArchiveBlob>(source, (), policy)
+                    .map_err(registered)?
+                    .handle()
+            }
+            DeriveKind::Latest => {
+                let observes = parse_attribute_id("--observes", arguments.observes.as_deref())?;
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<triblespace_core::collection::latest::LatestBlob>(source, observes, policy)
+                    .map_err(registered)?
+                    .handle()
+            }
+            DeriveKind::Lww => {
+                let identity = parse_attribute_id("--identity", arguments.identity.as_deref())?;
+                let orders = parse_attribute_id("--orders", arguments.orders.as_deref())?;
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<triblespace_core::collection::lww_register::LwwRegisterBlob>(
+                    source,
+                    (identity, orders),
+                    policy,
+                )
+                .map_err(registered)?
+                .handle()
+            }
+            DeriveKind::Nvfp4 => derive_nvfp4(&mut pile, source_handle, &arguments, policy)?,
+        };
+        Ok(handle)
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    let handle = res.and_then(|handle| close_res.map(|()| handle))?;
+    println!("blake3:{}", handle_hex(handle));
+    Ok(())
+}
+
+#[cfg(feature = "search")]
+fn derive_nvfp4(
+    pile: &mut Pile,
+    source_handle: CollectionHandle,
+    arguments: &DeriveArguments,
+    policy: CollectionPolicy,
+) -> Result<CollectionHandle> {
+    let attribute = parse_attribute_id("--attribute", arguments.attribute.as_deref())?;
+    let dimension = arguments
+        .dimension
+        .ok_or_else(|| anyhow!("--dimension is required for nvfp4"))?;
+    let argument = triblespace_search::nvfp4::NvFp4EmbeddingAttribute::new(attribute, dimension)
+        .map_err(|error| anyhow!("nvfp4 argument: {error}"))?;
+    let source: Collection<SimpleArchive> = {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        Collection::open(&snapshot, source_handle)
+            .map_err(|error| anyhow!("open source collection descriptor: {error}"))?
+    };
+    Ok(pile
+        .derive::<triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding>>(
+            source, argument, policy,
+        )
+        .map_err(|error| anyhow!("register derived collection: {error:?}"))?
+        .handle())
+}
+
+#[cfg(not(feature = "search"))]
+fn derive_nvfp4(
+    _pile: &mut Pile,
+    _source_handle: CollectionHandle,
+    _arguments: &DeriveArguments,
+    _policy: CollectionPolicy,
+) -> Result<CollectionHandle> {
+    Err(anyhow!(
+        "this binary was built without the search feature and cannot register NVFP4 vector sets"
+    ))
 }
