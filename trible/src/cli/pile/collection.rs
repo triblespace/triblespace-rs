@@ -352,6 +352,10 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("SuccinctArchiveBlob")
     } else if id == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
         Some("Rank9AcceleratedSuccinctArchiveBlob")
+    } else if id == <triblespace_core::collection::latest::LatestBlob as MetaDescribe>::id() {
+        Some("LatestBlob")
+    } else if id == <triblespace_core::collection::lww_register::LwwRegisterBlob as MetaDescribe>::id() {
+        Some("LwwRegisterBlob")
     } else {
         None
     }
