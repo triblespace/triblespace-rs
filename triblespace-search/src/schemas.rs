@@ -21,6 +21,8 @@ use std::convert::Infallible;
 use triblespace_core::inline::Encodes;
 
 use anybytes::View;
+use triblespace_core::blob::encodings::tensor::elements::F32;
+use triblespace_core::blob::encodings::tensor::{tensor_blob, Tensor, TensorError, TensorView};
 use triblespace_core::blob::{Blob, BlobEncoding, TryFromBlob};
 use triblespace_core::id::ExclusiveId;
 use triblespace_core::id_hex;
@@ -83,14 +85,20 @@ impl TryFromInline<'_, F32LE> for f32 {
     }
 }
 
-/// An arbitrary-length `[f32]` (little-endian) stored as a blob.
+/// An L2-normalized f32 vector stored as a rank-1 tensor blob.
 ///
-/// HNSW indexes reference embeddings by
-/// [`Handle<Embedding>`][h] so two indexes that embed
-/// the same entity share one on-disk blob. A blob is just the
-/// raw f32 LE bytes, length = `dim × 4`. The dim isn't
-/// recorded in the blob header — the HNSW index that owns the
-/// handle carries it (one `dim` per index).
+/// The bytes are exactly those of [`Tensor<F32, 1>`]: a 256-byte header
+/// whose first eight bytes carry the dimension as a little-endian `u64`,
+/// then the little-endian f32 payload, 256-byte aligned so the GPU path can
+/// alias the mapped pages. So the dimension travels inside the blob and is
+/// validated on read; an index that owns a handle no longer has to be the
+/// only place that knows how long the vector is, and a vector of the wrong
+/// length is refused by the encoding rather than discovered by a reader.
+///
+/// HNSW and flat indexes reference embeddings by [`Handle<Embedding>`][h], so
+/// two indexes that embed the same entity share one on-disk blob, and a
+/// vector stored as a plain rank-1 tensor is the same blob as well. What the
+/// `Embedding` type adds to the tensor is the convention below.
 ///
 /// ### Convention: L2-normalized
 ///
@@ -103,7 +111,9 @@ impl TryFromInline<'_, F32LE> for f32 {
 /// Use [`put_embedding`] to normalize + put in one step.
 ///
 /// Schema id minted via `trible genid`:
-/// `EEC5DFDEA2FFCED70850DF83B03CB62B`.
+/// `F5FC4D1C715921F68B392E4347464CCF`. The earlier id,
+/// `EEC5DFDEA2FFCED70850DF83B03CB62B`, named headerless raw f32 bytes and is
+/// retired without reuse.
 ///
 /// [h]: triblespace_core::inline::encodings::hash::Handle
 pub struct Embedding {}
@@ -112,11 +122,12 @@ impl BlobEncoding for Embedding {}
 
 impl MetaDescribe for Embedding {
     fn describe() -> Fragment {
-        let id = id_hex!("EEC5DFDEA2FFCED70850DF83B03CB62B");
+        let id = id_hex!("F5FC4D1C715921F68B392E4347464CCF");
         entity! { ExclusiveId::force_ref(&id) @
             metadata::name:        "Embedding",
-            metadata::description: "Arbitrary-length [f32] (little-endian) stored as a blob. Used as the L2-normalized vector representation of an entity in HNSW indexes; length = dim × 4, dim isn't recorded in the blob header — the index that owns the handle carries it.",
+            metadata::description: "An L2-normalized f32 vector stored as a rank-1 F32 tensor blob: a 256-byte header carrying the dimension as a little-endian u64, then the little-endian f32 payload, 256-byte aligned. The bytes are exactly those of Tensor<F32, 1>; the type adds the normalization convention.",
             metadata::tag:         metadata::KIND_BLOB_ENCODING,
+            metadata::blob_encoding*: <Tensor<F32, 1> as MetaDescribe>::describe(),
         }
     }
 }
@@ -138,12 +149,67 @@ pub type EmbHandle = triblespace_core::inline::encodings::hash::Handle<Embedding
 /// Decode a blob back into a zero-copy `View<[f32]>`. Fails
 /// iff the blob's byte length isn't a multiple of 4 (malformed)
 /// or the backing buffer can't be aligned to `f32`.
-impl TryFromBlob<Embedding> for View<[f32]> {
-    type Error = anybytes::view::ViewError;
+/// Why an embedding blob could not be read: it is not a well-formed rank-1
+/// F32 tensor, or its payload could not be viewed as `[f32]`.
+#[derive(Debug)]
+pub enum EmbeddingError {
+    Tensor(TensorError),
+    View(anybytes::view::ViewError),
+}
 
-    fn try_from_blob(b: Blob<Embedding>) -> Result<Self, Self::Error> {
-        b.bytes.view()
+impl core::fmt::Display for EmbeddingError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Tensor(error) => write!(f, "embedding is not a rank-1 F32 tensor: {error}"),
+            Self::View(error) => write!(f, "embedding payload is not viewable as [f32]: {error:?}"),
+        }
     }
+}
+
+impl std::error::Error for EmbeddingError {}
+
+impl From<TensorError> for EmbeddingError {
+    fn from(error: TensorError) -> Self {
+        Self::Tensor(error)
+    }
+}
+
+impl From<anybytes::view::ViewError> for EmbeddingError {
+    fn from(error: anybytes::view::ViewError) -> Self {
+        Self::View(error)
+    }
+}
+
+/// The blob's own tensor view: its dimension and its payload bytes.
+fn tensor_view(blob: Blob<Embedding>) -> Result<TensorView, EmbeddingError> {
+    let tensor: Blob<Tensor<F32, 1>> = Blob::new(blob.bytes);
+    Ok(TensorView::try_from_blob(tensor)?)
+}
+
+/// The dimension the blob declares in its header, validated against its
+/// payload length.
+pub fn dimension(blob: Blob<Embedding>) -> Result<usize, EmbeddingError> {
+    Ok(tensor_view(blob)?.elems())
+}
+
+/// Decode a blob back into a zero-copy `View<[f32]>` of its payload.
+/// Fails iff the header and payload disagree, or the payload cannot be
+/// aligned to `f32` (it starts 256 bytes into the blob, so it can whenever the
+/// blob itself is aligned).
+impl TryFromBlob<Embedding> for View<[f32]> {
+    type Error = EmbeddingError;
+    fn try_from_blob(b: Blob<Embedding>) -> Result<Self, Self::Error> {
+        let view = tensor_view(b)?;
+        Ok(view.payload().clone().view()?)
+    }
+}
+
+/// One rank-1 F32 tensor blob over `payload`, whose length is `dimension × 4`
+/// by construction.
+fn embedding_blob(dimension: usize, payload: Vec<u8>) -> Blob<Embedding> {
+    let tensor = tensor_blob::<F32, 1>([dimension as u64], anybytes::Bytes::from_source(payload))
+        .expect("a rank-1 f32 payload built from its own length always fits its header");
+    Blob::new(tensor.bytes)
 }
 
 impl Encodes<View<[f32]>> for Embedding
@@ -153,7 +219,7 @@ where
 {
     type Output = Blob<Embedding>;
     fn encode(source: View<[f32]>) -> Blob<Embedding> {
-        Blob::new(source.bytes())
+        Self::encode(&source[..])
     }
 }
 
@@ -164,13 +230,7 @@ where
 {
     type Output = Blob<Embedding>;
     fn encode(source: Vec<f32>) -> Blob<Embedding> {
-        // f32 is `IntoBytes` (zerocopy) so this is a straight
-        // byte-copy of the `Vec`'s backing storage.
-        let mut bytes = Vec::with_capacity(source.len() * 4);
-        for v in &source {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        Blob::new(bytes.into())
+        Self::encode(&source[..])
     }
 }
 
@@ -185,14 +245,10 @@ where
         for v in source {
             bytes.extend_from_slice(&v.to_le_bytes());
         }
-        Blob::new(bytes.into())
+        embedding_blob(source.len(), bytes)
     }
 }
 
-/// L2-normalize `vec` in place (noop on the zero vector).
-///
-/// Shared by [`put_embedding`] and by the HNSW / Flat query
-/// path, which normalize the query vector the same way.
 pub fn l2_normalize(vec: &mut [f32]) {
     let norm: f32 = vec.iter().map(|&x| x * x).sum::<f32>().sqrt();
     if norm > 0.0 {
@@ -317,4 +373,48 @@ mod tests {
     }
 
     use std::f32;
+}
+
+#[cfg(test)]
+mod embedding_tensor_tests {
+    use super::*;
+    use triblespace_core::blob::encodings::tensor::TENSOR_HEADER_LEN;
+
+    #[test]
+    fn an_embedding_is_a_rank_one_f32_tensor_with_its_dimension_in_the_header() {
+        let blob: Blob<Embedding> = Embedding::encode(vec![0.6_f32, 0.8, 0.0]);
+        assert_eq!(blob.bytes.len(), TENSOR_HEADER_LEN + 3 * 4);
+        assert_eq!(&blob.bytes[..8], &3_u64.to_le_bytes());
+        assert_eq!(dimension(blob.clone()).unwrap(), 3);
+        let view: View<[f32]> = View::try_from_blob(blob.clone()).unwrap();
+        assert_eq!(&view[..], &[0.6, 0.8, 0.0]);
+        let tensor: TensorView =
+            TensorView::try_from_blob(Blob::<Tensor<F32, 1>>::new(blob.bytes)).unwrap();
+        assert_eq!(tensor.dims(), &[3]);
+    }
+
+    #[test]
+    fn headerless_bytes_are_refused() {
+        let raw: Blob<Embedding> = Blob::new(anybytes::Bytes::from_source(vec![0_u8; 12]));
+        assert!(matches!(
+            View::<[f32]>::try_from_blob(raw),
+            Err(EmbeddingError::Tensor(_))
+        ));
+    }
+
+    #[test]
+    fn a_header_that_disagrees_with_its_payload_is_refused() {
+        let mut bytes = vec![0_u8; TENSOR_HEADER_LEN + 8];
+        bytes[..8].copy_from_slice(&3_u64.to_le_bytes());
+        let blob: Blob<Embedding> = Blob::new(anybytes::Bytes::from_source(bytes));
+        assert!(matches!(dimension(blob), Err(EmbeddingError::Tensor(_))));
+    }
+
+    #[test]
+    fn the_same_vector_is_the_same_blob_as_a_plain_tensor() {
+        let embedding: Blob<Embedding> = Embedding::encode(&[1.0_f32, 0.0][..]);
+        let payload = [1.0_f32, 0.0].iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let tensor = tensor_blob::<F32, 1>([2], anybytes::Bytes::from_source(payload)).unwrap();
+        assert_eq!(&embedding.bytes[..], &tensor.bytes[..]);
+    }
 }

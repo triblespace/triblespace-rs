@@ -1032,7 +1032,7 @@ where
         &self,
         from_handle: Inline<EmbHandle>,
         score_floor: f32,
-    ) -> Result<Vec<Inline<EmbHandle>>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<Inline<EmbHandle>>, B::GetError<crate::schemas::EmbeddingError>> {
         let Some(entry) = self.index.entry_point else {
             return Ok(Vec::new());
         };
@@ -1056,7 +1056,7 @@ where
             .collect())
     }
 
-    fn dist_to(&self, q: &[f32], i: u32) -> Result<f32, B::GetError<anybytes::view::ViewError>> {
+    fn dist_to(&self, q: &[f32], i: u32) -> Result<f32, B::GetError<crate::schemas::EmbeddingError>> {
         let raw = *self.index.handles.get(i as usize).expect("in range");
         let handle: Inline<EmbHandle> = Inline::new(raw);
         let view = self.cache.get(handle)?;
@@ -1068,7 +1068,7 @@ where
         q: &[f32],
         entry: u32,
         layer: u8,
-    ) -> Result<u32, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<u32, B::GetError<crate::schemas::EmbeddingError>> {
         let mut curr = entry;
         let mut curr_dist = self.dist_to(q, curr)?;
         loop {
@@ -1101,7 +1101,7 @@ where
         entry: u32,
         ef: usize,
         layer: u8,
-    ) -> Result<Vec<(u32, f32)>, B::GetError<anybytes::view::ViewError>> {
+    ) -> Result<Vec<(u32, f32)>, B::GetError<crate::schemas::EmbeddingError>> {
         use std::collections::{BinaryHeap, HashSet};
         let mut visited: HashSet<u32> = HashSet::new();
         visited.insert(entry);
