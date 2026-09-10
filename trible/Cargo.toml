@@ -54,6 +54,9 @@ tempfile = "3.24.0"
 blake3 = "1.8.3"
 
 [features]
-# Maintain and name NVFP4 vector sets. Off by default: the search crate brings the
-# whole model crate with it, which the custody daemon has no use for.
+default = ["search"]
+# Maintain and name NVFP4 vector sets. On by default so the one binary can create
+# and maintain every collection kind from the command line; the price is that
+# the search crate brings the model crate with it. Build with
+# --no-default-features for a lean daemon.
 search = ["dep:triblespace-search"]
