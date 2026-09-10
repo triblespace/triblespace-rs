@@ -356,6 +356,8 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("LatestBlob")
     } else if id == <triblespace_core::collection::lww_register::LwwRegisterBlob as MetaDescribe>::id() {
         Some("LwwRegisterBlob")
+    } else if id == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
+        Some("PathSummaryBlob")
     } else {
         None
     }
@@ -385,6 +387,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         Some("LATEST_STATES_MAPPING_V1")
     } else if id == REGISTER_COORDINATES_MAPPING_V1 {
         Some("REGISTER_COORDINATES_MAPPING_V1")
+    } else if id == triblespace_paths::REGULAR_PATH_MAPPING_V1 {
+        Some("REGULAR_PATH_MAPPING_V1")
     } else {
         None
     }
@@ -1737,6 +1741,8 @@ fn maintain_by_representation(
         go::<LatestBlob>(pile, snapshot, handle)
     } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
         go::<LwwRegisterBlob>(pile, snapshot, handle)
+    } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
+        go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle)
     } else {
         Err(anyhow!(
             "representation {representation:X} is not implemented by this binary; \
