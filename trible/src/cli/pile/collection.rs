@@ -47,7 +47,7 @@ use triblespace_core::id::Id;
 use triblespace_core::inline::encodings::hash::{Blake3, Handle, Hash};
 use triblespace_core::inline::Inline;
 use triblespace_core::metadata::MetaDescribe;
-use triblespace_core::repo::pile::PileSnapshot;
+use triblespace_core::repo::pile::{Pile, PileSnapshot};
 use triblespace_core::repo::{BlobStoreGet, BlobStoreMeta, SnapshotSource};
 use triblespace_core::trible::TribleSet;
 
@@ -1689,6 +1689,58 @@ fn cover_census(snapshot: &PileSnapshot, collection: CollectionHandle) -> Result
     Ok((commits, merges))
 }
 
+/// Maintain `handle` under whichever encoding its descriptor names.
+///
+/// The descriptor is the whole of the information needed: a root names its
+/// blob representation, a derivation names its source and mapping as well,
+/// and `Collection::open` checks the typed handle against those facts. What
+/// a binary cannot do is maintain an encoding it was not compiled with, so
+/// the dispatch asks each encoding this binary implements for its own id,
+/// exactly as [`representation_name`] does, and reports an unknown one
+/// rather than guessing.
+fn maintain_by_representation(
+    pile: &mut Pile,
+    snapshot: &PileSnapshot,
+    handle: CollectionHandle,
+    representation: Id,
+) -> Result<()> {
+    use triblespace_core::collection::latest::LatestBlob;
+    use triblespace_core::collection::lww_register::LwwRegisterBlob;
+    use triblespace_core::collection::CollectionRealization;
+
+    fn go<T>(pile: &mut Pile, snapshot: &PileSnapshot, handle: CollectionHandle) -> Result<()>
+    where
+        T: CollectionRealization + MetaDescribe,
+        Handle<T>: triblespace_core::inline::InlineEncoding,
+    {
+        let collection: Collection<T> = Collection::open(snapshot, handle)
+            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+        let maintained = runtime
+            .block_on(async { pile.maintain(collection).await })
+            .map_err(|error| anyhow!("maintain collection: {error}"))?;
+        drop(maintained);
+        Ok(())
+    }
+
+    if representation == <SimpleArchive as MetaDescribe>::id() {
+        go::<SimpleArchive>(pile, snapshot, handle)
+    } else if representation == <SuccinctArchiveBlob as MetaDescribe>::id() {
+        go::<SuccinctArchiveBlob>(pile, snapshot, handle)
+    } else if representation == <Rank9AcceleratedSuccinctArchiveBlob as MetaDescribe>::id() {
+        go::<Rank9AcceleratedSuccinctArchiveBlob>(pile, snapshot, handle)
+    } else if representation == <LatestBlob as MetaDescribe>::id() {
+        go::<LatestBlob>(pile, snapshot, handle)
+    } else if representation == <LwwRegisterBlob as MetaDescribe>::id() {
+        go::<LwwRegisterBlob>(pile, snapshot, handle)
+    } else {
+        Err(anyhow!(
+            "representation {representation:X} is not implemented by this binary; \
+             nothing here can maintain it"
+        ))
+    }
+}
+
 fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Result<()> {
     let key_path = triblespace_core::signing_key_file::resolve_path(key.as_deref(), &path);
     let _signer = triblespace_core::signing_key_file::load_existing(&key_path)
@@ -1700,16 +1752,18 @@ fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Resul
             .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
         let rows = enumerate(&snapshot)?;
         let handle = resolve(&rows, &reference)?;
-        let collection: Collection<SimpleArchive> = Collection::open(&snapshot, handle)
-            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+        let representation = match Fields::load(&snapshot, handle) {
+            Fields::Decoded { facts, .. } => descriptor::representation(&facts)
+                .map_err(|error| anyhow!("read collection representation: {error:?}"))?,
+            Fields::Missing => return Err(anyhow!("collection descriptor blob is not resident")),
+            Fields::Undecodable(error) => {
+                return Err(anyhow!("collection descriptor is not readable: {error}"))
+            }
+        };
         let before = cover_census(&snapshot, handle)?;
-        drop(snapshot);
         let started = std::time::Instant::now();
-        let runtime = tokio::runtime::Builder::new_current_thread().build()?;
-        let maintained = runtime
-            .block_on(async { pile.maintain(collection).await })
-            .map_err(|error| anyhow!("maintain collection: {error}"))?;
-        drop(maintained);
+        maintain_by_representation(&mut pile, &snapshot, handle, representation)?;
+        drop(snapshot);
         let elapsed = started.elapsed();
         let snapshot = pile
             .snapshot()
