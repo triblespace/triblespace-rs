@@ -113,6 +113,7 @@ pub mod ring;
 pub mod schemas;
 #[cfg(feature = "succinct")]
 pub mod succinct;
+pub mod text_bm25;
 pub mod tokens;
 
 /// Reference implementations for tests and benchmarks.

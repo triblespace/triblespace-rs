@@ -172,7 +172,7 @@ pub enum Command {
         /// What to derive. succinct and rank9 take no arguments; latest takes
         /// --observes; lww takes --identity and --orders; nvfp4 takes
         /// --attribute and --dimension. reference-summary takes --log2-bits
-        /// and --probes (defaults: 32 and 4).
+        /// and --probes (defaults: 32 and 4); bm25 takes --text and --tokenizer.
         #[arg(value_enum)]
         kind: DeriveKind,
         /// latest: the attribute whose GenId values name the state observed
@@ -196,6 +196,12 @@ pub enum Command {
         /// reference-summary: fixed number of Bloom probes per locator
         #[arg(long)]
         probes: Option<u8>,
+        /// bm25: the attribute carrying UTF8String text blobs
+        #[arg(long)]
+        text: Option<String>,
+        /// bm25: how to cut the texts: word, bigram or code
+        #[arg(long, default_value = "word")]
+        tokenizer: String,
         /// Existing READ/WRITE-root signing key (default: beside the pile)
         #[arg(long)]
         key: Option<PathBuf>,
@@ -272,6 +278,8 @@ pub enum DeriveKind {
     Nvfp4,
     /// Recursive blob-reference Bloom summary; maintain only with complete producer closure
     ReferenceSummary,
+    /// PortableBM25Blob over UTF8String texts in a SimpleArchive source
+    Bm25,
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -308,6 +316,8 @@ pub fn run(cmd: Command) -> Result<()> {
             dimension,
             log2_bits,
             probes,
+            text,
+            tokenizer,
             key,
         } => run_derive(
             pile,
@@ -321,6 +331,8 @@ pub fn run(cmd: Command) -> Result<()> {
                 dimension,
                 log2_bits,
                 probes,
+                text,
+                tokenizer,
             },
             key,
         ),
@@ -454,7 +466,34 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("PathSummaryBlob")
     } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| id == nvfp4) {
         Some("NvFp4CosineSet<Embedding>")
+    } else if bm25_carrier_id().is_some_and(|bm25| id == bm25) {
+        Some("PortableBM25Blob")
     } else {
+        None
+    }
+}
+
+/// The representation id of the portable BM25 carrier, with the `search`
+/// feature; `None` otherwise.
+fn bm25_carrier_id() -> Option<Id> {
+    #[cfg(feature = "search")]
+    {
+        Some(<triblespace_search::portable_bm25::PortableBM25Blob as MetaDescribe>::id())
+    }
+    #[cfg(not(feature = "search"))]
+    {
+        None
+    }
+}
+
+/// The text-attribute-to-BM25 mapping id, under the same feature.
+fn bm25_mapping_id() -> Option<Id> {
+    #[cfg(feature = "search")]
+    {
+        Some(triblespace_search::text_bm25::TEXT_ATTRIBUTE_TO_BM25)
+    }
+    #[cfg(not(feature = "search"))]
+    {
         None
     }
 }
@@ -517,6 +556,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         Some("REGULAR_PATH_MAPPING_V1")
     } else if nvfp4_mapping_id().is_some_and(|nvfp4| id == nvfp4) {
         Some("EMBEDDING_ATTRIBUTE_TO_NVFP4")
+    } else if bm25_mapping_id().is_some_and(|bm25| id == bm25) {
+        Some("TEXT_ATTRIBUTE_TO_BM25")
     } else {
         None
     }
@@ -1890,6 +1931,8 @@ fn maintain_by_representation(
         // own representation id, so this arm covers exactly the f32 Embedding
         // rows the faculties write. Only built with the `search` feature.
         maintain_nvfp4_embedding_set(pile, snapshot, handle)
+    } else if bm25_carrier_id().is_some_and(|bm25| representation == bm25) {
+        maintain_bm25(pile, snapshot, handle)
     } else {
         Err(anyhow!(
             "representation {representation:X} is not implemented by this binary; \
@@ -1980,6 +2023,8 @@ struct DeriveArguments {
     dimension: Option<usize>,
     log2_bits: Option<u8>,
     probes: Option<u8>,
+    text: Option<String>,
+    tokenizer: String,
 }
 
 fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
@@ -2072,6 +2117,7 @@ fn run_derive(
                     .map_err(registered)?
                     .handle()
             }
+            DeriveKind::Bm25 => derive_bm25(&mut pile, source_handle, &arguments, policy)?,
         };
         Ok(handle)
     })();
@@ -2120,5 +2166,72 @@ fn derive_nvfp4(
 ) -> Result<CollectionHandle> {
     Err(anyhow!(
         "this binary was built without the search feature and cannot register NVFP4 vector sets"
+    ))
+}
+
+#[cfg(feature = "search")]
+fn maintain_bm25(pile: &mut Pile, snapshot: &PileSnapshot, handle: CollectionHandle) -> Result<()> {
+    use triblespace_core::collection::CollectionStoreExt as _;
+    let collection: Collection<triblespace_search::portable_bm25::PortableBM25Blob> =
+        Collection::open(snapshot, handle)
+            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let maintained = runtime
+        .block_on(async { pile.maintain(collection).await })
+        .map_err(|error| anyhow!("maintain collection: {error}"))?;
+    drop(maintained);
+    Ok(())
+}
+
+#[cfg(not(feature = "search"))]
+fn maintain_bm25(
+    _pile: &mut Pile,
+    _snapshot: &PileSnapshot,
+    _handle: CollectionHandle,
+) -> Result<()> {
+    unreachable!("the BM25 representation is only recognised with the search feature")
+}
+
+#[cfg(feature = "search")]
+fn derive_bm25(
+    pile: &mut Pile,
+    source_handle: CollectionHandle,
+    arguments: &DeriveArguments,
+    policy: CollectionPolicy,
+) -> Result<CollectionHandle> {
+    use triblespace_search::text_bm25::{Bm25Tokenizer, TextAttributeToBm25};
+    let attribute = parse_attribute_id("--text", arguments.text.as_deref())?;
+    let tokenizer = Bm25Tokenizer::from_name(&arguments.tokenizer).ok_or_else(|| {
+        anyhow!(
+            "--tokenizer {:?} is not one of word, bigram, code",
+            arguments.tokenizer
+        )
+    })?;
+    let argument = TextAttributeToBm25 {
+        attribute,
+        tokenizer,
+    };
+    let source: Collection<SimpleArchive> = {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        Collection::open(&snapshot, source_handle)
+            .map_err(|error| anyhow!("open source collection descriptor: {error}"))?
+    };
+    Ok(pile
+        .derive::<triblespace_search::portable_bm25::PortableBM25Blob>(source, argument, policy)
+        .map_err(|error| anyhow!("register derived collection: {error:?}"))?
+        .handle())
+}
+
+#[cfg(not(feature = "search"))]
+fn derive_bm25(
+    _pile: &mut Pile,
+    _source_handle: CollectionHandle,
+    _arguments: &DeriveArguments,
+    _policy: CollectionPolicy,
+) -> Result<CollectionHandle> {
+    Err(anyhow!(
+        "this binary was built without the search feature and cannot register BM25 collections"
     ))
 }
