@@ -358,7 +358,35 @@ fn representation_name(id: Id) -> Option<&'static str> {
         Some("LwwRegisterBlob")
     } else if id == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         Some("PathSummaryBlob")
+    } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| id == nvfp4) {
+        Some("NvFp4CosineSet<Embedding>")
     } else {
+        None
+    }
+}
+
+/// The representation id of the NVFP4 vector set over f32 embeddings, when
+/// this binary was built with the `search` feature; `None` otherwise, so the
+/// listing prints the bare id instead of a name it cannot stand behind.
+fn nvfp4_embedding_set_id() -> Option<Id> {
+    #[cfg(feature = "search")]
+    {
+        Some(<triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding> as MetaDescribe>::id())
+    }
+    #[cfg(not(feature = "search"))]
+    {
+        None
+    }
+}
+
+/// The NVFP4 mapping-algorithm id, under the same feature.
+fn nvfp4_mapping_id() -> Option<Id> {
+    #[cfg(feature = "search")]
+    {
+        Some(triblespace_search::nvfp4::EMBEDDING_ATTRIBUTE_TO_NVFP4)
+    }
+    #[cfg(not(feature = "search"))]
+    {
         None
     }
 }
@@ -389,6 +417,8 @@ fn mapping_algorithm_name(id: Id) -> Option<&'static str> {
         Some("REGISTER_COORDINATES_MAPPING_V1")
     } else if id == triblespace_paths::REGULAR_PATH_MAPPING_V1 {
         Some("REGULAR_PATH_MAPPING_V1")
+    } else if nvfp4_mapping_id().is_some_and(|nvfp4| id == nvfp4) {
+        Some("EMBEDDING_ATTRIBUTE_TO_NVFP4")
     } else {
         None
     }
@@ -1743,6 +1773,12 @@ fn maintain_by_representation(
         go::<LwwRegisterBlob>(pile, snapshot, handle)
     } else if representation == <triblespace_paths::PathSummaryBlob as MetaDescribe>::id() {
         go::<triblespace_paths::PathSummaryBlob>(pile, snapshot, handle)
+    } else if nvfp4_embedding_set_id().is_some_and(|nvfp4| representation == nvfp4) {
+        // The vector set is generic over the embedding blob encoding, and the
+        // descriptor names that encoding as well; each instantiation has its
+        // own representation id, so this arm covers exactly the f32 Embedding
+        // rows the faculties write. Only built with the `search` feature.
+        maintain_nvfp4_embedding_set(pile, snapshot, handle)
     } else {
         Err(anyhow!(
             "representation {representation:X} is not implemented by this binary; \
@@ -1794,4 +1830,32 @@ fn run_maintain(path: PathBuf, reference: String, key: Option<PathBuf>) -> Resul
         .close()
         .map_err(|error| anyhow!("pile close: {error:?}"));
     res.and(close_res)
+}
+
+#[cfg(feature = "search")]
+fn maintain_nvfp4_embedding_set(
+    pile: &mut Pile,
+    snapshot: &PileSnapshot,
+    handle: CollectionHandle,
+) -> Result<()> {
+    use triblespace_core::collection::CollectionStoreExt as _;
+    let collection: Collection<
+        triblespace_search::nvfp4::NvFp4CosineSet<triblespace_search::schemas::Embedding>,
+    > = Collection::open(snapshot, handle)
+        .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_current_thread().build()?;
+    let maintained = runtime
+        .block_on(async { pile.maintain(collection).await })
+        .map_err(|error| anyhow!("maintain collection: {error}"))?;
+    drop(maintained);
+    Ok(())
+}
+
+#[cfg(not(feature = "search"))]
+fn maintain_nvfp4_embedding_set(
+    _pile: &mut Pile,
+    _snapshot: &PileSnapshot,
+    _handle: CollectionHandle,
+) -> Result<()> {
+    unreachable!("the NVFP4 representation is only recognised with the search feature")
 }
