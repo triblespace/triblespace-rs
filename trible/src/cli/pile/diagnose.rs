@@ -60,6 +60,14 @@ pub enum Command {
         /// Exact byte offset where a record header is expected
         offset: usize,
     },
+    /// Count every record in a pile by kind, with the bytes each kind occupies.
+    ///
+    /// Opaque records are listed by their marker, so a refusal to compact can
+    /// be read: which kinds are unknown here, and how much of the file they are.
+    Census {
+        /// Path to the pile file to inspect
+        pile: PathBuf,
+    },
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -67,6 +75,7 @@ pub fn run(cmd: Command) -> Result<()> {
         Command::Check { pile, fail_fast } => check(&pile, fail_fast),
         Command::LocateHash { pile, handle } => locate_hash_in_pile(&pile, &handle),
         Command::RecordAt { pile, offset } => record_at(&pile, offset),
+        Command::Census { pile } => census(&pile),
     }
 }
 
@@ -836,6 +845,97 @@ fn locate_hash_in_pile(pile_path: &Path, handle: &str) -> Result<()> {
     if let Some(err) = parse_error {
         println!("  parse stopped:  {err}");
         anyhow::bail!("pile contains an unreadable record: {err}");
+    }
+    Ok(())
+}
+
+/// Every record by kind: how many, and how many bytes of the file they are.
+fn census(path: &Path) -> Result<()> {
+    use std::collections::BTreeMap;
+    use triblespace_core::repo::pile::{PileRecordContent, PileRecords};
+
+    let mut records = PileRecords::open(path).map_err(|error| super::pile_read_error(path, error))?;
+    let total = records.bytes().len() as u64;
+    let mut kinds: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut opaque: BTreeMap<String, (u64, u64)> = BTreeMap::new();
+    let mut first_opaque: BTreeMap<String, usize> = BTreeMap::new();
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut duplicate_blobs: (u64, u64) = (0, 0);
+    let mut duplicates_by_day: BTreeMap<u64, (u64, u64)> = BTreeMap::new();
+    while let Some(record) = records.next() {
+        let record = record.map_err(|error| super::pile_read_error(path, error))?;
+        if let PileRecordContent::Blob { hash, timestamp, .. } = &record.content {
+            if !seen.insert(hash.raw) {
+                duplicate_blobs.0 += 1;
+                duplicate_blobs.1 += record.len as u64;
+                let day = timestamp / 86_400_000;
+                let entry = duplicates_by_day.entry(day).or_insert((0, 0));
+                entry.0 += 1;
+                entry.1 += record.len as u64;
+            }
+        }
+        let (kind, is_opaque) = match &record.content {
+            PileRecordContent::Blob { .. } => ("BLOB", None),
+            PileRecordContent::Collection { .. } => ("COLLECTION", None),
+            PileRecordContent::CapabilityProof { .. } => ("CAPABILITY_PROOF", None),
+            PileRecordContent::Want { .. } => ("WANT", None),
+            PileRecordContent::Branch { .. } => ("legacy BRANCH", None),
+            PileRecordContent::BranchTombstone { .. } => ("legacy BRANCH_TOMBSTONE", None),
+            PileRecordContent::LegacyCollectionV3 { .. } => ("legacy COLLECTION_V3", None),
+            PileRecordContent::RetiredCapabilityProof { .. } => ("retired CAPABILITY_PROOF", None),
+            PileRecordContent::RetiredCollectionDeriveV4 { .. } => ("retired COLLECTION_DERIVE_V4", None),
+            PileRecordContent::RetiredPeerEvidenceV1 => ("retired PEER_EVIDENCE_V1", None),
+            PileRecordContent::RetiredStoreScopeV1 => ("retired STORE_SCOPE_V1", None),
+            PileRecordContent::RetiredWantAssert { .. } => ("retired WANT_ASSERT", None),
+            PileRecordContent::RetiredWantRetract { .. } => ("retired WANT_RETRACT", None),
+            PileRecordContent::Opaque { kind, .. } => ("OPAQUE", Some(hex::encode_upper(kind.as_ref()))),
+            _ => ("other", None),
+        };
+        let entry = kinds.entry(kind.to_owned()).or_insert((0, 0));
+        entry.0 += 1;
+        entry.1 += record.len as u64;
+        if let Some(marker) = is_opaque {
+            let entry = opaque.entry(marker.clone()).or_insert((0, 0));
+            entry.0 += 1;
+            entry.1 += record.len as u64;
+            first_opaque.entry(marker).or_insert(record.offset);
+        }
+    }
+    println!("{} bytes in {}", total, path.display());
+    println!("{:<34} {:>10} {:>16} {:>7}", "kind", "records", "bytes", "share");
+    for (kind, (count, bytes)) in &kinds {
+        println!(
+            "{:<34} {:>10} {:>16} {:>6.1}%",
+            kind,
+            count,
+            bytes,
+            *bytes as f64 * 100.0 / total.max(1) as f64
+        );
+    }
+    println!(
+        "{:<34} {:>10} {:>16} {:>6.1}%   (a second or later record of a blob already present; distinct blobs {})",
+        "  of which duplicate BLOB",
+        duplicate_blobs.0,
+        duplicate_blobs.1,
+        duplicate_blobs.1 as f64 * 100.0 / total.max(1) as f64,
+        seen.len()
+    );
+    if !duplicates_by_day.is_empty() {
+        println!();
+        println!("duplicate BLOB records by insertion day (days since 1970-01-01, UTC):");
+        for (day, (count, bytes)) in &duplicates_by_day {
+            println!("  day {} {:>10} {:>16}", day, count, bytes);
+        }
+    }
+    if !opaque.is_empty() {
+        println!();
+        println!("opaque records by marker (first offset in brackets):");
+        for (marker, (count, bytes)) in &opaque {
+            println!(
+                "  {} {:>10} {:>16} [{}]",
+                marker, count, bytes, first_opaque[marker]
+            );
+        }
     }
     Ok(())
 }
