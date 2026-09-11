@@ -206,6 +206,28 @@ pub enum Command {
         #[arg(long)]
         key: Option<PathBuf>,
     },
+    /// Search a maintained BM25 collection from the command line.
+    ///
+    /// Reads the collection's exact cover, merges its carriers, cuts the query
+    /// with the tokenizer the descriptor names, and prints the best documents
+    /// (entities of the source collection) with their BM25 scores. With
+    /// --snippet, also prints the start of each hit's text, read from the
+    /// source collection through the attribute the descriptor names. Needs
+    /// the search feature.
+    Search {
+        /// Path to the pile file to read
+        pile: PathBuf,
+        /// BM25 collection: name, or descriptor handle
+        collection: String,
+        /// The query text
+        query: String,
+        /// How many hits to print
+        #[arg(long, default_value_t = 10)]
+        top: usize,
+        /// Print the first characters of each hit's text
+        #[arg(long)]
+        snippet: bool,
+    },
     /// Maintain one collection's cover: publish the MERGE equations that fold
     /// its commits into fewer, larger members.
     ///
@@ -336,6 +358,13 @@ pub fn run(cmd: Command) -> Result<()> {
             },
             key,
         ),
+        Command::Search {
+            pile,
+            collection,
+            query,
+            top,
+            snippet,
+        } => run_search(pile, collection, query, top, snippet),
         Command::Maintain {
             pile,
             collection,
@@ -2233,5 +2262,167 @@ fn derive_bm25(
 ) -> Result<CollectionHandle> {
     Err(anyhow!(
         "this binary was built without the search feature and cannot register BM25 collections"
+    ))
+}
+
+#[cfg(feature = "search")]
+fn run_search(path: PathBuf, reference: String, query: String, top: usize, snippet: bool) -> Result<()> {
+    use anybytes::View;
+    use triblespace_core::blob::encodings::utf8string::UTF8String;
+    use triblespace_core::collection::{CollectionDerivation, CollectionSnapshotExt};
+    use triblespace_core::inline::encodings::genid::GenId;
+    use triblespace_core::trible::TRIBLE_LEN;
+    use triblespace_search::portable_bm25::{PortableBM25Blob, PortableBM25Index};
+    use triblespace_search::text_bm25::Bm25Tokenizer;
+    use triblespace_search::tokens::{bigram_tokens, code_tokens, hash_tokens, BigramHash, WordHash};
+
+    let mut pile = open_refreshed(&path)?;
+    let res = (|| -> Result<()> {
+        let snapshot = pile
+            .snapshot()
+            .map_err(|error| anyhow!("pile snapshot: {error:?}"))?;
+        let rows = enumerate(&snapshot)?;
+        let handle = resolve(&rows, &reference)?;
+        let collection: Collection<PortableBM25Blob> = Collection::open(&snapshot, handle)
+            .map_err(|error| anyhow!("open collection descriptor: {error}"))?;
+        // The descriptor says how the texts were cut and where they came from.
+        let descriptor: Blob<SimpleArchive> = snapshot
+            .get(handle)
+            .map_err(|error| anyhow!("read descriptor: {error}"))?;
+        let descriptor = Fragment::from(
+            <TribleSet as TryFromBlob<SimpleArchive>>::try_from_blob(descriptor)
+                .map_err(|error| anyhow!("decode descriptor: {error:?}"))?,
+        );
+        let argument = PortableBM25Blob::bind(&Fragment::empty(), &descriptor)
+            .map_err(|error| anyhow!("bind BM25 mapping: {error}"))?;
+        let source = triblespace_core::collection::descriptor::source(descriptor.facts())
+            .map_err(|error| anyhow!("read source: {error:?}"))?
+            .ok_or_else(|| anyhow!("BM25 descriptor names no source collection"))?;
+
+        // A derived collection is attached under its SOURCE's admitted cover:
+        // that is the foundational support the maintenance realised it from.
+        let source_collection: Collection<SimpleArchive> = Collection::open(&snapshot, source)
+            .map_err(|error| anyhow!("open source descriptor: {error}"))?;
+        let support = source_collection
+            .admitted(&snapshot)
+            .map_err(|error| anyhow!("admitted source support: {error:?}"))?;
+        let view = snapshot
+            .collection_exact(collection, &support)
+            .map_err(|error| anyhow!("attach cover: {error:?}"))?;
+        let members: Vec<_> = view.cover().members().collect();
+        if members.is_empty() {
+            println!("the collection has no members yet; run 'collection maintain' first");
+            return Ok(());
+        }
+        let mut carriers = Vec::with_capacity(members.len());
+        for member in &members {
+            let blob: Blob<PortableBM25Blob> = snapshot
+                .get(*member)
+                .map_err(|error| anyhow!("read member: {error}"))?;
+            carriers.push(blob.bytes);
+        }
+
+        // Score under the tokenizer the descriptor names; the carrier bytes are
+        // the same grammar whichever term space they hold.
+        let hits: Vec<(Inline<GenId>, f32)> = match argument.tokenizer {
+            Bm25Tokenizer::Bigram => {
+                let indexes = carriers
+                    .iter()
+                    .map(|bytes| PortableBM25Index::<GenId, BigramHash>::from_bytes(bytes.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| anyhow!("decode carrier: {error}"))?;
+                let index = PortableBM25Index::<GenId, BigramHash>::merge(indexes.iter())
+                    .map_err(|error| anyhow!("merge carriers: {error}"))?;
+                index.query_multi(&bigram_tokens(&query))
+            }
+            Bm25Tokenizer::Word | Bm25Tokenizer::Code => {
+                let indexes = carriers
+                    .iter()
+                    .map(|bytes| PortableBM25Index::<GenId, WordHash>::from_bytes(bytes.clone()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| anyhow!("decode carrier: {error}"))?;
+                let index = PortableBM25Index::<GenId, WordHash>::merge(indexes.iter())
+                    .map_err(|error| anyhow!("merge carriers: {error}"))?;
+                let terms = if argument.tokenizer == Bm25Tokenizer::Code {
+                    code_tokens(&query)
+                } else {
+                    hash_tokens(&query)
+                };
+                index.query_multi(&terms)
+            }
+        };
+        let mut hits = hits;
+        hits.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+        hits.truncate(top);
+
+        // Snippets come from the source facts through the descriptor's attribute.
+        let texts: std::collections::HashMap<[u8; 16], [u8; 32]> = if snippet {
+            let facts: TribleSet = snapshot
+                .collection_exact(source_collection, &support)
+                .map_err(|error| anyhow!("attach source: {error:?}"))?
+                .view::<TribleSet>()
+                .map_err(|error| anyhow!("view source: {error:?}"))?;
+            let blob: Blob<SimpleArchive> = facts.to_blob();
+            let mut map = std::collections::HashMap::new();
+            for trible in blob.bytes.as_ref().chunks_exact(TRIBLE_LEN) {
+                if trible[16..32] == argument.attribute[..] {
+                    let entity: [u8; 16] = trible[..16].try_into().unwrap();
+                    let value: [u8; 32] = trible[32..].try_into().unwrap();
+                    map.entry(entity).or_insert(value);
+                }
+            }
+            map
+        } else {
+            Default::default()
+        };
+
+        println!(
+            "{} hit(s) for {:?} over {} carrier(s), tokenizer {}",
+            hits.len(),
+            query,
+            members.len(),
+            argument.tokenizer.name()
+        );
+        for (document, score) in hits {
+            let entity: &Id = document
+                .try_from_inline()
+                .map_err(|error| anyhow!("document key is not an entity id: {error:?}"))?;
+            let line = format!("{score:>8.3}  {entity:X}");
+            if let Some(handle) = texts.get(&entity.raw()) {
+                let text = snapshot
+                    .get(Inline::<Handle<UTF8String>>::new(*handle))
+                    .ok()
+                    .and_then(|blob: Blob<UTF8String>| View::<str>::try_from_blob(blob).ok())
+                    .map(|view| {
+                        let flat: String = view.split_whitespace().collect::<Vec<_>>().join(" ");
+                        clip_chars(&flat, 110)
+                    })
+                    .unwrap_or_default();
+                println!("{line}  {text}");
+            } else {
+                println!("{line}");
+            }
+        }
+        Ok(())
+    })();
+    let close_res = pile
+        .close()
+        .map_err(|error| anyhow!("pile close: {error:?}"));
+    res.and(close_res)
+}
+
+#[cfg(feature = "search")]
+fn clip_chars(text: &str, limit: usize) -> String {
+    let mut out: String = text.chars().take(limit).collect();
+    if text.chars().count() > limit {
+        out.push('…');
+    }
+    out
+}
+
+#[cfg(not(feature = "search"))]
+fn run_search(_path: PathBuf, _reference: String, _query: String, _top: usize, _snippet: bool) -> Result<()> {
+    Err(anyhow!(
+        "this binary was built without the search feature and cannot search BM25 collections"
     ))
 }
