@@ -14,13 +14,14 @@ pub use triblespace_gpu as gpu;
 pub mod macros {
     pub use triblespace_core::macros::id_hex;
     pub use triblespace_macros::{
-        attributes, entity, exists, find, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, path_expr, pattern, pattern_changes, value_formatter,
     };
 }
 
 pub mod prelude {
     pub use crate::macros::{
-        attributes, entity, exists, find, id_hex, pattern, pattern_changes, value_formatter,
+        attributes, entity, exists, find, id_hex, path_expr, pattern, pattern_changes,
+        value_formatter,
     };
     pub use triblespace_core::prelude::*;
 }

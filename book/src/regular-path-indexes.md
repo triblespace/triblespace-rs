@@ -289,6 +289,20 @@ in reverse, and parentheses group:
 derived collection; the automaton travels in the descriptor, so a later
 maintainer needs nothing but the pile.
 
+The same grammar is a macro in Rust, with attributes named by their paths
+instead of their ids (and `{ expression }` for one computed elsewhere):
+
+```rust,ignore
+use triblespace::macros::path_expr;
+
+let friends = path_expr!(social::friend (social::friend | ^social::friend)* social::name?);
+let index = PathIndex::from_edges(friends.compile(), edges)?;
+```
+
+Both front ends lex into `triblespace_paths::syntax::Token`, parse with one
+`syntax::parse`, and lower the same `syntax::Ast`, so an expression means the
+same thing on the command line and in code.
+
 The bottom is an explicit 48-byte summary: automaton-blob handle, state count,
 and zero vertex and arc counts. Derivation is therefore total even for an empty
 source or a non-nullable source with no matching labels.

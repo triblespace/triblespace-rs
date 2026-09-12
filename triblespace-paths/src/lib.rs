@@ -35,6 +35,9 @@ pub use persistence::{
 };
 pub use summary::{GraphEdge, PathError, PathSummary};
 
+/// The shared text grammar for path expressions and its parser.
+pub mod syntax;
+
 #[cfg(any(kani, test))]
 #[path = "../proofs/mod.rs"]
 mod proofs;

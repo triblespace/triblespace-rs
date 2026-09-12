@@ -49,6 +49,7 @@ tracing-subscriber = { version = "0.3.22", features = ["env-filter"], optional =
 thread_local = { version = "1", optional = true }
 
 [dev-dependencies]
+triblespace-paths = { path = "./triblespace-paths" }
 criterion = "0.6.0"
 futures = "0.3"
 fake = "4.3.0"

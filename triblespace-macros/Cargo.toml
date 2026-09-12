@@ -20,6 +20,7 @@ hex = "0.4"
 triblespace-core = { version = "0.47.0", path = "../triblespace-core", default-features = false }
 triblespace-core-macros = { version = "0.47.0", path = "../triblespace-core-macros" }
 triblespace-macros-common = { version = "0.47.0", path = "../triblespace-macros-common" }
+triblespace-paths = { version = "0.47.0", path = "../triblespace-paths" }
 
 [dev-dependencies]
 pretty_assertions = "1"

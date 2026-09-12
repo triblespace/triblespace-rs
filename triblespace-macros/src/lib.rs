@@ -36,6 +36,8 @@ use triblespace_macros_common::{
     attributes_impl, entity_impl, pattern_changes_impl, pattern_impl, value_formatter_impl,
 };
 
+mod path_expr;
+
 mod instrumentation_attributes {
     /// Attributes specific to compile-time attribute definition instrumentation.
     /// Reuses `metadata::name`, `metadata::attribute`, and `metadata::tag` for
@@ -453,6 +455,29 @@ pub fn find(input: TokenStream) -> TokenStream {
     emit_metadata("find", &clone, |_context| {});
     let inner = TokenStream2::from(input);
     TokenStream::from(quote!(::triblespace::core::macros::find!(#inner)))
+}
+
+/// A regular path expression written like a regex over attribute paths,
+/// lowered to `triblespace_paths::PathExpr` builder calls through the grammar
+/// the `trible` command line shares.
+///
+/// ```rust,ignore
+/// let expr = path_expr!(social::friend (social::friend | ^social::friend)* social::name?);
+/// let automaton = expr.compile();
+/// ```
+///
+/// Atoms are Rust paths naming attributes (anything with an `.id()`), or
+/// `{ expression }`. Juxtaposition is sequence, `|` alternation, `*`, `+` and
+/// `?` repetition, `^` reverse, parentheses group. The generated code names
+/// `::triblespace_paths`, so it must be a dependency of the calling crate.
+#[proc_macro]
+pub fn path_expr(input: TokenStream) -> TokenStream {
+    let clone = input.clone();
+    emit_metadata("path_expr", &clone, |_context| {});
+    match path_expr::path_expr_impl(TokenStream2::from(input)) {
+        Ok(tokens) => TokenStream::from(tokens),
+        Err(error) => TokenStream::from(error.to_compile_error()),
+    }
 }
 
 /// Instrumented wrapper around the core `exists!` query macro.
