@@ -11,6 +11,7 @@ mod compact;
 mod diagnose;
 mod migrate;
 pub mod net;
+mod path_text;
 mod signing;
 
 #[derive(Parser)]

@@ -274,6 +274,21 @@ paths(∅) = ⊥
 paths(a ∪ b) = paths(a) ⊔ paths(b)
 ```
 
+The same derivation is available from the command line without writing Rust.
+`trible pile collection derive <pile> <source> path --expr '<expression>'`
+registers the path summary collection; the expression names attributes by
+their 32-hex-digit ids, juxtaposition is sequence, `|` alternation, `*`, `+`
+and `?` the usual repetitions, `^` before an atom or group follows those edges
+in reverse, and parentheses group:
+
+```text
+--expr '2B3A… (^4C5D… | 6E7F…)+ 8091…?'
+```
+
+`trible pile collection maintain` then folds the summary like any other
+derived collection; the automaton travels in the descriptor, so a later
+maintainer needs nothing but the pile.
+
 The bottom is an explicit 48-byte summary: automaton-blob handle, state count,
 and zero vertex and arc counts. Derivation is therefore total even for an empty
 source or a non-nullable source with no matching labels.

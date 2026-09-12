@@ -172,7 +172,8 @@ pub enum Command {
         /// What to derive. succinct and rank9 take no arguments; latest takes
         /// --observes; lww takes --identity and --orders; nvfp4 takes
         /// --attribute and --dimension. reference-summary takes --log2-bits
-        /// and --probes (defaults: 32 and 4); bm25 takes --text and --tokenizer.
+        /// and --probes (defaults: 32 and 4); bm25 takes --text and --tokenizer;
+        /// path takes --expr.
         #[arg(value_enum)]
         kind: DeriveKind,
         /// latest: the attribute whose GenId values name the state observed
@@ -202,6 +203,11 @@ pub enum Command {
         /// bm25: how to cut the texts: word, bigram or code
         #[arg(long, default_value = "word")]
         tokenizer: String,
+        /// path: the regular path expression over attribute ids. Juxtaposition
+        /// is sequence, | alternation, * + ? repetition, ^ reverse, ( ) group:
+        /// `A (^B | C)+ D?` with A..D as 32-hex-digit attribute ids.
+        #[arg(long)]
+        expr: Option<String>,
         /// Existing READ/WRITE-root signing key (default: beside the pile)
         #[arg(long)]
         key: Option<PathBuf>,
@@ -302,6 +308,9 @@ pub enum DeriveKind {
     ReferenceSummary,
     /// PortableBM25Blob over UTF8String texts in a SimpleArchive source
     Bm25,
+    /// PathSummaryBlob over a SimpleArchive source, for the regular path
+    /// expression given as --expr
+    Path,
 }
 
 pub fn run(cmd: Command) -> Result<()> {
@@ -340,6 +349,7 @@ pub fn run(cmd: Command) -> Result<()> {
             probes,
             text,
             tokenizer,
+            expr,
             key,
         } => run_derive(
             pile,
@@ -355,6 +365,7 @@ pub fn run(cmd: Command) -> Result<()> {
                 probes,
                 text,
                 tokenizer,
+                expr,
             },
             key,
         ),
@@ -2054,6 +2065,7 @@ struct DeriveArguments {
     probes: Option<u8>,
     text: Option<String>,
     tokenizer: String,
+    expr: Option<String>,
 }
 
 fn parse_attribute_id(flag: &str, value: Option<&str>) -> Result<Id> {
@@ -2147,6 +2159,19 @@ fn run_derive(
                     .handle()
             }
             DeriveKind::Bm25 => derive_bm25(&mut pile, source_handle, &arguments, policy)?,
+            DeriveKind::Path => {
+                let text = arguments
+                    .expr
+                    .as_deref()
+                    .ok_or_else(|| anyhow!("--expr is required for path"))?;
+                let automaton = super::path_text::parse(text)
+                    .map_err(|error| anyhow!("--expr: {error}"))?
+                    .compile();
+                let source: Collection<SimpleArchive> = open_source(&mut pile, source_handle)?;
+                pile.derive::<triblespace_paths::PathSummaryBlob>(source, automaton, policy)
+                    .map_err(registered)?
+                    .handle()
+            }
         };
         Ok(handle)
     })();
