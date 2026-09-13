@@ -12,6 +12,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
   binary does not know. They are carried exactly, by their own length, and the
   report counts them and their bytes; migrating or dropping old records stays
   an explicit, separate operation (JP, 2026-09-13).
+- `pile compact` leaves behind a retired unsigned equation whose signed twin
+  is present, and says how many it left; the endorsement migration writes
+  the twins, compaction sheds the originals, and the unsigned kind can then
+  leave the code.
 
 ### Fixed
 

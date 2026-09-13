@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+- A retained rewrite no longer carries a retired unsigned MERGE or DERIVE
+  once a signed equation with the same collection, inputs and output is
+  present in the source: the endorsement it was kept for has happened. One
+  without a signed twin is still carried. Counted in
+  `PileRewriteStats::superseded_equations` (JP, 2026-09-13: the compactor
+  can collect the signed ones and drop the superseded unsigned ones).
 - `Pile::rewrite_retained_into` carries frames of unknown kind exactly, by
   their own length, instead of refusing the whole rewrite: it keeps every
   resident blob, so it cannot orphan whatever such a frame names, and a binary

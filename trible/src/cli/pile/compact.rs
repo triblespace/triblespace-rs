@@ -208,7 +208,7 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
     drop(destination_file);
 
     println!(
-        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  active wants: {}\n  active legacy pins: {}",
+        "Compacted {} into {}:\n  bytes: {} -> {}\n  blob records: {} -> {}\n  collection records: {} -> {}\n  capability proofs: {} -> {}\n  current WANT records: {} -> {}\n  retired WANT log records: {} -> {} (dropped)\n  retired team records: {} -> {} (dropped)\n  frames of unknown kind: {} ({} bytes) -> {} ({} bytes) (carried exactly)\n  unsigned equations with a signed twin: {} (not carried)\n  active wants: {}\n  active legacy pins: {}",
         source_path.display(),
         destination_path.display(),
         source_census.bytes,
@@ -229,6 +229,7 @@ pub(super) fn run(source_path: PathBuf, destination_path: PathBuf) -> Result<()>
         source_census.opaque_bytes,
         destination_census.opaque,
         destination_census.opaque_bytes,
+        stats.superseded_equations,
         stats.wants,
         stats.strong_pins,
     );

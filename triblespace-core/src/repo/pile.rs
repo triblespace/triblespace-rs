@@ -4996,6 +4996,25 @@ pub fn reframe_into(
     Ok(stats)
 }
 
+/// Stands in for a derive's absent second input in [`equation_key`].
+const ENDORSED_DERIVE_MARK: [u8; 32] = [0xFF; 32];
+
+/// The semantic identity of an equation, signed or not: its collection, its
+/// inputs in digest order, and its result.
+fn equation_key(
+    collection: [u8; 32],
+    first: [u8; 32],
+    second: [u8; 32],
+    result: [u8; 32],
+) -> ([u8; 32], [u8; 32], [u8; 32], [u8; 32]) {
+    let (low, high) = if first <= second {
+        (first, second)
+    } else {
+        (second, first)
+    };
+    (collection, low, high, result)
+}
+
 /// Deterministic accounting for one retained pile rewrite.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct PileRewriteStats {
@@ -5009,6 +5028,9 @@ pub struct PileRewriteStats {
     pub capability_proofs: usize,
     /// Number of frames of unknown kind carried exactly, by their own length.
     pub opaque_frames: usize,
+    /// Number of retired unsigned equations not carried because a signed
+    /// equation with the same collection, inputs and output is present.
+    pub superseded_equations: usize,
 }
 
 /// Failure while copying one policy-selected pile state into another pile.
@@ -5264,7 +5286,62 @@ impl Pile {
             }
         }
 
+        // An unsigned equation is inert evidence kept for one purpose, an
+        // explicit endorsement. Once a signed equation with the same
+        // collection, inputs and output is present, that purpose is served
+        // and the old frame is baggage: it is not carried. One without a
+        // twin still is, as the only evidence something could endorse.
+        let mut signed_equations = BTreeSet::new();
+        for key in collection_records.clone().into_iter_ordered() {
+            match *collection_records
+                .get(&key)
+                .expect("collection key from PATCH snapshot must retain its value")
+            {
+                CollectionRecord::Merge(record) => {
+                    let (low, high) = record.inputs();
+                    signed_equations.insert(equation_key(
+                        record.collection().raw,
+                        low.raw,
+                        high.raw,
+                        record.result().raw,
+                    ));
+                }
+                CollectionRecord::Derive(record) => {
+                    signed_equations.insert(equation_key(
+                        record.collection().raw,
+                        record.input().raw,
+                        ENDORSED_DERIVE_MARK,
+                        record.output().raw,
+                    ));
+                }
+                CollectionRecord::Commit(_) => {}
+            }
+        }
+        let mut superseded_equations = 0usize;
         for header in legacy_collection_headers.into_iter_ordered() {
+            if let Ok(PileRecord {
+                content: PileRecordContent::LegacyUnsignedCollectionEquation { equation },
+                ..
+            }) = decode_record(&header, 0)
+            {
+                let key = match equation {
+                    LegacyUnsignedCollectionEquation::Merge {
+                        collection,
+                        low,
+                        high,
+                        result,
+                    } => equation_key(collection.raw, low.raw, high.raw, result.raw),
+                    LegacyUnsignedCollectionEquation::Derive {
+                        collection,
+                        input,
+                        output,
+                    } => equation_key(collection.raw, input.raw, ENDORSED_DERIVE_MARK, output.raw),
+                };
+                if signed_equations.contains(&key) {
+                    superseded_equations += 1;
+                    continue;
+                }
+            }
             destination
                 .preserve_legacy_collection_header(header)
                 .map_err(PileRewriteError::Collection)?;
@@ -5308,6 +5385,7 @@ impl Pile {
             wants: preserved_wants.len(),
             capability_proofs: capability_proof_count,
             opaque_frames: opaque_frames.len(),
+            superseded_equations,
         })
     }
 }
@@ -6978,6 +7056,87 @@ mod tests {
     }
 
     #[test]
+    fn endorsed_unsigned_equations_are_not_carried_by_rewrite() {
+        // The same planted unsigned merge and derive as above, with a signed
+        // twin for the merge only: the merge is baggage and stays behind, the
+        // derive is still the only evidence of itself and travels.
+        let dir = tempfile::tempdir().unwrap();
+        let source_path = fresh_empty_pile_path(&dir, "endorsed-source.pile");
+        let mut source = Pile::open(&source_path).unwrap();
+        let input = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"endorsed input".to_vec()))
+            .unwrap();
+        let output = source
+            .put::<UnknownBlob, _>(Bytes::from_source(b"endorsed output".to_vec()))
+            .unwrap();
+        let collection = source
+            .put::<SimpleArchive, _>(TribleSet::new().to_blob())
+            .unwrap();
+        source.close().unwrap();
+        let merge = LegacyCollectionMergeRecordHeader {
+            magic: FRAME_MAGIC,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            record_kind: record_kind::KIND_COLLECTION_MERGE_UNSIGNED,
+            collection: collection.raw,
+            low: [0; 32],
+            high: input.raw,
+            result: output.raw,
+            reserved: [0; 64],
+        };
+        let derive = CollectionDeriveHeaderEnvelopeV1 {
+            envelope_marker: MAGIC_MARKER_ENVELOPE,
+            record_kind: MAGIC_MARKER_COLLECTION_DERIVE_V5,
+            span_blocks: ENVELOPE_HEADER_BLOCKS.to_le_bytes(),
+            target: collection.raw,
+            input: input.raw,
+            output: output.raw,
+            reserved: [0; 124],
+        };
+        append_test_bytes(&source_path, merge.as_bytes());
+        append_test_bytes(&source_path, derive.as_bytes());
+        let mut source = Pile::open(&source_path).unwrap();
+        let signer = SigningKey::from_bytes(&[9; 32]);
+        let twin = CollectionRecord::Merge(CollectionMerge::sign(
+            &signer,
+            CollectionHandle::new(collection.raw),
+            Inline::<Hash<Blake3>>::new([0; 32]),
+            Inline::<Hash<Blake3>>::new(input.raw),
+            Inline::<Hash<Blake3>>::new(output.raw),
+        ));
+        source.insert(twin).unwrap();
+        assert_eq!(
+            source
+                .snapshot()
+                .unwrap()
+                .legacy_unsigned_collection_equations()
+                .count(),
+            2
+        );
+
+        let destination_path = fresh_empty_pile_path(&dir, "endorsed-destination.pile");
+        let mut destination = Pile::open(&destination_path).unwrap();
+        let stats = source
+            .rewrite_retained_into(
+                &mut destination,
+                &RetentionRoots::new(),
+                WantRewritePolicy::Drop,
+            )
+            .unwrap();
+        assert_eq!(stats.superseded_equations, 1);
+        let reader = destination.snapshot().unwrap();
+        let carried: Vec<_> = reader.legacy_unsigned_collection_equations().collect();
+        assert_eq!(carried.len(), 1);
+        assert!(matches!(
+            carried[0],
+            LegacyUnsignedCollectionEquation::Derive { .. }
+        ));
+        assert!(reader.record(twin.fingerprint()).unwrap().is_some());
+        drop(reader);
+        destination.close().unwrap();
+        source.close().unwrap();
+    }
+
+    #[test]
     fn opaque_envelopes_are_raw_visible_and_writers_cross_them() {
         let dir = tempfile::tempdir().unwrap();
         let path = fresh_empty_pile_path(&dir, "opaque-crossing.pile");
@@ -8013,6 +8172,7 @@ mod tests {
                 wants: 1,
                 capability_proofs: 0,
                 opaque_frames: 0,
+                superseded_equations: 0,
             }
         );
 
